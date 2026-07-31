@@ -40,6 +40,41 @@ runtime_env =
       end
   end
 
+openstax_rich_content_v3_default =
+  if runtime_env in [:dev, :test], do: "true", else: "false"
+
+config :oli,
+       :openstax_rich_content_v3_enabled,
+       get_env_as_boolean.(
+         "OPENSTAX_RICH_CONTENT_V3_ENABLED",
+         openstax_rich_content_v3_default
+       )
+
+openstax_course_import_max_parallel_lessons =
+  case System.get_env("OPENSTAX_COURSE_IMPORT_MAX_PARALLEL_LESSONS", "3")
+       |> String.trim()
+       |> Integer.parse() do
+    {parallelism, ""} -> parallelism |> max(1) |> min(8)
+    _invalid -> 3
+  end
+
+config :oli,
+       :openstax_course_import_max_parallel_lessons,
+       openstax_course_import_max_parallel_lessons
+
+openstax_course_import_lesson_planning_strategy =
+  case System.get_env("OPENSTAX_COURSE_IMPORT_PLANNING_STRATEGY", "parallel_v1")
+       |> String.trim()
+       |> String.downcase() do
+    "serial_v1" -> :serial_v1
+    "parallel_v1" -> :parallel_v1
+    _unsupported -> :parallel_v1
+  end
+
+config :oli,
+       :openstax_course_import_lesson_planning_strategy,
+       openstax_course_import_lesson_planning_strategy
+
 # Appsignal client key is required for appsignal integration
 config :appsignal, :client_key, System.get_env("APPSIGNAL_PUSH_API_KEY", nil)
 
@@ -308,13 +343,25 @@ if clickhouse_olap_enabled do
 end
 
 if runtime_env != :test do
+  local_s3? = runtime_env == :dev
+
+  s3_access_key_id =
+    [{:system, "AWS_S3_ACCESS_KEY_ID"}, {:system, "AWS_ACCESS_KEY_ID"}] ++
+      if(local_s3?, do: ["your_minio_access_key"], else: [])
+
+  s3_secret_access_key =
+    [{:system, "AWS_S3_SECRET_ACCESS_KEY"}, {:system, "AWS_SECRET_ACCESS_KEY"}] ++
+      if(local_s3?, do: ["your_minio_secret_key"], else: [])
+
   config :ex_aws, :s3,
     region: [{:system, "AWS_S3_REGION"}, {:system, "AWS_REGION"}, "us-east-1"],
-    access_key_id: [{:system, "AWS_S3_ACCESS_KEY_ID"}, {:system, "AWS_ACCESS_KEY_ID"}],
-    secret_access_key: [{:system, "AWS_S3_SECRET_ACCESS_KEY"}, {:system, "AWS_SECRET_ACCESS_KEY"}],
-    scheme: System.get_env("AWS_S3_SCHEME", "https") <> "://",
-    port: System.get_env("AWS_S3_PORT", "443") |> String.to_integer(),
-    host: System.get_env("AWS_S3_HOST", "s3.amazonaws.com")
+    access_key_id: s3_access_key_id,
+    secret_access_key: s3_secret_access_key,
+    scheme: System.get_env("AWS_S3_SCHEME", if(local_s3?, do: "http", else: "https")) <> "://",
+    port:
+      System.get_env("AWS_S3_PORT", if(local_s3?, do: "9000", else: "443"))
+      |> String.to_integer(),
+    host: System.get_env("AWS_S3_HOST", if(local_s3?, do: "localhost", else: "s3.amazonaws.com"))
 end
 
 force_ssl_default = if runtime_env == :prod, do: "true", else: "false"
@@ -713,7 +760,10 @@ if runtime_env == :prod do
         crontab: [
           {"*/2 * * * *", OliWeb.DatasetStatusPoller, queue: :default},
           {"*/30 * * * *", Oli.Lti.KeysetRefreshWorker,
-           args: %{refresh_all: true}, queue: :default}
+           args: %{refresh_all: true}, queue: :default},
+          {"*/5 * * * *", Oli.OpenStax.CourseImport.Worker.NotificationDispatchWorker,
+           queue: :course_import},
+          {"*/5 * * * *", Oli.OpenStax.CourseImport.Worker.RunHealthWorker, queue: :course_import}
         ]
       }
     ],
@@ -736,6 +786,11 @@ if runtime_env == :prod do
       project_export: String.to_integer(System.get_env("OBAN_QUEUE_SIZE_PROJECT_EXPORT", "3")),
       objectives: String.to_integer(System.get_env("OBAN_QUEUE_SIZE_OBJECTIVES", "3")),
       mailer: String.to_integer(System.get_env("OBAN_QUEUE_SIZE_MAILER", "10")),
+      course_import: String.to_integer(System.get_env("OBAN_QUEUE_SIZE_COURSE_IMPORT", "2")),
+      course_import_ai:
+        String.to_integer(System.get_env("OBAN_QUEUE_SIZE_COURSE_IMPORT_AI", "6")),
+      course_import_media:
+        String.to_integer(System.get_env("OBAN_QUEUE_SIZE_COURSE_IMPORT_MEDIA", "1")),
       certificate_eligibility:
         String.to_integer(System.get_env("OBAN_QUEUE_SIZE_CERTIFICATE_ELIGIBILITY", "10"))
     ]

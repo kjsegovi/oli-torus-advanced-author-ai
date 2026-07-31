@@ -79,6 +79,12 @@ defmodule OliWeb.Workspaces.CourseAuthor.Curriculum.EditorLiveTest do
       assert element(view, "#page_editor-container")
       assert element(view, "#collab-space-#{project.slug}-#{revision.slug}")
       assert element(view, "#content > nav")
+
+      assert has_element?(
+               view,
+               "#authoring-mode-badge[data-authoring-mode='basic']",
+               "Basic Author"
+             )
     end
 
     test "displays breadcrumbs in basic authoring mode", %{
@@ -118,10 +124,28 @@ defmodule OliWeb.Workspaces.CourseAuthor.Curriculum.EditorLiveTest do
       render_hook(view, "survey_scripts_loaded", %{})
       render_hook(view, "authoring_preview_state_changed", %{"enabled" => true})
 
-      assert has_element?(view, "div.TitleBar")
+      assert has_element?(
+               view,
+               "#authoring-shell-header.TitleBar.relative.z-40.bg-Background-bg-primary > div.flex-nowrap"
+             )
+
+      assert has_element?(view, "#authoring-shell-header h1.truncate[title]")
       assert has_element?(view, "button[phx-click=\"begin_title_edit\"]")
-      assert has_element?(view, "button[phx-click=\"request_authoring_preview\"]")
+
+      assert has_element?(
+               view,
+               "#authoring-preview-actions.shrink-0 button.btn.btn-primary[phx-click=\"request_authoring_preview\"]:not([disabled])",
+               "Preview"
+             )
+
       assert has_element?(view, "div.TitleBar #adaptive_read_only_toggle")
+
+      assert has_element?(
+               view,
+               "#authoring-mode-badge[data-authoring-mode='advanced']",
+               "Advanced Author"
+             )
+
       refute has_element?(view, "div.TitleBar #adaptive_read_only_toggle input[disabled]")
       assert has_element?(view, "div.TitleBar button[phx-click=\"begin_title_edit\"][disabled]")
 

@@ -1,0 +1,1517 @@
+<div id="openstax-course-import" class="mx-auto max-w-5xl pb-12">
+  <div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+    <div>
+      <h2 id="header_id" class="pb-2">{gettext("Create course from OpenStax")}</h2>
+      <p class="max-w-3xl text-sm text-gray-600">
+        {gettext(
+          "Plan a complete course in the background, review the unit and lesson plans, then create the approved lessons in this project."
+        )}
+      </p>
+    </div>
+    <.link navigate={@return_path} class="text-sm font-semibold text-primary hover:underline">
+      <.icon name="hero-arrow-left" class="mr-1 h-4 w-4" /> {gettext("Back to curriculum")}
+    </.link>
+  </div>
+
+  <div
+    :if={!@available?}
+    class="mb-6 rounded border border-yellow-300 bg-yellow-50 p-4 text-sm text-yellow-900"
+    role="alert"
+  >
+    <p class="font-semibold">{gettext("OpenStax course import is unavailable")}</p>
+    <p class="mt-1">
+      {gettext(
+        "This feature requires access to the project and the OpenStax import feature flag."
+      )}
+    </p>
+  </div>
+
+  <div
+    :if={@error_message}
+    class="mb-6 rounded border border-red-200 bg-red-50 p-4 text-sm text-red-800"
+    role="alert"
+  >
+    {@error_message}
+  </div>
+
+  <%= if is_nil(@run) do %>
+    <section class="rounded border border-gray-200 bg-white p-6 shadow-sm">
+      <h3 class="mb-1 text-lg font-semibold text-gray-900">
+        {gettext("Choose an OpenStax book")}
+      </h3>
+      <p class="mb-5 text-sm text-gray-600">
+        {gettext(
+          "Planning a full book can take several hours. It runs in the background, so you can leave this page and return later; your course plan and progress are saved."
+        )}
+      </p>
+      <.form
+        id="openstax-course-import-form"
+        for={@form}
+        phx-change="validate"
+        phx-submit="start"
+        class="space-y-5"
+      >
+        <div>
+          <.input
+            field={@form[:source_url]}
+            type="url"
+            label={gettext("OpenStax book URL")}
+            placeholder="https://openstax.org/details/books/introduction-computer-science"
+            required
+            disabled={!@available?}
+          />
+          <p class="mt-1 text-xs text-gray-500">
+            {gettext(
+              "Use the book details link from openstax.org. No content is created until you approve the lesson plans."
+            )}
+          </p>
+        </div>
+        <div class="flex items-center gap-3">
+          <.button
+            type="submit"
+            variant={:primary}
+            size={:sm}
+            disabled={!@available?}
+            phx-disable-with={gettext("Starting course planner...")}
+          >
+            {gettext("Plan course")}
+          </.button>
+          <.link navigate={@return_path} class="text-sm text-gray-600 hover:underline">
+            {gettext("Cancel")}
+          </.link>
+        </div>
+      </.form>
+    </section>
+  <% else %>
+    <% status = @run.status %>
+    <nav aria-label={gettext("Course import progress")} class="mb-6">
+      <ol class="openstax-course-import-timeline">
+        <li :for={{stage, label} <- workflow_stages()} class={timeline_stage_class(stage, status)}>
+          <span class="openstax-course-import-timeline-marker" aria-hidden="true">
+            <.icon
+              :if={String.contains?(timeline_stage_class(stage, status), "is-complete")}
+              name="hero-check"
+              class="h-3.5 w-3.5"
+            />
+            <span :if={!String.contains?(timeline_stage_class(stage, status), "is-complete")}>
+              {Enum.find_index(workflow_stages(), fn {key, _} -> key == stage end) + 1}
+            </span>
+          </span>
+          <span class="openstax-course-import-timeline-label">{label}</span>
+          <span
+            :if={stage_is_active?(stage, status)}
+            class="sr-only"
+          >
+            {gettext("Current stage")}
+          </span>
+        </li>
+      </ol>
+    </nav>
+
+    <aside
+      id="openstax-course-import-queue"
+      class="mb-6 rounded border border-gray-200 bg-white p-4 shadow-sm"
+      aria-live="polite"
+    >
+      <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <p class="text-xs font-semibold uppercase tracking-wide text-gray-500">
+            {gettext("Course plan queue")}
+          </p>
+          <p class="mt-1 font-semibold text-gray-900">{progress_heading(status)}</p>
+          <p class="mt-1 text-sm text-gray-600">
+            {gettext("Run ID")}:
+            <code class="rounded bg-gray-100 px-1 py-0.5 text-xs">{@run.id}</code>
+          </p>
+          <.link
+            navigate={run_path(@project.slug, @run.id)}
+            class="mt-1 inline-block text-xs font-semibold text-primary hover:underline"
+          >
+            {gettext("Bookmarkable resume link")}
+          </.link>
+        </div>
+        <div class="text-sm text-gray-600 sm:text-right">
+          <p>
+            {approved_lesson_count(@run)} / {total_lesson_count(@run)}
+            {gettext("lesson plans approved")}
+          </p>
+          <p :for={total <- run_progress(@run)} class="mt-1 text-xs">
+            {total["label"] || total[:label] || total["stage"] || total[:stage]}: {total[
+              "completed"
+            ] || total[:completed] || 0}/{total["total"] || total[:total] || 0}
+          </p>
+          <div
+            :if={lesson_planning_summary(@run).total > 0}
+            id="openstax-lesson-planning-summary"
+            class="mt-2 rounded bg-slate-50 px-3 py-2 text-left text-xs sm:text-right"
+          >
+            <p class="font-semibold text-gray-900">{lesson_planning_summary_text(@run)}</p>
+            <p class="mt-0.5 text-gray-600">{planning_parallelism_text(@run)}</p>
+          </div>
+        </div>
+      </div>
+      <ul
+        :if={lesson_planning_summary(@run).active_items != []}
+        id="openstax-active-lesson-plans"
+        class="mt-3 grid gap-2 text-xs sm:grid-cols-2 lg:grid-cols-3"
+        aria-label={gettext("Active lesson planning jobs")}
+      >
+        <li
+          :for={item <- lesson_planning_summary(@run).active_items}
+          class="rounded border border-blue-100 bg-blue-50 px-3 py-2 text-blue-950"
+        >
+          {active_planning_item_text(item)}
+        </li>
+      </ul>
+      <div
+        id="openstax-course-import-timing"
+        class="mt-4 rounded border border-blue-100 bg-blue-50/70 p-3 text-sm text-blue-950"
+        aria-live="off"
+        data-estimate-state={estimate_value(@run_estimate, "state", "unavailable")}
+        data-estimate-milestone={estimate_value(@run_estimate, "milestone", "")}
+        data-work-state={estimate_value(@run_estimate, "work_state", "")}
+      >
+        <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div class="flex min-w-0 items-start gap-2">
+            <.icon name="hero-clock" class="mt-0.5 h-4 w-4 shrink-0 text-blue-700" />
+            <div class="min-w-0">
+              <p class="text-xs font-semibold uppercase tracking-wide text-blue-700">
+                {gettext("Time estimate")}
+              </p>
+              <p id="openstax-course-import-estimate" class="mt-0.5 font-semibold">
+                {estimate_primary_text(@run_estimate, status)}
+              </p>
+              <p id="openstax-course-import-estimate-note" class="mt-1 text-xs text-blue-900">
+                {estimate_detail_text(@run_estimate, status)}
+              </p>
+            </div>
+          </div>
+          <p
+            :if={show_estimate_elapsed?(@run_estimate)}
+            id="openstax-course-import-elapsed"
+            class="shrink-0 text-xs font-medium text-blue-800 sm:text-right"
+          >
+            {estimate_elapsed_text(@run_estimate)}
+          </p>
+        </div>
+      </div>
+      <div
+        :if={estimate_stalled?(@run_estimate)}
+        id="openstax-course-import-delay-warning"
+        class="mt-3 rounded border border-yellow-300 bg-yellow-50 p-3 text-sm text-yellow-950"
+        role="status"
+        aria-live="polite"
+      >
+        <p class="font-semibold">{gettext("This step is taking longer than expected")}</p>
+        <p class="mt-1">
+          {gettext(
+            "No new progress checkpoint has been recorded recently. The current item may still be processing; you can leave this page and return later."
+          )}
+        </p>
+        <p class="mt-1 text-xs">{estimate_last_progress_text(@run_estimate)}</p>
+      </div>
+      <dl
+        :if={run_persisted_counts(@run) != []}
+        class="mt-4 grid grid-cols-2 gap-2 border-t border-gray-100 pt-3 text-xs sm:grid-cols-4"
+      >
+        <div
+          :for={{label, count} <- run_persisted_counts(@run)}
+          class="rounded bg-slate-50 px-2 py-1.5"
+        >
+          <dt class="text-gray-500">{label}</dt>
+          <dd class="font-semibold text-gray-900">{count}</dd>
+        </div>
+      </dl>
+      <div :if={status not in [:completed, :failed, :cancelled]} class="mt-3 flex justify-end">
+        <button
+          type="button"
+          class="text-sm font-semibold text-gray-600 hover:text-red-700 hover:underline"
+          phx-click="cancel_run"
+          data-confirm={
+            gettext(
+              "Cancel this course import? The saved plan will remain available, but background work will stop."
+            )
+          }
+        >
+          {gettext("Cancel import")}
+        </button>
+      </div>
+    </aside>
+
+    <section
+      :if={status == :awaiting_lesson_approval && run_has_error?(@run)}
+      class="mb-6 rounded border border-yellow-300 bg-yellow-50 p-4 text-sm text-yellow-950"
+      role="alert"
+    >
+      <p class="font-semibold">{gettext("This import needs reviewer attention")}</p>
+      <p class="mt-1">{run_error_message(@run)}</p>
+      <p :if={run_error_phase(@run) != ""} class="mt-2 text-xs">
+        <span class="font-semibold">{gettext("Stage")}:</span> {run_error_phase(@run)}
+      </p>
+      <p :if={run_error_media_ids(@run) != []} class="mt-2 break-words text-xs">
+        <span class="font-semibold">{gettext("Affected source figures")}:</span>
+        {Enum.join(run_error_media_ids(@run), ", ")}
+      </p>
+      <p :if={attention_lesson_titles(@run) != []} class="mt-2 text-xs">
+        <span class="font-semibold">{gettext("Lessons needing attention")}:</span>
+        {Enum.join(attention_lesson_titles(@run), ", ")}
+      </p>
+    </section>
+
+    <section
+      :if={
+        status in [
+          :preflighting,
+          :ingesting,
+          :planning_outline,
+          :planning_lessons,
+          :staging_media,
+          :applying
+        ]
+      }
+      class="rounded border border-blue-200 bg-blue-50 p-6 text-blue-950"
+      aria-live="polite"
+      aria-busy="true"
+      id="openstax-course-import-processing"
+    >
+      <div class="flex items-center gap-3">
+        <span class="openstax-course-import-working-mark" aria-hidden="true">
+          <.icon name="hero-arrow-path" class="h-5 w-5" />
+        </span>
+        <div>
+          <p class="font-semibold">{progress_heading(status)}</p>
+          <p class="mt-1 text-sm">
+            {gettext(
+              "You can close this tab. Work continues on the server, and the estimate will refresh when you return. We will email you when a review or completion step is ready."
+            )}
+          </p>
+          <p
+            id="openstax-course-import-processing-estimate"
+            class="mt-2 text-sm font-semibold"
+            aria-live="off"
+          >
+            {estimate_primary_text(@run_estimate, status)}
+          </p>
+        </div>
+      </div>
+
+      <div class="openstax-course-import-live-steps mt-5" aria-hidden="true">
+        <span class="openstax-course-import-live-step"></span>
+        <span class="openstax-course-import-live-step"></span>
+        <span class="openstax-course-import-live-step"></span>
+      </div>
+
+      <div class="mt-6">
+        <div class="mb-2 flex items-center justify-between gap-3 text-sm">
+          <span class="font-medium text-blue-800">{gettext("OpenStax plan progress")}</span>
+          <span class="text-blue-900">{processing_progress_text_for_run(@run)}</span>
+        </div>
+        <div
+          id="openstax-course-import-progress"
+          class="h-2 overflow-hidden rounded-full bg-blue-200"
+          role="progressbar"
+          aria-label={gettext("OpenStax import progress")}
+          aria-valuemin={processing_progress_minimum_for_run(@run)}
+          aria-valuemax={processing_progress_maximum_for_run(@run)}
+          aria-valuenow={processing_progress_for_run(@run)}
+          aria-valuetext={processing_progress_text_for_run(@run)}
+        >
+          <div
+            class="openstax-course-import-progress-fill h-full rounded-full bg-primary motion-reduce:transition-none"
+            style={"width: #{processing_progress_width_for_run(@run)}%"}
+            aria-hidden="true"
+          >
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section
+      :if={status == :awaiting_scope}
+      class="rounded border border-gray-200 bg-white p-6 shadow-sm"
+    >
+      <div class="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
+        <div>
+          <h3 class="text-lg font-semibold text-gray-900">
+            {gettext("Choose chapters to include")}
+          </h3>
+          <p class="mt-1 max-w-3xl text-sm text-gray-600">
+            {gettext(
+              "All discovered chapters are selected by default. Remove chapters you do not want in this course, then continue to the outline."
+            )}
+          </p>
+        </div>
+        <span class="rounded bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800">
+          {length(scope_chapters(@run))} {gettext("chapters discovered")}
+        </span>
+      </div>
+
+      <form id="openstax-course-scope" phx-submit="save_scope" class="mt-5 space-y-3">
+        <label
+          :for={chapter <- scope_chapters(@run)}
+          class="flex cursor-pointer items-start gap-3 rounded border border-gray-200 p-3 transition hover:border-blue-300 hover:bg-blue-50"
+        >
+          <input
+            type="checkbox"
+            name="chapters[]"
+            value={chapter.id}
+            checked={chapter.selected}
+            class="mt-1 h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
+          />
+          <span>
+            <span class="block font-semibold text-gray-900">{chapter.title}</span>
+            <span :if={chapter.detail} class="mt-1 block text-sm text-gray-600">
+              {chapter.detail}
+            </span>
+          </span>
+        </label>
+
+        <p
+          :if={scope_chapters(@run) == []}
+          class="rounded bg-yellow-50 p-3 text-sm text-yellow-900"
+        >
+          {gettext(
+            "The source is still being indexed. This page will update when chapter choices are ready."
+          )}
+        </p>
+
+        <.button
+          type="submit"
+          variant={:primary}
+          disabled={scope_chapters(@run) == []}
+          phx-disable-with={gettext("Saving selection...")}
+        >
+          {gettext("Continue with selected chapters")}
+        </.button>
+      </form>
+    </section>
+
+    <section
+      :if={status == :awaiting_outline_approval}
+      class="rounded border border-gray-200 bg-white p-6 shadow-sm"
+    >
+      <h3 class="text-lg font-semibold text-gray-900">{gettext("Review course outline")}</h3>
+      <p class="mt-1 text-sm text-gray-600">
+        {gettext("Approve the proposed units to begin the per-lesson planning pass.")}
+      </p>
+      <div class="mt-5 space-y-3">
+        <div :for={unit <- units_for_run(@run)} class="rounded border border-gray-200 p-4">
+          <div class="flex gap-3">
+            <div class="openstax-course-import-source-cover" aria-hidden="true">
+              <.icon name="hero-book-open" class="h-5 w-5" />
+            </div>
+            <div>
+              <p class="font-semibold">{unit.unit_name}</p>
+              <p class="mt-1 text-sm text-gray-600">
+                {lesson_count(unit)} {gettext("lessons planned")}
+              </p>
+              <p class="mt-2 text-xs text-gray-500">
+                {gettext("Source")}: {@run.book_slug}
+              </p>
+              <ol class="mt-4 space-y-3">
+                <li
+                  :for={lesson <- lessons_for_unit(unit)}
+                  class="rounded border border-gray-100 bg-gray-50 p-3"
+                >
+                  <p class="text-sm font-semibold text-gray-900">{lesson.title}</p>
+                  <ul
+                    :if={lesson_learning_objectives(lesson) != []}
+                    class="mt-2 list-disc space-y-1 pl-5 text-xs text-gray-700"
+                  >
+                    <li :for={objective <- lesson_learning_objectives(lesson)}>
+                      {objective}
+                    </li>
+                  </ul>
+                  <div
+                    :if={lesson_sections(lesson) != []}
+                    class="mt-2 flex flex-wrap gap-1.5"
+                  >
+                    <span
+                      :for={section <- lesson_sections(lesson)}
+                      class="rounded bg-blue-50 px-2 py-0.5 text-xs text-blue-900"
+                    >
+                      {section}
+                    </span>
+                  </div>
+                </li>
+              </ol>
+            </div>
+          </div>
+        </div>
+      </div>
+      <.button class="mt-5" variant={:primary} phx-click="approve_outline">
+        {gettext("Approve outline and plan lessons")}
+      </.button>
+    </section>
+
+    <section
+      :if={status == :awaiting_lesson_approval}
+      class="rounded border border-gray-200 bg-white p-6 shadow-sm"
+    >
+      <div class="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
+        <div>
+          <h3 class="text-lg font-semibold text-gray-900">{gettext("Review lesson plans")}</h3>
+          <p class="mt-1 text-sm text-gray-600">
+            {gettext(
+              "Each plan includes learner-facing explanations, worked examples, takeaways, and formative questions. Basic and Advanced Author lessons are intentionally mixed."
+            )}
+          </p>
+        </div>
+        <span class="rounded bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800">
+          {gettext("Individual approval required")}
+        </span>
+      </div>
+      <div class="mt-5 space-y-4">
+        <div :for={unit <- units_for_run(@run)} class="rounded border border-gray-200 p-4">
+          <h4 class="font-semibold text-gray-900">{unit.unit_name}</h4>
+          <aside
+            :if={assessment_questions(unit) != []}
+            class="mt-3 rounded border border-indigo-200 bg-indigo-50 p-4"
+          >
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <p class="text-xs font-semibold uppercase tracking-wide text-indigo-700">
+                  {gettext("Unit assessment quiz")}
+                </p>
+                <p class="mt-1 font-semibold text-indigo-950">{assessment_title(unit)}</p>
+              </div>
+              <span class="rounded bg-white px-2 py-0.5 text-xs font-semibold text-indigo-800">
+                {if assessment_mode(unit) == "advanced",
+                  do: gettext("Advanced Author"),
+                  else: gettext("Basic Author")}
+              </span>
+            </div>
+            <ol class="mt-3 list-decimal space-y-1 pl-5 text-sm text-indigo-950">
+              <li :for={question <- assessment_questions(unit)}>{question_text(question)}</li>
+            </ol>
+            <div :if={assessment_evidence_links(unit) != []} class="mt-3 text-xs">
+              <p class="font-semibold text-indigo-800">{gettext("Assessment evidence")}</p>
+              <ul class="mt-1 space-y-1 break-words">
+                <li :for={link <- assessment_evidence_links(unit)}>
+                  <.link href={link} target="_blank" rel="noopener noreferrer">{link}</.link>
+                </li>
+              </ul>
+            </div>
+          </aside>
+          <div class="mt-3 space-y-3">
+            <article
+              :for={lesson <- lessons_for_unit(unit)}
+              class="rounded border border-gray-100 bg-gray-50 p-4"
+            >
+              <div class="space-y-3">
+                <div class="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
+                  <div>
+                    <div class="flex flex-wrap items-center gap-2">
+                      <p class="font-semibold text-gray-900">{lesson.title}</p>
+                      <span class={[
+                        "rounded px-2 py-0.5 text-xs font-semibold",
+                        if(lesson.plan_mode == "advanced",
+                          do: "bg-purple-100 text-purple-800",
+                          else: "bg-blue-100 text-blue-800"
+                        )
+                      ]}>
+                        {if lesson.plan_mode == "advanced",
+                          do: gettext("Advanced Author"),
+                          else: gettext("Basic Author")}
+                      </span>
+                      <span
+                        :if={lesson.status == "approved"}
+                        class="rounded bg-green-100 px-2 py-0.5 text-xs font-semibold text-green-800"
+                      >
+                        {gettext("Approved")}
+                      </span>
+                      <span
+                        :if={lesson_needs_author_review?(lesson)}
+                        data-openstax-author-review-badge
+                        class="inline-flex items-center gap-1 rounded bg-yellow-100 px-2 py-0.5 text-xs font-semibold text-yellow-900"
+                      >
+                        <.icon name="hero-exclamation-triangle" class="h-3.5 w-3.5" />
+                        {gettext("Author review")}
+                      </span>
+                      <span
+                        :if={lesson_busy?(lesson)}
+                        class="inline-flex items-center gap-1 rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-900"
+                        role="status"
+                      >
+                        <.icon name="hero-arrow-path" class="h-3.5 w-3.5" />
+                        {lesson_busy_label(lesson)}
+                      </span>
+                      <span
+                        :if={lesson_planning_failed?(lesson)}
+                        class="rounded bg-red-100 px-2 py-0.5 text-xs font-semibold text-red-800"
+                        role="status"
+                      >
+                        {gettext("Regeneration failed")}
+                      </span>
+                    </div>
+                    <div class="openstax-course-import-source-preview mt-3">
+                      <span class="openstax-course-import-source-cover" aria-hidden="true">
+                        <.icon name="hero-document-text" class="h-4 w-4" />
+                      </span>
+                      <div>
+                        <p class="text-xs font-semibold uppercase tracking-wide text-gray-600">
+                          {gettext("Source preview")}
+                        </p>
+                        <p :if={source_excerpt(lesson) != ""} class="mt-1 text-sm text-gray-700">
+                          {source_excerpt(lesson)}
+                        </p>
+                        <p
+                          :if={source_excerpt(lesson) == ""}
+                          class="mt-1 text-sm italic text-gray-500"
+                        >
+                          {gettext("Source excerpt will be shown when the source pass completes.")}
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                  <div class="flex flex-wrap gap-2">
+                    <.button
+                      variant={:secondary}
+                      size={:sm}
+                      phx-click="edit_lesson"
+                      phx-value-lesson_id={lesson.id}
+                      disabled={lesson_busy?(lesson)}
+                    >
+                      {gettext("Edit")}
+                    </.button>
+                    <.button
+                      variant={:secondary}
+                      size={:sm}
+                      phx-click="regenerate_lesson"
+                      phx-value-lesson_id={lesson.id}
+                      phx-disable-with={gettext("Regenerating...")}
+                      disabled={lesson_busy?(lesson)}
+                    >
+                      {regenerate_button_label(lesson)}
+                    </.button>
+                    <.button
+                      variant={:secondary}
+                      size={:sm}
+                      phx-click="open_reject_lesson"
+                      phx-value-lesson_id={lesson.id}
+                      disabled={lesson_busy?(lesson)}
+                    >
+                      {gettext("Request changes")}
+                    </.button>
+                    <.button
+                      :if={lesson.status != "approved"}
+                      variant={:primary}
+                      size={:sm}
+                      phx-click="approve_lesson"
+                      phx-value-lesson_id={lesson.id}
+                      disabled={lesson_busy?(lesson)}
+                    >
+                      {gettext("Approve lesson")}
+                    </.button>
+                  </div>
+                </div>
+
+                <div
+                  :if={lesson_planning_failed?(lesson)}
+                  class="rounded border border-red-200 bg-red-50 p-3 text-sm text-red-900"
+                  role="alert"
+                >
+                  <p class="font-semibold">{gettext("The previous lesson plan was kept")}</p>
+                  <p class="mt-1">{lesson_planning_error_message(lesson)}</p>
+                  <p class="mt-1 text-xs">
+                    {gettext("Edit the existing plan or retry regeneration when you are ready.")}
+                  </p>
+                </div>
+
+                <details
+                  id={"generated-lesson-material-#{lesson.id}"}
+                  open
+                  class="rounded border border-slate-200 bg-white"
+                >
+                  <summary class="cursor-pointer select-none px-4 py-3 text-sm font-semibold text-gray-900">
+                    <span>{gettext("Generated lesson material")}</span>
+                    <span class="ml-2 text-xs font-normal text-gray-500">
+                      {lesson_instructional_word_count(lesson)} {gettext("instructional words")}
+                    </span>
+                  </summary>
+                  <div class="space-y-5 border-t border-slate-200 px-4 py-4">
+                    <div class="grid gap-3 sm:grid-cols-2">
+                      <div
+                        :if={plan_content(lesson, "opening_hook") != ""}
+                        class="rounded border border-amber-200 bg-amber-50 p-3"
+                      >
+                        <p class="text-xs font-semibold uppercase tracking-wide text-amber-800">
+                          {gettext("Curiosity hook")}
+                        </p>
+                        <p class="mt-2 text-sm leading-6 text-amber-950">
+                          {plan_content(lesson, "opening_hook")}
+                        </p>
+                      </div>
+                      <div
+                        :if={plan_content(lesson, "why_this_matters") != ""}
+                        class="rounded border border-blue-200 bg-blue-50 p-3"
+                      >
+                        <p class="text-xs font-semibold uppercase tracking-wide text-blue-800">
+                          {gettext("Why this matters")}
+                        </p>
+                        <p class="mt-2 text-sm leading-6 text-blue-950">
+                          {plan_content(lesson, "why_this_matters")}
+                        </p>
+                      </div>
+                    </div>
+
+                    <div :if={plan_content(lesson, "narrative") != ""}>
+                      <p class="text-xs font-semibold uppercase tracking-wide text-gray-600">
+                        {gettext("Lesson introduction")}
+                      </p>
+                      <p class="mt-2 whitespace-pre-line text-sm leading-6 text-gray-700">
+                        {plan_content(lesson, "narrative")}
+                      </p>
+                    </div>
+
+                    <section :if={lesson_learning_objectives(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Mapped learning objectives")}
+                      </h5>
+                      <ul class="mt-2 list-disc space-y-1 pl-5 text-sm text-gray-700">
+                        <li :for={objective <- lesson_learning_objectives(lesson)}>
+                          {objective}
+                        </li>
+                      </ul>
+                    </section>
+
+                    <section :if={plan_instructional_sections(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Instructional sections")}
+                      </h5>
+                      <div class="mt-3 space-y-4">
+                        <article
+                          :for={section <- plan_instructional_sections(lesson)}
+                          data-openstax-material-section="instructional"
+                          class="rounded border border-gray-200 bg-gray-50 p-3"
+                        >
+                          <h6 class="font-semibold text-gray-900">
+                            {plan_item_value(
+                              section,
+                              "heading",
+                              gettext("Lesson explanation")
+                            )}
+                          </h6>
+                          <p class="mt-2 whitespace-pre-line text-sm leading-6 text-gray-700">
+                            {plan_item_value(section, "explanation")}
+                          </p>
+                          <ul
+                            :if={plan_item_strings(section, "examples") != []}
+                            class="mt-3 list-disc space-y-1 pl-5 text-sm text-gray-700"
+                          >
+                            <li :for={example <- plan_item_strings(section, "examples")}>
+                              {example}
+                            </li>
+                          </ul>
+                          <p
+                            :if={plan_item_evidence_ids(section) != []}
+                            class="mt-3 break-words text-xs text-gray-500"
+                          >
+                            <span class="font-semibold">{gettext("Source blocks")}:</span>
+                            {Enum.join(plan_item_evidence_ids(section), ", ")}
+                          </p>
+                        </article>
+                      </div>
+                    </section>
+
+                    <section :if={plan_media(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Source figures")}
+                      </h5>
+                      <div class="mt-3 grid gap-4 md:grid-cols-2">
+                        <figure
+                          :for={media <- plan_media(lesson)}
+                          class="overflow-hidden rounded border border-gray-200 bg-white"
+                        >
+                          <img
+                            :if={media_preview_url(media)}
+                            src={media_preview_url(media)}
+                            alt={plan_item_value(media, "alt")}
+                            loading="lazy"
+                            class="max-h-72 w-full object-contain bg-slate-50"
+                          />
+                          <figcaption class="space-y-1 border-t border-gray-200 p-3 text-xs text-gray-700">
+                            <p>{plan_item_value(media, "caption")}</p>
+                            <p
+                              :if={plan_item_value(media, "credit") != ""}
+                              class="text-gray-500"
+                            >
+                              {plan_item_value(media, "credit")}
+                            </p>
+                            <p class="font-medium text-gray-500">
+                              {gettext("Rights")}: {plan_item_value(
+                                media,
+                                "rights_status",
+                                gettext("Requires review")
+                              )}
+                            </p>
+                          </figcaption>
+                        </figure>
+                      </div>
+                    </section>
+
+                    <section :if={plan_callouts(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Real-world connections")}
+                      </h5>
+                      <div class="mt-3 space-y-3">
+                        <aside
+                          :for={callout <- plan_callouts(lesson)}
+                          class="rounded border-l-4 border-cyan-500 bg-cyan-50 p-3 text-cyan-950"
+                        >
+                          <p class="text-xs font-semibold uppercase tracking-wide text-cyan-800">
+                            {plan_item_value(
+                              callout,
+                              "type",
+                              gettext("Source connection")
+                            )}
+                          </p>
+                          <h6 class="mt-1 font-semibold">
+                            {plan_item_value(callout, "title", gettext("Source connection"))}
+                          </h6>
+                          <p class="mt-2 whitespace-pre-line text-sm leading-6">
+                            {plan_item_value(callout, "body")}
+                          </p>
+                        </aside>
+                      </div>
+                    </section>
+
+                    <section :if={
+                      lesson.plan_mode == "advanced" && plan_advanced_screens(lesson) != []
+                    }>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Advanced interaction and rule preview")}
+                      </h5>
+                      <div class="mt-3 space-y-3">
+                        <article
+                          :for={screen <- plan_advanced_screens(lesson)}
+                          data-openstax-advanced-screen={plan_item_value(screen, "id")}
+                          class="rounded border border-purple-200 bg-purple-50 p-3 text-purple-950"
+                        >
+                          <div class="flex flex-wrap items-center justify-between gap-2">
+                            <h6 class="font-semibold">
+                              {plan_item_value(screen, "title", gettext("Adaptive screen"))}
+                            </h6>
+                            <span class="rounded bg-white px-2 py-0.5 text-xs font-semibold text-purple-800">
+                              {plan_item_value(
+                                screen,
+                                "interaction_type",
+                                plan_item_value(screen, "kind", gettext("content"))
+                              )}
+                            </span>
+                          </div>
+                          <p class="mt-2 text-sm">{plan_item_value(screen, "prompt")}</p>
+                          <ul
+                            :if={plan_item_maps(screen, "choices") != []}
+                            class="mt-3 space-y-2 text-xs"
+                          >
+                            <li
+                              :for={choice <- plan_item_maps(screen, "choices")}
+                              class="rounded border border-purple-100 bg-white p-2"
+                            >
+                              <p class="font-medium">{plan_item_value(choice, "text")}</p>
+                              <p :if={plan_item_value(choice, "feedback") != ""} class="mt-1">
+                                <span class="font-semibold">{gettext("Feedback")}:</span>
+                                {plan_item_value(choice, "feedback")}
+                              </p>
+                            </li>
+                          </ul>
+                          <p
+                            :if={
+                              plan_item_value(screen, "remediation") != "" ||
+                                plan_item_value(screen, "remediation_section_id") != ""
+                            }
+                            class="mt-3 text-xs"
+                          >
+                            <span class="font-semibold">{gettext("Remediation")}:</span>
+                            {plan_item_value(
+                              screen,
+                              "remediation",
+                              plan_item_value(screen, "remediation_section_id")
+                            )}
+                          </p>
+                        </article>
+                      </div>
+                      <ul
+                        :if={plan_advanced_remediation_paths(lesson) != []}
+                        class="mt-3 list-disc space-y-1 pl-5 text-xs text-purple-900"
+                      >
+                        <li :for={path <- plan_advanced_remediation_paths(lesson)}>
+                          {plan_item_value(path, "from_question_id", gettext("Interaction"))}
+                          <span aria-hidden="true"> → </span>
+                          {plan_item_value(path, "to_section_id", gettext("review section"))}
+                        </li>
+                      </ul>
+                    </section>
+
+                    <section :if={plan_worked_examples(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Worked examples")}
+                      </h5>
+                      <div class="mt-3 space-y-4">
+                        <article
+                          :for={example <- plan_worked_examples(lesson)}
+                          data-openstax-material-section="worked-example"
+                          class="rounded border border-indigo-200 bg-indigo-50 p-3 text-indigo-950"
+                        >
+                          <h6 class="font-semibold">
+                            {plan_item_value(
+                              example,
+                              "title",
+                              gettext("Guided example")
+                            )}
+                          </h6>
+                          <p class="mt-2 text-sm leading-6">
+                            {plan_item_value(example, "scenario")}
+                          </p>
+                          <ol
+                            :if={plan_item_strings(example, "steps") != []}
+                            class="mt-3 list-decimal space-y-1 pl-5 text-sm"
+                          >
+                            <li :for={step <- plan_item_strings(example, "steps")}>
+                              {step}
+                            </li>
+                          </ol>
+                          <p
+                            :if={plan_item_value(example, "conclusion") != ""}
+                            class="mt-3 text-sm font-medium"
+                          >
+                            {plan_item_value(example, "conclusion")}
+                          </p>
+                        </article>
+                      </div>
+                    </section>
+
+                    <section :if={plan_curiosity_prompts(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Curiosity and prediction prompts")}
+                      </h5>
+                      <ol class="mt-2 list-decimal space-y-2 pl-5 text-sm text-gray-700">
+                        <li :for={prompt <- plan_curiosity_prompts(lesson)}>
+                          {plan_item_value(prompt, "prompt")}
+                        </li>
+                      </ol>
+                    </section>
+
+                    <section :if={plan_questions(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Interleaved formative activities")}
+                      </h5>
+                      <div class="mt-3 space-y-3">
+                        <article
+                          :for={question <- plan_questions(lesson)}
+                          class="rounded border border-emerald-200 bg-emerald-50 p-3"
+                        >
+                          <div class="flex flex-wrap items-center justify-between gap-2">
+                            <p class="font-medium text-emerald-950">{question_text(question)}</p>
+                            <span class="rounded bg-white px-2 py-0.5 text-xs font-semibold text-emerald-800">
+                              {question_type_label(question)}
+                            </span>
+                          </div>
+                          <ul
+                            :if={plan_item_value(question, "choices", []) != []}
+                            class="mt-2 list-disc space-y-1 pl-5 text-sm text-emerald-950"
+                          >
+                            <li :for={choice <- plan_item_value(question, "choices", [])}>
+                              {plan_item_value(choice, "text")}
+                              <span
+                                :if={plan_item_value(choice, "correct", false)}
+                                class="ml-1 text-xs font-semibold text-emerald-700"
+                              >
+                                {gettext("(correct)")}
+                              </span>
+                            </li>
+                          </ul>
+                          <p
+                            :if={plan_item_value(question, "remediation") != ""}
+                            class="mt-2 text-xs text-emerald-800"
+                          >
+                            <span class="font-semibold">{gettext("Remediation")}:</span>
+                            {plan_item_value(question, "remediation")}
+                          </p>
+                        </article>
+                      </div>
+                    </section>
+
+                    <section :if={plan_application_problems(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Application problem set")}
+                      </h5>
+                      <ol class="mt-3 space-y-3">
+                        <li
+                          :for={problem <- plan_application_problems(lesson)}
+                          data-openstax-material-section="application-problem"
+                          class="rounded border border-violet-200 bg-violet-50 p-3 text-sm text-violet-950"
+                        >
+                          <p class="font-medium">{plan_item_value(problem, "prompt")}</p>
+                          <p
+                            :if={plan_item_value(problem, "guidance") != ""}
+                            class="mt-2 text-xs text-violet-800"
+                          >
+                            <span class="font-semibold">{gettext("Guidance")}:</span>
+                            {plan_item_value(problem, "guidance")}
+                          </p>
+                        </li>
+                      </ol>
+                    </section>
+
+                    <section
+                      :if={plan_key_takeaways(lesson) != []}
+                      data-openstax-material-section="takeaways"
+                    >
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Key takeaways")}
+                      </h5>
+                      <ul class="mt-2 list-disc space-y-1 pl-5 text-sm text-gray-700">
+                        <li :for={takeaway <- plan_key_takeaways(lesson)}>{takeaway}</li>
+                      </ul>
+                    </section>
+
+                    <section :if={lesson_excluded_blocks(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Source content excluded from this lesson")}
+                      </h5>
+                      <ul class="mt-2 space-y-2 text-sm text-gray-700">
+                        <li
+                          :for={excluded <- lesson_excluded_blocks(lesson)}
+                          class="rounded border border-yellow-200 bg-yellow-50 p-3"
+                        >
+                          <p class="break-words font-medium">
+                            {plan_item_value(excluded, "id", gettext("Unknown source block"))}
+                          </p>
+                          <p class="mt-1 text-xs text-yellow-900">
+                            {plan_item_value(
+                              excluded,
+                              "reason",
+                              gettext("No reviewer-visible reason was provided.")
+                            )}
+                          </p>
+                        </li>
+                      </ul>
+                    </section>
+
+                    <p
+                      :if={!rich_lesson_material?(lesson)}
+                      class="rounded bg-yellow-50 p-3 text-sm text-yellow-900"
+                    >
+                      {gettext(
+                        "This plan does not include structured instructional material yet. Review it carefully; you may regenerate it or approve it as-is."
+                      )}
+                    </p>
+                  </div>
+                </details>
+
+                <div class="space-y-2">
+                  <div class="flex flex-wrap gap-2 text-xs">
+                    <span class="rounded bg-slate-100 px-2 py-1 font-medium text-slate-700">
+                      {lesson_instructional_word_count(lesson)} {gettext("instructional words")}
+                    </span>
+                    <span
+                      :if={lesson_coverage(lesson).available > 0}
+                      class="rounded bg-slate-100 px-2 py-1 font-medium text-slate-700"
+                    >
+                      {lesson_coverage(lesson).accounted_for}/{lesson_coverage(lesson).available}
+                      {gettext("source blocks accounted for")}
+                    </span>
+                    <span class="rounded bg-slate-100 px-2 py-1 font-medium text-slate-700">
+                      {length(plan_media(lesson))} {gettext("figures")}
+                    </span>
+                    <span class="rounded bg-slate-100 px-2 py-1 font-medium text-slate-700">
+                      {length(plan_application_problems(lesson))} {gettext("application problems")}
+                    </span>
+                  </div>
+                  <p class="text-xs font-semibold uppercase tracking-wide text-gray-600">
+                    {gettext("Source references")}
+                  </p>
+                  <div
+                    :if={lesson_sections(lesson) != []}
+                    class="flex flex-wrap gap-1.5"
+                  >
+                    <span
+                      :for={section <- lesson_sections(lesson)}
+                      class="rounded bg-blue-50 px-2 py-0.5 text-xs text-blue-900"
+                    >
+                      {section}
+                    </span>
+                  </div>
+
+                  <div :if={lesson_evidence_links(lesson) != []}>
+                    <p class="text-xs font-semibold text-gray-600">{gettext("Evidence links")}</p>
+                    <ul class="mt-1 space-y-1 text-xs break-words">
+                      <li :for={link <- lesson_evidence_links(lesson)}>
+                        <.link href={link} target="_blank" rel="noopener noreferrer">
+                          {link}
+                        </.link>
+                      </li>
+                    </ul>
+                  </div>
+
+                  <p class="text-xs text-gray-500">
+                    {question_count(lesson)} {gettext("questions included")}
+                  </p>
+                  <div class="flex flex-wrap items-center gap-2 text-xs">
+                    <span class="font-semibold text-gray-600">{gettext("Plan checks")}</span>
+                    <span class={[
+                      "rounded px-2 py-0.5 font-semibold",
+                      if(check_status(lesson_checks(lesson)) in ["ok", "passed"],
+                        do: "bg-green-100 text-green-800",
+                        else: "bg-yellow-100 text-yellow-800"
+                      )
+                    ]}>
+                      {check_status(lesson_checks(lesson))}
+                    </span>
+                    <span
+                      :if={lesson_needs_author_review?(lesson)}
+                      data-openstax-author-review-warning
+                      class="font-medium text-yellow-900"
+                    >
+                      {gettext(
+                        "Automated checks found items for author review. You may edit, regenerate, or approve this lesson as-is."
+                      )}
+                    </span>
+                  </div>
+                  <div
+                    :if={lesson_rejection_reason(lesson) != ""}
+                    class="rounded border border-yellow-200 bg-yellow-50 p-3 text-xs text-yellow-950"
+                  >
+                    <p class="font-semibold">{gettext("Requested revision")}</p>
+                    <p class="mt-1 whitespace-pre-line">{lesson_rejection_reason(lesson)}</p>
+                  </div>
+                  <div :if={failed_lesson_checks(lesson) != []} class="space-y-2">
+                    <article
+                      :for={check <- failed_lesson_checks(lesson)}
+                      data-openstax-failed-check={map_string_key(check, "check_type", "unknown")}
+                      class="rounded border border-yellow-200 bg-yellow-50 p-3 text-xs text-yellow-950"
+                    >
+                      <p class="font-semibold">{check_type_label(check)}</p>
+                      <ul
+                        :if={check_issues(check) != []}
+                        class="mt-2 list-disc space-y-1 pl-5"
+                      >
+                        <li :for={issue <- check_issues(check)}>{issue}</li>
+                      </ul>
+                      <dl
+                        :if={check_repair_items(check) != []}
+                        class="mt-3 space-y-1 border-t border-yellow-200 pt-2"
+                      >
+                        <div :for={{label, value} <- check_repair_items(check)}>
+                          <dt class="inline font-semibold">{label}:</dt>
+                          <dd class="inline">{value}</dd>
+                        </div>
+                      </dl>
+                    </article>
+                  </div>
+                </div>
+
+                <form
+                  :if={@editing_lesson_id == lesson.id && !lesson_busy?(lesson)}
+                  id={"edit-openstax-lesson-#{lesson.id}"}
+                  phx-submit="save_lesson"
+                  class="space-y-3 rounded border border-blue-200 bg-white p-4"
+                >
+                  <input type="hidden" name="lesson_id" value={lesson.id} />
+                  <div>
+                    <label
+                      class="block text-sm font-semibold text-gray-800"
+                      for={"objective-#{lesson.id}"}
+                    >
+                      {gettext("Learning objectives")}
+                    </label>
+                    <textarea
+                      id={"objective-#{lesson.id}"}
+                      name="lesson_plan[learning_objectives]"
+                      rows="3"
+                      class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
+                    >{Enum.join(lesson_learning_objectives(lesson), "\n")}</textarea>
+                    <p class="mt-1 text-xs text-gray-500">
+                      {gettext("Enter one measurable objective per line.")}
+                    </p>
+                  </div>
+                  <div>
+                    <label
+                      class="block text-sm font-semibold text-gray-800"
+                      for={"narrative-#{lesson.id}"}
+                    >
+                      {gettext("Lesson narrative")}
+                    </label>
+                    <textarea
+                      id={"narrative-#{lesson.id}"}
+                      name="lesson_plan[narrative]"
+                      rows="5"
+                      class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
+                    >{plan_content(lesson, "narrative", source_excerpt(lesson))}</textarea>
+                  </div>
+                  <fieldset class="space-y-4 rounded border border-slate-200 bg-slate-50 p-4">
+                    <legend class="px-1 text-sm font-semibold text-gray-900">
+                      {gettext("Lesson material")}
+                    </legend>
+                    <p class="text-xs text-gray-600">
+                      {gettext(
+                        "Edit the learner-facing text below. Source evidence, media, worked-example steps, and adaptive metadata stay attached."
+                      )}
+                    </p>
+
+                    <div>
+                      <label
+                        class="block text-sm font-semibold text-gray-800"
+                        for={"opening-hook-#{lesson.id}"}
+                      >
+                        {gettext("Opening hook")}
+                      </label>
+                      <textarea
+                        id={"opening-hook-#{lesson.id}"}
+                        name="lesson_plan[opening_hook]"
+                        rows="3"
+                        class="mt-1 block w-full rounded border-gray-300 bg-white text-sm focus:border-primary focus:ring-primary"
+                      >{plan_content(lesson, "opening_hook")}</textarea>
+                    </div>
+
+                    <div>
+                      <label
+                        class="block text-sm font-semibold text-gray-800"
+                        for={"why-this-matters-#{lesson.id}"}
+                      >
+                        {gettext("Why this matters")}
+                      </label>
+                      <textarea
+                        id={"why-this-matters-#{lesson.id}"}
+                        name="lesson_plan[why_this_matters]"
+                        rows="3"
+                        class="mt-1 block w-full rounded border-gray-300 bg-white text-sm focus:border-primary focus:ring-primary"
+                      >{plan_content(lesson, "why_this_matters")}</textarea>
+                    </div>
+
+                    <section :if={plan_instructional_sections(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Instructional sections")}
+                      </h5>
+                      <div class="mt-2 space-y-3">
+                        <div
+                          :for={
+                            {section, index} <-
+                              Enum.with_index(plan_instructional_sections(lesson))
+                          }
+                          class="rounded border border-gray-200 bg-white p-3"
+                        >
+                          <label
+                            class="block text-xs font-semibold text-gray-700"
+                            for={"instructional-section-heading-#{lesson.id}-#{index}"}
+                          >
+                            {gettext("Section heading")}
+                          </label>
+                          <input
+                            type="text"
+                            id={"instructional-section-heading-#{lesson.id}-#{index}"}
+                            name={"lesson_plan[instructional_sections][#{index}][heading]"}
+                            value={plan_item_value(section, "heading")}
+                            class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
+                          />
+                          <label
+                            class="mt-3 block text-xs font-semibold text-gray-700"
+                            for={"instructional-section-explanation-#{lesson.id}-#{index}"}
+                          >
+                            {gettext("Explanation")}
+                          </label>
+                          <textarea
+                            id={"instructional-section-explanation-#{lesson.id}-#{index}"}
+                            name={"lesson_plan[instructional_sections][#{index}][explanation]"}
+                            rows="5"
+                            class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
+                          >{plan_item_value(section, "explanation")}</textarea>
+                        </div>
+                      </div>
+                    </section>
+
+                    <section :if={plan_worked_examples(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Worked examples")}
+                      </h5>
+                      <div class="mt-2 space-y-3">
+                        <div
+                          :for={{example, index} <- Enum.with_index(plan_worked_examples(lesson))}
+                          class="rounded border border-gray-200 bg-white p-3"
+                        >
+                          <label
+                            class="block text-xs font-semibold text-gray-700"
+                            for={"worked-example-title-#{lesson.id}-#{index}"}
+                          >
+                            {gettext("Example title")}
+                          </label>
+                          <input
+                            type="text"
+                            id={"worked-example-title-#{lesson.id}-#{index}"}
+                            name={"lesson_plan[worked_examples][#{index}][title]"}
+                            value={plan_item_value(example, "title")}
+                            class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
+                          />
+                          <label
+                            class="mt-3 block text-xs font-semibold text-gray-700"
+                            for={"worked-example-body-#{lesson.id}-#{index}"}
+                          >
+                            {gettext("Example body")}
+                          </label>
+                          <textarea
+                            id={"worked-example-body-#{lesson.id}-#{index}"}
+                            name={"lesson_plan[worked_examples][#{index}][scenario]"}
+                            rows="4"
+                            class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
+                          >{plan_item_value(example, "scenario")}</textarea>
+                        </div>
+                      </div>
+                    </section>
+
+                    <section :if={plan_curiosity_prompts(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Curiosity prompts")}
+                      </h5>
+                      <div class="mt-2 space-y-3">
+                        <div :for={
+                          {prompt, index} <- Enum.with_index(plan_curiosity_prompts(lesson))
+                        }>
+                          <label
+                            class="block text-xs font-semibold text-gray-700"
+                            for={"curiosity-prompt-#{lesson.id}-#{index}"}
+                          >
+                            {gettext("Prompt %{number}", number: index + 1)}
+                          </label>
+                          <textarea
+                            id={"curiosity-prompt-#{lesson.id}-#{index}"}
+                            name={"lesson_plan[curiosity_prompts][#{index}][prompt]"}
+                            rows="2"
+                            class="mt-1 block w-full rounded border-gray-300 bg-white text-sm focus:border-primary focus:ring-primary"
+                          >{plan_item_value(prompt, "prompt")}</textarea>
+                        </div>
+                      </div>
+                    </section>
+
+                    <section :if={plan_application_problems(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Application problems")}
+                      </h5>
+                      <div class="mt-2 space-y-3">
+                        <div :for={
+                          {problem, index} <- Enum.with_index(plan_application_problems(lesson))
+                        }>
+                          <label
+                            class="block text-xs font-semibold text-gray-700"
+                            for={"application-problem-#{lesson.id}-#{index}"}
+                          >
+                            {gettext("Problem %{number}", number: index + 1)}
+                          </label>
+                          <textarea
+                            id={"application-problem-#{lesson.id}-#{index}"}
+                            name={"lesson_plan[application_problems][#{index}][prompt]"}
+                            rows="3"
+                            class="mt-1 block w-full rounded border-gray-300 bg-white text-sm focus:border-primary focus:ring-primary"
+                          >{plan_item_value(problem, "prompt")}</textarea>
+                        </div>
+                      </div>
+                    </section>
+
+                    <section :if={plan_key_takeaways(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Key takeaways")}
+                      </h5>
+                      <div class="mt-2 space-y-3">
+                        <div :for={
+                          {takeaway, index} <- Enum.with_index(plan_key_takeaways(lesson))
+                        }>
+                          <label
+                            class="block text-xs font-semibold text-gray-700"
+                            for={"key-takeaway-#{lesson.id}-#{index}"}
+                          >
+                            {gettext("Takeaway %{number}", number: index + 1)}
+                          </label>
+                          <textarea
+                            id={"key-takeaway-#{lesson.id}-#{index}"}
+                            name="lesson_plan[key_takeaways][]"
+                            rows="2"
+                            class="mt-1 block w-full rounded border-gray-300 bg-white text-sm focus:border-primary focus:ring-primary"
+                          >{takeaway}</textarea>
+                        </div>
+                      </div>
+                    </section>
+                  </fieldset>
+                  <div>
+                    <p class="block text-sm font-semibold text-gray-800">
+                      {gettext("Formative questions")}
+                    </p>
+                    <p class="mt-1 text-xs text-gray-500">
+                      {gettext(
+                        "Edit prompts without losing their choices, feedback, evidence, or adaptive rules."
+                      )}
+                    </p>
+                    <div class="mt-2 space-y-3">
+                      <div
+                        :for={question <- plan_questions(lesson)}
+                        class="rounded border border-gray-200 bg-gray-50 p-3"
+                      >
+                        <input
+                          type="hidden"
+                          name="lesson_plan[question_order][]"
+                          value={plan_item_value(question, "id")}
+                        />
+                        <label
+                          class="flex items-center justify-between gap-2 text-xs font-semibold text-gray-700"
+                          for={"question-#{lesson.id}-#{plan_item_value(question, "id")}"}
+                        >
+                          <span>{question_type_label(question)}</span>
+                          <span class="font-normal text-gray-500">
+                            {plan_item_value(question, "id")}
+                          </span>
+                        </label>
+                        <textarea
+                          id={"question-#{lesson.id}-#{plan_item_value(question, "id")}"}
+                          name={"lesson_plan[question_prompts][#{plan_item_value(question, "id")}]"}
+                          rows="2"
+                          class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
+                        >{question_text(question)}</textarea>
+                      </div>
+                    </div>
+                  </div>
+                  <div>
+                    <label
+                      class="block text-sm font-semibold text-gray-800"
+                      for={"mode-#{lesson.id}"}
+                    >
+                      {gettext("Authoring mode")}
+                    </label>
+                    <select
+                      id={"mode-#{lesson.id}"}
+                      name="lesson_plan[plan_mode]"
+                      class="mt-1 rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
+                    >
+                      <option value="basic" selected={lesson.plan_mode == "basic"}>
+                        {gettext("Basic Author")}
+                      </option>
+                      <option value="advanced" selected={lesson.plan_mode == "advanced"}>
+                        {gettext("Advanced Author")}
+                      </option>
+                    </select>
+                  </div>
+                  <div class="flex gap-3">
+                    <.button type="submit" variant={:primary} size={:sm}>
+                      {gettext("Save and recheck")}
+                    </.button>
+                    <button
+                      type="button"
+                      class="text-sm font-semibold text-gray-600 hover:underline"
+                      phx-click="close_lesson_editor"
+                    >
+                      {gettext("Cancel")}
+                    </button>
+                  </div>
+                </form>
+
+                <form
+                  :if={@rejecting_lesson_id == lesson.id && !lesson_busy?(lesson)}
+                  id={"reject-openstax-lesson-#{lesson.id}"}
+                  phx-submit="reject_lesson"
+                  class="rounded border border-yellow-300 bg-yellow-50 p-4"
+                >
+                  <input type="hidden" name="lesson_id" value={lesson.id} />
+                  <label
+                    class="block text-sm font-semibold text-yellow-950"
+                    for={"reason-#{lesson.id}"}
+                  >
+                    {gettext("What should change?")}
+                  </label>
+                  <textarea
+                    id={"reason-#{lesson.id}"}
+                    name="reason"
+                    required
+                    rows="3"
+                    class="mt-2 block w-full rounded border-yellow-300 text-sm focus:border-yellow-600 focus:ring-yellow-600"
+                  ></textarea>
+                  <div class="mt-3 flex gap-3">
+                    <.button type="submit" variant={:secondary} size={:sm}>
+                      {gettext("Request revision")}
+                    </.button>
+                    <button
+                      type="button"
+                      class="text-sm font-semibold text-yellow-900 hover:underline"
+                      phx-click="close_reject_lesson"
+                    >
+                      {gettext("Cancel")}
+                    </button>
+                  </div>
+                </form>
+              </div>
+            </article>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section
+      :if={status == :compiling}
+      class="rounded border border-gray-200 bg-white p-6 shadow-sm"
+    >
+      <h3 class="text-lg font-semibold text-gray-900">{gettext("Ready to create the course")}</h3>
+      <p class="mt-1 text-sm text-gray-600">
+        {gettext(
+          "All lesson plans are approved. Creating lessons runs in the background and will not interrupt your authoring session."
+        )}
+      </p>
+      <.button
+        class="mt-5"
+        variant={:primary}
+        phx-click="apply"
+        phx-disable-with={gettext("Creating course...")}
+      >
+        {gettext("Create approved lessons")}
+      </.button>
+    </section>
+    <section
+      :if={status == :completed}
+      class="rounded border border-green-200 bg-green-50 p-6 text-green-950"
+    >
+      <h3 class="text-lg font-semibold">{gettext("Course created")}</h3>
+      <p class="mt-1 text-sm">
+        {gettext(
+          "Your approved lessons have been added to the project. A completion email is sent when your author account has an email address."
+        )}
+      </p>
+      <.link
+        navigate={@return_path}
+        class="mt-4 inline-block font-semibold text-primary hover:underline"
+      >
+        {gettext("Return to curriculum")}
+      </.link>
+    </section>
+    <section
+      :if={status in [:failed, :cancelled]}
+      class="rounded border border-red-200 bg-red-50 p-6 text-red-900"
+    >
+      <h3 class="text-lg font-semibold">
+        {if status == :failed,
+          do: gettext("Course import failed"),
+          else: gettext("Course import cancelled")}
+      </h3>
+      <p class="mt-1 text-sm">
+        {gettext(
+          "No unapproved lesson content was added. Start a new import from the curriculum page when you are ready."
+        )}
+      </p>
+      <div
+        :if={status == :failed}
+        class="mt-4 rounded border border-red-200 bg-white/70 p-3 text-sm"
+      >
+        <p class="font-semibold">{gettext("Failure details")}</p>
+        <p class="mt-1 break-words">{run_error_message(@run)}</p>
+      </div>
+      <div class="mt-5 flex flex-wrap gap-3">
+        <.button
+          :if={status == :failed && run_recoverable?(@run)}
+          variant={:primary}
+          phx-click="retry_run"
+        >
+          {gettext("Retry import")}
+        </.button>
+        <.link navigate={@return_path} class="text-sm font-semibold text-primary hover:underline">
+          {gettext("Return to curriculum")}
+        </.link>
+      </div>
+    </section>
+  <% end %>
+</div>

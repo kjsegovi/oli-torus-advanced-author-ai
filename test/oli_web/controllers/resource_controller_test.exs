@@ -35,15 +35,32 @@ defmodule OliWeb.ResourceControllerTest do
                "<li class=\"breadcrumb-item active truncate\" aria-current=\"page\">\n  #{revision.title}\n</li>"
     end
 
-    test "renders adaptive editor", %{
+    test "redirects adaptive pages to the workspace editor shell", %{
       conn: conn,
       project: project,
       adaptive_page_revision: revision
     } do
       conn = get(conn, Routes.resource_path(conn, :edit, project.slug, revision.slug))
 
-      assert html_response(conn, 200) =~
-               "<div data-react-class=\"Components.Authoring\" data-react-props=\""
+      assert redirected_to(conn, 302) ==
+               "/workspaces/course_author/#{project.slug}/curriculum/#{revision.slug}/edit"
+    end
+
+    test "preserves a valid adaptive creation mode when redirecting", %{
+      conn: conn,
+      project: project,
+      adaptive_page_revision: revision
+    } do
+      conn =
+        get(
+          conn,
+          Routes.resource_path(conn, :edit, project.slug, revision.slug, %{
+            creation_mode: "flowchart"
+          })
+        )
+
+      assert redirected_to(conn, 302) ==
+               "/workspaces/course_author/#{project.slug}/curriculum/#{revision.slug}/edit?creation_mode=flowchart"
     end
 
     test "renders error when resource does not exist", %{conn: conn, project: project} do

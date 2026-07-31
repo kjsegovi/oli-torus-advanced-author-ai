@@ -52,6 +52,14 @@ defmodule OliWeb.Workspaces.CourseAuthor.Curriculum.Entry do
             {container_link(@child, @project, @numberings, "ml-1 mr-1 entry-title")}
           <% else %>
             <span class="ml-1 mr-1 entry-title">{@child.title}</span>
+            <span
+              :if={ResourceType.is_adaptive_page(@child)}
+              data-authoring-mode="advanced"
+              class="badge rounded-pill px-2 py-1 text-xs font-semibold bg-primary text-white"
+              title="This lesson opens in Advanced Author"
+            >
+              Advanced Author
+            </span>
             <.edit_link
               project_slug={@project.slug}
               child={@child}

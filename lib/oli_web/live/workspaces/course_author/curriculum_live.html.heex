@@ -217,6 +217,26 @@
         <i class="fas fa-history"></i> View revision history
       </.link>
       <.button
+        :if={@google_slides_import_visible?}
+        href={
+          ~p"/workspaces/course_author/#{@project.slug}/curriculum/#{@container.slug}/import/google-slides"
+        }
+        variant={:primary}
+        size={:sm}
+        aria-label={gettext("Import from Google Slides")}
+      >
+        {gettext("Import from Google Slides")}
+      </.button>
+      <.button
+        :if={@openstax_course_import_visible?}
+        href={~p"/workspaces/course_author/#{@project.slug}/curriculum/import/openstax"}
+        variant={:primary}
+        size={:sm}
+        aria-label={gettext("Create course from OpenStax")}
+      >
+        {gettext("Create course from OpenStax")}
+      </.button>
+      <.button
         :if={can_import?(@author, @project)}
         variant={:primary}
         size={:sm}

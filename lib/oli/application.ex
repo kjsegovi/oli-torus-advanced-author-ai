@@ -154,6 +154,7 @@ defmodule Oli.Application do
         Task.Supervisor.start_child(Oli.TaskSupervisor, fn ->
           Process.sleep(1_000)
           safe_inventory_recovery()
+          safe_course_import_recovery()
         end)
 
         {:ok, pid}
@@ -218,6 +219,26 @@ defmodule Oli.Application do
 
         :ok
     end
+  end
+
+  defp safe_course_import_recovery do
+    unless Application.get_env(:oli, :env) == :test do
+      case Oban.insert(Oli.OpenStax.CourseImport.Worker.RunHealthWorker.new(%{})) do
+        {:ok, _job} ->
+          :ok
+
+        {:error, reason} ->
+          Logger.error("OpenStax course import recovery enqueue failed: #{inspect(reason)}")
+          :ok
+      end
+    end
+  rescue
+    exception ->
+      Logger.error(
+        "OpenStax course import recovery failed: #{Exception.format(:error, exception, __STACKTRACE__)}"
+      )
+
+      :ok
   end
 
   defp maybe_add_appsignal_logger_backend do

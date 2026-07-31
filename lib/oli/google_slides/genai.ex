@@ -4,10 +4,14 @@ defmodule Oli.GoogleSlides.GenAI do
 
   Model resolution order:
 
-  1. `ServiceConfig` named `"google_slides_import"`
-  2. Default seeded `ServiceConfig` named `"standard-no-backup"`
-  3. First persisted OpenAI `RegisteredModel`
-  4. Ephemeral model built from `OPENAI_API_KEY` in the environment
+  1. Global `FeatureConfig` for `:google_slides_import`
+  2. `ServiceConfig` named `"google_slides_import"`
+  3. Ephemeral model built from `OPENAI_API_KEY` in the environment
+  4. Default seeded `ServiceConfig` named `"standard-no-backup"`
+
+  Arbitrary persisted models are never selected: course material must only be
+  sent through an explicitly named/assigned route or the documented
+  environment fallback.
   """
 
   require Logger
@@ -16,16 +20,18 @@ defmodule Oli.GoogleSlides.GenAI do
 
   alias Oli.GenAI.Completions
   alias Oli.GenAI.Completions.{Message, RegisteredModel, ServiceConfig}
+  alias Oli.GenAI.FeatureConfig
   alias Oli.Repo
 
   @service_name "google_slides_import"
   @fallback_service_name "standard-no-backup"
   @default_openai_url "https://api.openai.com"
   @default_openai_model "gpt-4o-mini"
+  @default_openai_recv_timeout 120_000
 
   @spec configured?() :: boolean()
   def configured? do
-    case resolve_model() do
+    case resolve_service_config() do
       {:ok, _} -> true
       _ -> false
     end
@@ -33,15 +39,51 @@ defmodule Oli.GoogleSlides.GenAI do
     _ -> false
   end
 
-  @spec resolve_model() :: {:ok, RegisteredModel.t()} | {:error, :not_configured}
-  def resolve_model do
-    with {:error, :not_configured} <- service_config_model(@service_name),
-         {:error, :not_configured} <- service_config_model(@fallback_service_name),
-         {:error, :not_configured} <- first_openai_model(),
-         {:error, :not_configured} <- env_openai_model() do
+  @doc """
+  Resolves the routing configuration used by the durable import planner.
+
+  Persisted service configurations retain their primary, secondary, and backup
+  routing policy. Legacy model-only and environment fallbacks are wrapped in a
+  synthetic primary-only configuration so they still pass through the common
+  GenAI execution boundary.
+  """
+  @spec resolve_service_config() :: {:ok, ServiceConfig.t()} | {:error, :not_configured}
+  def resolve_service_config do
+    with {:error, :not_configured} <- feature_service_config(),
+         {:error, :not_configured} <- named_service_config(@service_name),
+         {:error, :not_configured} <- env_openai_model(),
+         {:error, :not_configured} <- named_service_config(@fallback_service_name) do
       {:error, :not_configured}
     else
-      {:ok, model} -> {:ok, model}
+      {:ok, %ServiceConfig{} = service_config} ->
+        ensure_tool_capable(service_config)
+
+      {:ok, %RegisteredModel{} = model} ->
+        {:ok, synthetic_service_config(model)}
+    end
+  end
+
+  defp feature_service_config do
+    case FeatureConfig.load_for(nil, :google_slides_import) do
+      {:ok,
+       %ServiceConfig{
+         primary_model: %RegisteredModel{provider: provider}
+       } = service_config}
+      when provider == :open_ai ->
+        {:ok, service_config}
+
+      _ ->
+        {:error, :not_configured}
+    end
+  rescue
+    _ -> {:error, :not_configured}
+  end
+
+  @spec resolve_model() :: {:ok, RegisteredModel.t()} | {:error, :not_configured}
+  def resolve_model do
+    case resolve_service_config() do
+      {:ok, %ServiceConfig{primary_model: %RegisteredModel{} = model}} -> {:ok, model}
+      _ -> {:error, :not_configured}
     end
   end
 
@@ -73,22 +115,57 @@ defmodule Oli.GoogleSlides.GenAI do
     |> String.trim()
   end
 
-  defp service_config_model(name) do
-    case Repo.get_by(ServiceConfig, name: name) |> Repo.preload(:primary_model) do
-      %ServiceConfig{primary_model: %RegisteredModel{} = model} -> {:ok, model}
-      _ -> {:error, :not_configured}
+  defp named_service_config(name) do
+    case Repo.get_by(ServiceConfig, name: name)
+         |> Repo.preload([:primary_model, :secondary_model, :backup_model]) do
+      %ServiceConfig{
+        primary_model: %RegisteredModel{provider: provider}
+      } = service_config
+      when provider == :open_ai ->
+        {:ok, service_config}
+
+      _ ->
+        {:error, :not_configured}
     end
   rescue
     _ -> {:error, :not_configured}
   end
 
-  defp first_openai_model do
-    case Repo.one(from(m in RegisteredModel, where: m.provider == ^:open_ai, limit: 1)) do
-      %RegisteredModel{} = model -> {:ok, model}
-      _ -> {:error, :not_configured}
+  defp ensure_tool_capable(%ServiceConfig{} = service_config) do
+    models = [
+      service_config.primary_model,
+      service_config.secondary_model,
+      service_config.backup_model
+    ]
+
+    if Enum.all?(models, fn
+         nil -> true
+         %RegisteredModel{provider: :open_ai} -> true
+         _ -> false
+       end) do
+      {:ok, service_config}
+    else
+      {:error, :not_configured}
     end
-  rescue
-    _ -> {:error, :not_configured}
+  end
+
+  defp ensure_tool_capable(_service_config), do: {:error, :not_configured}
+
+  defp synthetic_service_config(%RegisteredModel{} = model) do
+    model =
+      if is_nil(model.id) do
+        %{model | id: -1}
+      else
+        model
+      end
+
+    %ServiceConfig{
+      id: -1,
+      name: "google-slides-import-fallback",
+      primary_model: model,
+      secondary_model: nil,
+      backup_model: nil
+    }
   end
 
   defp env_openai_model do
@@ -105,9 +182,25 @@ defmodule Oli.GoogleSlides.GenAI do
            url_template: System.get_env("OPENAI_API_URL") || @default_openai_url,
            api_key: api_key,
            secondary_api_key: System.get_env("OPENAI_ORG_KEY"),
-           timeout: env_integer("OPENAI_TIMEOUT", 8000),
-           recv_timeout: env_integer("OPENAI_RECV_TIMEOUT", 60_000),
-           pool_class: :slow
+           timeout:
+             env_integer(
+               "GOOGLE_SLIDES_IMPORT_OPENAI_TIMEOUT",
+               env_integer("OPENAI_TIMEOUT", 8_000)
+             ),
+           recv_timeout:
+             env_integer(
+               "GOOGLE_SLIDES_IMPORT_OPENAI_RECV_TIMEOUT",
+               env_integer("OPENAI_RECV_TIMEOUT", @default_openai_recv_timeout)
+             ),
+           pool_class: :slow,
+           # This synthetic route has no secondary or backup model. Opening its
+           # breaker after one transient error only prevents Oban from making
+           # the remaining attempts and replaces the provider error with
+           # :all_breakers_open. The durable import worker owns retries for this
+           # fallback; configured multi-model routes retain their breaker policy.
+           routing_breaker_error_rate_threshold: 0.0,
+           routing_breaker_429_threshold: 0.0,
+           routing_breaker_latency_p95_ms: 0
          }}
     end
   end

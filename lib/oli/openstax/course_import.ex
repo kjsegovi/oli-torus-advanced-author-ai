@@ -1,0 +1,4094 @@
+defmodule Oli.OpenStax.CourseImport do
+  @moduledoc """
+  Durable context for project-scoped OpenStax course imports.
+
+  This module is the authorization and state-machine boundary. Background
+  workers may only advance runs through these functions, which keeps retries,
+  browser reconnection, and user mutations consistent.
+  """
+
+  import Ecto.Query
+
+  require Logger
+
+  alias Oli.Accounts.Author
+  alias Oli.Authoring.Course.Project
+  alias Oli.Authoring.Editing.Utils, as: EditingUtils
+
+  alias Oli.OpenStax.CourseImport.{
+    AIPlanner,
+    Checks,
+    Compiler,
+    Lesson,
+    LessonCheck,
+    LessonPlan,
+    MediaIngestor,
+    Outbox,
+    Parser,
+    Planner,
+    PubSub,
+    RichSource,
+    Run,
+    SourceAsset,
+    Telemetry,
+    Unit
+  }
+
+  alias Oli.OpenStax.CourseImport.Worker.{
+    ApplyWorker,
+    LessonPlanningCoordinatorWorker,
+    LessonPlanWorker,
+    LessonPlannerWorker,
+    MediaWorker,
+    OutlineWorker,
+    PreflightWorker
+  }
+
+  alias Oli.Publishing.AuthoringResolver
+  alias Oli.Publishing
+  alias Oli.Repo
+  alias Oli.Resources.Revision
+  alias Oli.ScopedFeatureFlags
+
+  @active_statuses [
+    :preflighting,
+    :awaiting_scope,
+    :ingesting,
+    :staging_media,
+    :planning_outline,
+    :awaiting_outline_approval,
+    :planning_lessons,
+    :awaiting_lesson_approval,
+    :compiling,
+    :applying
+  ]
+
+  @terminal_statuses [:completed, :failed, :cancelled]
+  @active_lesson_planning_states ["queued", "running", "retrying"]
+  @unfinished_lesson_planning_states ["pending" | @active_lesson_planning_states]
+  @progress_timing_history_limit 20
+  @progress_item_history_limit 30
+
+  @allowed_transitions %{
+    preflighting: [:awaiting_scope, :failed, :cancelled],
+    awaiting_scope: [:ingesting, :failed, :cancelled],
+    ingesting: [:planning_outline, :failed, :cancelled],
+    planning_outline: [:awaiting_outline_approval, :failed, :cancelled],
+    awaiting_outline_approval: [:planning_lessons, :failed, :cancelled],
+    planning_lessons: [:awaiting_lesson_approval, :failed, :cancelled],
+    awaiting_lesson_approval: [:compiling, :failed, :cancelled],
+    compiling: [:awaiting_lesson_approval, :staging_media, :applying, :failed, :cancelled],
+    staging_media: [:awaiting_lesson_approval, :applying, :failed, :cancelled],
+    applying: [:completed, :failed, :cancelled],
+    completed: [],
+    failed: [],
+    cancelled: []
+  }
+
+  @spec available?(Project.t(), Author.t()) :: boolean()
+  def available?(%Project{} = project, %Author{} = author) do
+    ScopedFeatureFlags.enabled?(:openstax_course_import, project) and
+      authorize_project(project, author) == :ok
+  rescue
+    _ -> false
+  end
+
+  def available?(_, _), do: false
+
+  @spec start_import(Project.t(), Revision.t() | integer(), Author.t(), String.t()) ::
+          {:ok, Run.t()} | {:error, term()}
+  def start_import(
+        %Project{} = project,
+        target_container,
+        %Author{} = author,
+        source_url
+      )
+      when is_binary(source_url) do
+    source_url = String.trim(source_url)
+
+    with :ok <- authorize_project(project, author),
+         :ok <- ensure_feature_available(project),
+         {:ok, target_resource_id} <- target_resource_id(target_container),
+         :ok <- ensure_project_root_empty(project, target_resource_id),
+         :ok <- ensure_no_active_run(project.id, target_resource_id) do
+      case Parser.parse_openstax_url(source_url) do
+        {:ok, book_slug} ->
+          create_run(project, author, target_resource_id, source_url, book_slug)
+
+        {:error, :invalid_openstax_url} ->
+          create_invalid_source_run(project, author, target_resource_id, source_url)
+      end
+    end
+  end
+
+  def start_import(%Project{}, _target, _author, _source_url), do: {:error, :invalid_input}
+
+  @spec get_run(Project.t(), Author.t(), Ecto.UUID.t()) ::
+          {:ok, Run.t()} | {:error, term()}
+  def get_run(%Project{} = project, %Author{} = author, run_id) when is_binary(run_id) do
+    with :ok <- authorize_project(project, author) do
+      case Repo.one(
+             from(run in Run,
+               where:
+                 run.id == ^run_id and run.project_id == ^project.id and
+                   run.author_id == ^author.id
+             )
+           ) do
+        nil -> {:error, :not_found}
+        run -> {:ok, preload_run(run)}
+      end
+    end
+  end
+
+  def get_run(_, _, _), do: {:error, :not_found}
+
+  @doc """
+  Returns the authorized run row without loading its units, lessons, and plan
+  history. Long-running LiveView polling uses this lightweight checkpoint and
+  reloads the full plan only when the workflow enters a review stage.
+  """
+  @spec get_run_checkpoint(Project.t(), Author.t(), Ecto.UUID.t()) ::
+          {:ok, Run.t()} | {:error, term()}
+  def get_run_checkpoint(%Project{} = project, %Author{} = author, run_id)
+      when is_binary(run_id) do
+    with :ok <- authorize_project(project, author) do
+      case Repo.one(
+             from(run in Run,
+               where:
+                 run.id == ^run_id and run.project_id == ^project.id and
+                   run.author_id == ^author.id
+             )
+           ) do
+        nil -> {:error, :not_found}
+        run -> {:ok, run}
+      end
+    end
+  end
+
+  def get_run_checkpoint(_, _, _), do: {:error, :not_found}
+
+  @spec get_active_run(Project.t(), Author.t(), Revision.t() | integer()) ::
+          {:ok, Run.t()} | {:error, term()}
+  def get_active_run(%Project{} = project, %Author{} = author, target_container) do
+    with :ok <- authorize_project(project, author),
+         {:ok, target_resource_id} <- target_resource_id(target_container) do
+      case Repo.one(
+             from(run in Run,
+               where:
+                 run.project_id == ^project.id and run.author_id == ^author.id and
+                   run.target_root_container_resource_id == ^target_resource_id and
+                   run.status in ^@active_statuses,
+               order_by: [desc: run.inserted_at],
+               limit: 1
+             )
+           ) do
+        nil -> {:error, :not_found}
+        run -> {:ok, preload_run(run)}
+      end
+    end
+  end
+
+  @spec load_run_details(Ecto.UUID.t(), Author.t()) :: {:ok, Run.t()} | {:error, term()}
+  def load_run_details(run_id, %Author{} = author) when is_binary(run_id) do
+    with {:ok, run} <- get_owned_run(run_id, author),
+         %Project{} = project <- Repo.get(Project, run.project_id),
+         :ok <- authorize_project(project, author) do
+      {:ok, preload_run(run)}
+    else
+      nil -> {:error, :not_found}
+      {:error, _} = error -> error
+    end
+  end
+
+  def load_run_details(_, _), do: {:error, :not_found}
+
+  @spec list_for_author(integer(), Author.t(), pos_integer()) :: {:ok, [Run.t()]}
+  def list_for_author(project_id, author, limit \\ 50)
+
+  def list_for_author(project_id, %Author{} = author, limit)
+      when is_integer(project_id) and is_integer(limit) and limit > 0 do
+    case Repo.get(Project, project_id) do
+      nil ->
+        {:error, :not_found}
+
+      project ->
+        with :ok <- authorize_project(project, author) do
+          {:ok,
+           Repo.all(
+             from(run in Run,
+               where: run.project_id == ^project_id and run.author_id == ^author.id,
+               order_by: [desc: run.inserted_at],
+               limit: ^limit
+             )
+           )}
+        end
+    end
+  end
+
+  def list_for_author(_, _, _), do: {:error, :invalid_input}
+
+  @spec update_scope(Ecto.UUID.t(), Author.t(), [String.t()]) ::
+          {:ok, Run.t()} | {:error, term()}
+  def update_scope(run_id, %Author{} = author, selected_chapter_ids)
+      when is_binary(run_id) and is_list(selected_chapter_ids) do
+    selected_ids =
+      selected_chapter_ids
+      |> Enum.filter(&is_binary/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.uniq()
+
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_scope),
+         false <- Enum.empty?(selected_ids),
+         {:ok, scope_attrs} <- scope_attrs(run, selected_ids) do
+      transition_with_job(
+        run,
+        :ingesting,
+        scope_attrs,
+        OutlineWorker.new(%{"run_id" => run.id})
+      )
+    else
+      true -> {:error, :no_chapters_selected}
+      {:error, _} = error -> error
+    end
+  end
+
+  def update_scope(_, _, _), do: {:error, :invalid_input}
+
+  @spec approve_outline(Run.t() | Ecto.UUID.t(), Author.t()) ::
+          {:ok, Run.t()} | {:error, term()}
+  def approve_outline(%Run{id: run_id}, %Author{} = author), do: approve_outline(run_id, author)
+
+  def approve_outline(run_id, %Author{} = author) when is_binary(run_id) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_outline_approval),
+         true <- run_has_lessons?(run.id) do
+      attrs = %{
+        outline_approved_by_author_id: author.id,
+        outline_approved_at: DateTime.utc_now()
+      }
+
+      case run.lesson_planning_strategy do
+        :parallel_v1 -> transition_to_parallel_lesson_planning(run, attrs)
+        _serial -> transition_with_job(run, :planning_lessons, attrs, legacy_planner_job(run))
+      end
+    else
+      false -> {:error, :empty_outline}
+      {:error, _} = error -> error
+    end
+  end
+
+  @spec update_lesson_plan(String.t(), Author.t(), map(), String.t() | nil) ::
+          {:ok, Lesson.t()} | {:error, term()}
+  def update_lesson_plan(lesson_id, %Author{} = author, payload, plan_mode)
+      when is_binary(lesson_id) and is_map(payload) do
+    with {:ok, lesson} <- lesson_with_run(lesson_id),
+         {:ok, _run} <- authorized_run(lesson.run_id, author),
+         :ok <- ensure_status(lesson.run.status, :awaiting_lesson_approval),
+         :ok <- validate_plan_mode(plan_mode || lesson.plan_mode) do
+      persist_lesson_plan(
+        lesson,
+        payload,
+        plan_mode || lesson.plan_mode,
+        "author",
+        true
+      )
+    end
+  end
+
+  def update_lesson_plan(_, _, _, _), do: {:error, :invalid_input}
+
+  @spec approve_lesson(Ecto.UUID.t(), Ecto.UUID.t(), Author.t()) ::
+          {:ok, Lesson.t()} | {:error, term()}
+  def approve_lesson(run_id, lesson_id, %Author{} = author) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval) do
+      result =
+        Repo.transaction(fn ->
+          locked_run =
+            Repo.one!(from(r in Run, where: r.id == ^run.id, lock: "FOR UPDATE"))
+
+          :ok = rollback_unless_ok(ensure_status(locked_run.status, :awaiting_lesson_approval))
+
+          lesson =
+            Repo.one(
+              from(lesson in Lesson,
+                where: lesson.id == ^lesson_id and lesson.run_id == ^locked_run.id,
+                lock: "FOR UPDATE"
+              )
+            ) || Repo.rollback(:not_found)
+
+          :ok = rollback_unless_ok(ensure_lesson_not_busy(lesson))
+          plan = latest_plan_or_nil(lesson.id) || Repo.rollback(:missing_lesson_plan)
+          :ok = rollback_unless_ok(ensure_plan_approvable(plan))
+          now = DateTime.utc_now()
+
+          approved_lesson =
+            lesson
+            |> Lesson.changeset(%{
+              status: "approved",
+              approved_by_author_id: author.id,
+              approved_at: now,
+              planning_state: "completed",
+              planning_error: nil,
+              planning_finished_at: lesson.planning_finished_at || now
+            })
+            |> Repo.update!()
+
+          plan
+          |> LessonPlan.changeset(%{
+            approved_by_user: true,
+            approved_at: now,
+            rejection_reason: nil
+          })
+          |> Repo.update!()
+
+          transition = maybe_transition_to_compiling_locked(locked_run)
+
+          {Repo.preload(approved_lesson, :plans, force: true), transition}
+        end)
+
+      case result do
+        {:ok, {approved_lesson, {:transitioned, compiling_run}}} ->
+          # The transition is committed with the final lesson approval while
+          # holding the run lock, so a concurrent plan edit cannot invalidate
+          # approval between the readiness check and this status change.
+          after_transition({:ok, compiling_run})
+          sync_review_counts(run.id)
+          maybe_reconcile_parallel_review_progress(run.id)
+          {:ok, approved_lesson}
+
+        {:ok, {approved_lesson, :not_ready}} ->
+          sync_review_counts(run.id)
+          maybe_reconcile_parallel_review_progress(run.id)
+          {:ok, approved_lesson}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  @spec approve_all_lessons(Run.t() | Ecto.UUID.t(), Author.t()) ::
+          {:ok, Run.t()} | {:error, term()}
+  def approve_all_lessons(%Run{id: run_id}, %Author{} = author),
+    do: approve_all_lessons(run_id, author)
+
+  def approve_all_lessons(run_id, %Author{} = author) do
+    with {:ok, run} <- authorized_run(run_id, author) do
+      cond do
+        run.status == :compiling ->
+          {:ok, preload_run(run)}
+
+        run.status != :awaiting_lesson_approval ->
+          {:error, {:invalid_status, run.status, :awaiting_lesson_approval}}
+
+        not run_has_lessons?(run.id) ->
+          {:error, :no_lessons_to_approve}
+
+        all_lessons_approved?(run.id) ->
+          transition_to_compiling_if_ready(run.id)
+
+        true ->
+          {:error, :lessons_pending_approval}
+      end
+    end
+  end
+
+  @spec reject_lesson(Ecto.UUID.t(), Ecto.UUID.t(), Author.t(), String.t()) ::
+          {:ok, Lesson.t()} | {:error, term()}
+  def reject_lesson(run_id, lesson_id, %Author{} = author, reason)
+      when is_binary(reason) do
+    reason = String.trim(reason)
+
+    with false <- reason == "",
+         {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval) do
+      Repo.transaction(fn ->
+        locked_run =
+          Repo.one!(from(r in Run, where: r.id == ^run.id, lock: "FOR UPDATE"))
+
+        :ok = rollback_unless_ok(ensure_status(locked_run.status, :awaiting_lesson_approval))
+
+        lesson =
+          Repo.one(
+            from(lesson in Lesson,
+              where: lesson.id == ^lesson_id and lesson.run_id == ^locked_run.id,
+              lock: "FOR UPDATE"
+            )
+          ) || Repo.rollback(:not_found)
+
+        :ok = rollback_unless_ok(ensure_lesson_not_busy(lesson))
+        plan = latest_plan_or_nil(lesson.id) || Repo.rollback(:missing_lesson_plan)
+
+        rejected =
+          lesson
+          |> Lesson.changeset(%{
+            status: "ready_for_review",
+            approved_by_author_id: nil,
+            approved_at: nil
+          })
+          |> Repo.update!()
+
+        plan
+        |> LessonPlan.changeset(%{
+          approved_by_user: false,
+          approved_at: nil,
+          rejection_reason: reason
+        })
+        |> Repo.update!()
+
+        Repo.preload(rejected, :plans, force: true)
+      end)
+      |> case do
+        {:ok, rejected} ->
+          sync_review_counts(run.id)
+          {:ok, rejected}
+
+        {:error, error} ->
+          {:error, error}
+      end
+    else
+      true -> {:error, :rejection_reason_required}
+      {:error, _} = error -> error
+    end
+  end
+
+  def reject_lesson(_, _, _, _), do: {:error, :invalid_input}
+
+  @spec regenerate_lesson(Ecto.UUID.t(), Ecto.UUID.t(), Author.t()) ::
+          {:ok, Lesson.t()} | {:error, term()}
+  def regenerate_lesson(run_id, lesson_id, %Author{} = author) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval) do
+      enqueue_lesson_regeneration(run, lesson_id)
+    end
+  end
+
+  @spec cancel_run(Ecto.UUID.t(), Author.t()) :: {:ok, Run.t()} | {:error, term()}
+  def cancel_run(run_id, %Author{} = author) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         true <- run.status in @active_statuses do
+      case cancel_run_with_planning_fence(run.id) do
+        {:ok, cancelled} ->
+          cancel_background_jobs(cancelled.id)
+          {:ok, cancelled}
+
+        {:error, _} = error ->
+          error
+      end
+    else
+      false -> {:error, :not_cancellable}
+      {:error, _} = error -> error
+    end
+  end
+
+  @spec retry_run(Ecto.UUID.t(), Author.t()) :: {:ok, Run.t()} | {:error, term()}
+  def retry_run(run_id, %Author{} = author) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :failed) do
+      case failure_phase(run) do
+        phase when phase in ["lesson_planning", "checks"] ->
+          retry_parallel_lesson_planning(run)
+
+        _other ->
+          with {:ok, target_status, job} <- retry_target(run) do
+            force_status_with_job(run, target_status, job)
+          end
+      end
+    end
+  end
+
+  @spec start_apply(Project.t(), Run.t() | Ecto.UUID.t(), Author.t()) ::
+          {:ok, Run.t()} | {:error, term()}
+  def start_apply(%Project{} = project, %Run{id: run_id}, %Author{} = author),
+    do: start_apply(project, run_id, author)
+
+  def start_apply(%Project{} = project, run_id, %Author{} = author)
+      when is_binary(run_id) do
+    with {:ok, run} <- get_run(project, author, run_id),
+         :ok <- ensure_status(run.status, :compiling),
+         true <- all_lessons_approved?(run.id),
+         :ok <- ensure_project_root_empty(project, run.target_root_container_resource_id) do
+      planned_media_ids = planned_required_media_ids(run)
+
+      with {:ok, discovery_media_urls} <-
+             MediaIngestor.discovery_media_urls(run.id, planned_media_ids),
+           {:ok, dry_run} <-
+             Compiler.dry_run(run,
+               media_urls: discovery_media_urls,
+               attribution: source_attribution(run)
+             ),
+           compiled_media_ids <- MediaIngestor.required_media_ids(dry_run),
+           true <- compiled_media_ids == planned_media_ids,
+           {:ok, _selected_assets} <-
+             MediaIngestor.select_required_assets(run.id, compiled_media_ids) do
+        required_media_ids = compiled_media_ids
+
+        checkpoint = %{
+          "schema_version" => 1,
+          "required_media_ids" => required_media_ids,
+          "approved_plan_digest" => approved_plan_digest(run)
+        }
+
+        attrs = %{
+          error: nil,
+          progress:
+            merge_progress(run.progress, %{
+              "counts" => %{"source_assets_required" => length(required_media_ids)}
+            }),
+          result:
+            (run.result || %{})
+            |> Map.put("compile_checkpoint", checkpoint)
+            |> maybe_put_final_dry_run(required_media_ids, dry_run)
+        }
+
+        case required_media_ids do
+          [] ->
+            transition_with_job(
+              run,
+              :applying,
+              attrs,
+              ApplyWorker.new(%{"run_id" => run.id})
+            )
+
+          _ids ->
+            transition_with_job(
+              run,
+              :staging_media,
+              attrs,
+              MediaWorker.new(%{"run_id" => run.id})
+            )
+        end
+      else
+        false ->
+          return_compile_failure_to_review(run, :required_media_selection_changed)
+
+        {:error, reason} ->
+          return_compile_failure_to_review(run, reason)
+      end
+    else
+      false -> {:error, :lessons_pending_approval}
+      {:error, _} = error -> error
+    end
+  end
+
+  @spec transition_run(Ecto.UUID.t(), Run.status()) :: {:ok, Run.t()} | {:error, term()}
+  def transition_run(run_id, next_status), do: transition_run(run_id, next_status, %{})
+
+  @spec transition_run(Ecto.UUID.t(), Run.status(), map()) ::
+          {:ok, Run.t()} | {:error, term()}
+  def transition_run(run_id, next_status, attrs) when is_binary(run_id) and is_map(attrs) do
+    result =
+      Repo.transaction(fn ->
+        run = Repo.one(from(r in Run, where: r.id == ^run_id, lock: "FOR UPDATE"))
+
+        with %Run{} <- run,
+             :ok <- ensure_transition_allowed(run.status, next_status),
+             {:ok, updated} <-
+               run
+               |> Run.update_changeset(transition_attrs(run, next_status, attrs))
+               |> Repo.update(),
+             :ok <- Outbox.persist(updated) do
+          updated
+        else
+          nil -> Repo.rollback(:not_found)
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+
+    after_transition(result)
+  end
+
+  @spec fetch_run(Ecto.UUID.t()) :: {:ok, Run.t()} | {:error, :not_found}
+  def fetch_run(run_id) when is_binary(run_id) do
+    case Repo.get(Run, run_id) do
+      nil -> {:error, :not_found}
+      run -> {:ok, run}
+    end
+  end
+
+  def fetch_run(_), do: {:error, :not_found}
+
+  @doc false
+  def compile_checkpoint(%Run{} = run) do
+    case get_in(run.result || %{}, ["compile_checkpoint"]) do
+      %{
+        "required_media_ids" => ids,
+        "approved_plan_digest" => digest
+      } = checkpoint
+      when is_list(ids) and is_binary(digest) ->
+        if digest == approved_plan_digest(preload_run(run)),
+          do: {:ok, checkpoint},
+          else: {:error, :stale_compile_checkpoint}
+
+      _ ->
+        {:error, :missing_compile_checkpoint}
+    end
+  end
+
+  @doc false
+  def source_attribution(%Run{} = run) do
+    persisted =
+      if run.source_schema_version >= 2 do
+        case RichSource.load_run_corpus(run.id) do
+          {:ok, %{attribution: attribution}} when is_map(attribution) -> attribution
+          _ -> %{}
+        end
+      else
+        get_in(run.preflight_snapshot || %{}, ["license"]) || %{}
+      end
+
+    persisted
+    |> stringify_keys()
+    |> Map.put_new("source_provider", "OpenStax")
+    |> Map.put_new(
+      "source_title",
+      get_in(run.preflight_snapshot || %{}, ["title"]) || run.book_slug
+    )
+    |> Map.put_new(
+      "book_title",
+      get_in(run.preflight_snapshot || %{}, ["title"]) || run.book_slug
+    )
+    |> Map.put_new("source_url", run.source_url)
+    |> Map.put_new("license", "CC BY-NC-SA 4.0")
+  end
+
+  @doc false
+  def finish_media_staging(%Run{} = run, compiled) when is_map(compiled) do
+    transition_with_job(
+      run,
+      :applying,
+      %{
+        error: nil,
+        result:
+          (run.result || %{})
+          |> Map.put("dry_run", compiled)
+          |> Map.put("media_staged_at", DateTime.to_iso8601(DateTime.utc_now()))
+      },
+      ApplyWorker.new(%{"run_id" => run.id})
+    )
+  end
+
+  @doc false
+  def return_media_failure_to_review(run_id, reason) do
+    result =
+      Repo.transaction(fn ->
+        run =
+          Repo.one(from(candidate in Run, where: candidate.id == ^run_id, lock: "FOR UPDATE")) ||
+            Repo.rollback(:not_found)
+
+        :ok = rollback_unless_ok(ensure_status(run.status, :staging_media))
+
+        required_ids =
+          get_in(run.result || %{}, ["compile_checkpoint", "required_media_ids"]) || []
+
+        affected_lesson_ids = lessons_referencing_media(run.id, required_ids)
+
+        Repo.update_all(
+          from(asset in SourceAsset, where: asset.run_id == ^run.id),
+          set: [required: false, updated_at: DateTime.utc_now()]
+        )
+
+        Repo.update_all(
+          from(lesson in Lesson,
+            where: lesson.id in ^affected_lesson_ids
+          ),
+          set: [
+            status: "needs_attention",
+            approved_by_author_id: nil,
+            approved_at: nil,
+            updated_at: DateTime.utc_now()
+          ]
+        )
+
+        Repo.update_all(
+          from(plan in LessonPlan,
+            where: plan.lesson_id in ^affected_lesson_ids and plan.approved_by_user == true
+          ),
+          set: [approved_by_user: false, approved_at: nil, updated_at: DateTime.utc_now()]
+        )
+
+        error = %{
+          "phase" => "media_staging",
+          "reason" => inspect(reason),
+          "message" =>
+            "One or more selected OpenStax images could not be safely imported. Edit or regenerate the affected lesson to remove or replace that media.",
+          "recoverable" => true,
+          "source_media_ids" => required_ids
+        }
+
+        with {:ok, updated} <-
+               run
+               |> Run.update_changeset(
+                 transition_attrs(run, :awaiting_lesson_approval, %{
+                   error: error,
+                   result: Map.drop(run.result || %{}, ["compile_checkpoint", "dry_run"])
+                 })
+               )
+               |> Repo.update(),
+             :ok <- Outbox.persist(updated) do
+          updated
+        else
+          {:error, transition_reason} -> Repo.rollback(transition_reason)
+        end
+      end)
+
+    after_transition(result)
+  end
+
+  @doc false
+  def persist_scope_snapshot(run_id, snapshot) when is_map(snapshot) do
+    chapters =
+      snapshot
+      |> Map.get("chapters", [])
+      |> Enum.map(&Map.put(&1, "selected", true))
+
+    selected_ids = Enum.map(chapters, & &1["id"])
+
+    update_run_if_status(run_id, :preflighting, %{
+      preflight_snapshot: Map.put(snapshot, "chapters", chapters),
+      scope_manifest: %{
+        "book_slug" => snapshot["book_slug"],
+        "title" => snapshot["title"],
+        "chapters" => chapters,
+        "selected_chapter_ids" => selected_ids
+      },
+      progress: %{
+        "stage" => "preflighting",
+        "stage_totals" => [
+          %{
+            "label" => "Chapters discovered",
+            "completed" => length(chapters),
+            "total" => length(chapters)
+          }
+        ]
+      }
+    })
+  end
+
+  @doc false
+  def persist_ingested_snapshot(run_id, snapshot) when is_map(snapshot) do
+    case Repo.get(Run, run_id) do
+      %Run{source_schema_version: version} when version >= 2 ->
+        persist_rich_ingested_snapshot(run_id, snapshot)
+
+      %Run{} ->
+        persist_legacy_ingested_snapshot(run_id, snapshot)
+
+      nil ->
+        {:error, :not_found}
+    end
+  end
+
+  defp persist_rich_ingested_snapshot(run_id, snapshot) do
+    chapters = Map.get(snapshot, "chapters", [])
+    compact_snapshot = RichSource.compact_snapshot(snapshot)
+    compact_chapters = Map.get(compact_snapshot, "chapters", [])
+
+    with {:ok, corpus_counts} <- RichSource.persist_snapshot(run_id, snapshot) do
+      update_run_if_status(run_id, :ingesting, %{
+        preflight_snapshot: compact_snapshot,
+        scope_manifest: %{
+          "book_slug" => snapshot["book_slug"],
+          "title" => snapshot["title"],
+          "chapters" => Enum.map(compact_chapters, &Map.put(&1, "selected", true)),
+          "selected_chapter_ids" => snapshot["selected_chapter_ids"] || []
+        },
+        progress: %{
+          "stage" => "ingesting",
+          "counts" => %{
+            "sections_extracted" => corpus_counts.sections,
+            "source_blocks_extracted" => corpus_counts.blocks,
+            "source_assets_discovered" => corpus_counts.assets
+          },
+          "stage_totals" => [
+            %{
+              "label" => "Chapters read",
+              "completed" => length(chapters),
+              "total" => length(chapters)
+            },
+            %{
+              "label" => "Sections retained",
+              "completed" => corpus_counts.sections,
+              "total" => count_snapshot_sections(chapters)
+            },
+            %{
+              "label" => "Source blocks retained",
+              "completed" => corpus_counts.blocks,
+              "total" => corpus_counts.blocks
+            }
+          ]
+        }
+      })
+    end
+  end
+
+  defp persist_legacy_ingested_snapshot(run_id, snapshot) do
+    chapters = Map.get(snapshot, "chapters", [])
+
+    update_run_if_status(run_id, :ingesting, %{
+      preflight_snapshot: snapshot,
+      scope_manifest: %{
+        "book_slug" => snapshot["book_slug"],
+        "title" => snapshot["title"],
+        "chapters" => Enum.map(chapters, &Map.put(&1, "selected", true)),
+        "selected_chapter_ids" => snapshot["selected_chapter_ids"] || []
+      },
+      progress: %{
+        "stage" => "ingesting",
+        "counts" => %{
+          "sections_extracted" => count_snapshot_sections(chapters)
+        },
+        "stage_totals" => [
+          %{
+            "label" => "Chapters read",
+            "completed" => length(chapters),
+            "total" => length(chapters)
+          },
+          %{
+            "label" => "Sections retained",
+            "completed" => count_snapshot_sections(chapters),
+            "total" => count_snapshot_sections(chapters)
+          }
+        ]
+      }
+    })
+  end
+
+  @doc false
+  def persist_source_corpus(run_id, snapshot), do: RichSource.persist_snapshot(run_id, snapshot)
+
+  @doc false
+  def load_source_snapshot(run_id, base_snapshot \\ %{}),
+    do: RichSource.load_snapshot(run_id, base_snapshot)
+
+  @doc false
+  def load_source_corpus(run_id), do: RichSource.load_run_corpus(run_id)
+
+  @doc false
+  def load_lesson_source_corpus(lesson_id), do: RichSource.load_lesson_corpus(lesson_id)
+
+  @doc false
+  def link_lesson_sources(run_id), do: RichSource.link_lessons(run_id)
+
+  @doc false
+  def rich_content_versions(%Project{} = project) do
+    enabled? =
+      Application.get_env(:oli, :openstax_rich_content_v3_enabled, false) or
+        ScopedFeatureFlags.enabled?(:openstax_rich_content_v3, project)
+
+    if enabled?, do: {2, 3}, else: {1, 2}
+  rescue
+    _ -> {1, 2}
+  end
+
+  @doc false
+  def initialize_parallel_lesson_planning(run_id, generation)
+      when is_binary(run_id) and is_integer(generation) and generation > 0 do
+    result =
+      Repo.transaction(fn ->
+        run = lock_run!(run_id)
+        :ok = rollback_unless_ok(ensure_parallel_generation(run, generation, [:planning_lessons]))
+
+        lessons = lock_selected_lessons(run.id)
+
+        if lessons == [] do
+          Repo.rollback(:no_lessons_to_plan)
+        end
+
+        now = DateTime.utc_now()
+
+        lessons
+        |> Enum.with_index(1)
+        |> Enum.each(fn {lesson, position} ->
+          attrs =
+            if lesson.last_plan_version > 0 do
+              completed_planning_attrs(lesson, generation, position, now)
+            else
+              pending_planning_attrs(lesson, generation, position, "initial", now)
+            end
+
+          lesson
+          |> Lesson.changeset(attrs)
+          |> Repo.update!()
+        end)
+
+        reconcile_lesson_planning_locked(run, generation, now)
+      end)
+
+    announce_parallel_result(result)
+  end
+
+  def initialize_parallel_lesson_planning(_run_id, _generation),
+    do: {:error, :invalid_lesson_planning_generation}
+
+  @doc false
+  def claim_lesson_plan_job(args, attempt, job_id)
+      when is_map(args) and is_integer(attempt) and attempt > 0 and is_integer(job_id) do
+    with {:ok, job_args} <- normalize_lesson_job_args(args) do
+      result =
+        Repo.transaction(fn ->
+          run = lock_run!(job_args.run_id)
+
+          :ok =
+            rollback_unless_ok(
+              ensure_parallel_generation(
+                run,
+                job_args.generation,
+                planning_statuses(job_args.operation)
+              )
+            )
+
+          lesson = lock_lesson!(job_args.lesson_id, run.id)
+
+          cond do
+            lesson.planning_request_id != job_args.request_id or
+                lesson.planning_generation != job_args.generation ->
+              Repo.rollback(:stale_lesson_planning_job)
+
+            lesson.planning_state == "completed" ->
+              {:already_completed, run}
+
+            lesson.planning_oban_job_id != job_id ->
+              Repo.rollback(:stale_lesson_planning_job)
+
+            lesson.planning_state not in ["queued", "running", "retrying"] ->
+              Repo.rollback(:stale_lesson_planning_job)
+
+            job_args.operation == "regenerate" and
+                lesson.last_plan_version != job_args.base_plan_version ->
+              Repo.rollback(:stale_lesson_planning_job)
+
+            true ->
+              now = DateTime.utc_now()
+
+              claimed =
+                lesson
+                |> Lesson.changeset(%{
+                  planning_state: "running",
+                  planning_attempts: max(lesson.planning_attempts, attempt),
+                  planning_started_at: lesson.planning_started_at || now,
+                  planning_last_progress_at: now,
+                  planning_error: nil
+                })
+                |> Repo.update!()
+
+              %{run: updated_run} =
+                reconciliation =
+                reconcile_lesson_planning_locked(run, job_args.generation, now)
+
+              {:claimed, claimed, updated_run, reconciliation}
+          end
+        end)
+
+      case result do
+        {:ok, {:already_completed, _run}} ->
+          {:ok, :already_completed}
+
+        {:ok, {:claimed, lesson, run, _reconciliation}} ->
+          source = lesson_source_map(lesson)
+
+          with :ok <- ensure_usable_lesson_source(run, source) do
+            PubSub.broadcast(run)
+
+            Telemetry.lesson_job_started(
+              run.id,
+              lesson.id,
+              lesson.planning_attempts,
+              if(lesson.planning_attempts == 1,
+                do: duration_seconds(lesson.planning_queued_at, lesson.planning_started_at),
+                else: nil
+              )
+            )
+
+            {:ok,
+             %{
+               source: source,
+               planning_position: lesson.planning_position || job_args.position,
+               plan_schema_version: run.plan_schema_version
+             }}
+          end
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  def claim_lesson_plan_job(_args, _attempt, _job_id), do: {:error, :invalid_lesson_job}
+
+  @doc false
+  def complete_lesson_plan_job(
+        args,
+        %{plan_mode: plan_mode, payload: payload, created_by: created_by}
+      )
+      when is_map(args) and is_map(payload) do
+    with {:ok, job_args} <- normalize_lesson_job_args(args),
+         :ok <- validate_plan_mode(plan_mode) do
+      result =
+        Repo.transaction(fn ->
+          run = lock_run!(job_args.run_id)
+
+          :ok =
+            rollback_unless_ok(
+              ensure_parallel_generation(
+                run,
+                job_args.generation,
+                planning_statuses(job_args.operation)
+              )
+            )
+
+          lesson = lock_lesson!(job_args.lesson_id, run.id)
+
+          cond do
+            lesson.planning_request_id != job_args.request_id or
+                lesson.planning_generation != job_args.generation ->
+              Repo.rollback(:stale_lesson_planning_job)
+
+            lesson.planning_state == "completed" ->
+              {Repo.preload(lesson, :plans, force: true), run, false, false}
+
+            lesson.planning_state not in ["queued", "running", "retrying"] ->
+              Repo.rollback(:stale_lesson_planning_job)
+
+            job_args.operation == "regenerate" and
+                lesson.last_plan_version != job_args.base_plan_version ->
+              Repo.rollback(:stale_lesson_planning_job)
+
+            true ->
+              existing = latest_plan_or_nil(lesson.id)
+
+              {planned_lesson, persisted?} =
+                if job_args.operation == "initial" and not is_nil(existing) do
+                  {Repo.preload(lesson, :plans, force: true), false}
+                else
+                  {
+                    persist_locked_lesson_plan(
+                      lesson,
+                      existing,
+                      payload,
+                      plan_mode,
+                      created_by,
+                      true
+                    ),
+                    true
+                  }
+                end
+
+              now = DateTime.utc_now()
+
+              completed =
+                planned_lesson
+                |> Lesson.changeset(%{
+                  planning_state: "completed",
+                  planning_attempts: max(planned_lesson.planning_attempts, 1),
+                  planning_last_progress_at: now,
+                  planning_finished_at: now,
+                  planning_error: nil
+                })
+                |> Repo.update!()
+                |> Repo.preload(:plans, force: true)
+
+              run = maybe_update_latest_plan_version_locked(run, completed.last_plan_version)
+              duration = duration_seconds(completed.planning_started_at, now)
+
+              reconciliation =
+                reconcile_lesson_planning_locked(run, job_args.generation, now, duration)
+
+              {completed, reconciliation.run, reconciliation.terminal?, persisted?}
+          end
+        end)
+
+      case result do
+        {:ok, {lesson, run, terminal?, persisted?}} ->
+          announce_parallel_run(run, terminal?)
+
+          if persisted? do
+            case latest_plan_or_nil(lesson.id) do
+              %LessonPlan{} = plan ->
+                Telemetry.plan_checked(run.id, lesson.id, plan, plan.created_by == "system")
+
+              nil ->
+                :ok
+            end
+
+            Telemetry.lesson_job_completed(
+              run.id,
+              lesson.id,
+              lesson.planning_attempts,
+              duration_seconds(lesson.planning_started_at, lesson.planning_finished_at)
+            )
+          end
+
+          {:ok, lesson, run}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  def complete_lesson_plan_job(_args, _result), do: {:error, :invalid_lesson_plan_result}
+
+  @doc false
+  def retry_lesson_plan_job(args, attempt, category)
+      when is_map(args) and is_integer(attempt) and attempt > 0 and is_atom(category) do
+    update_lesson_plan_job_failure(args, attempt, category, "retrying")
+  end
+
+  @doc false
+  def fail_lesson_plan_job(args, attempt, category)
+      when is_map(args) and is_integer(attempt) and attempt > 0 and is_atom(category) do
+    update_lesson_plan_job_failure(args, attempt, category, "failed")
+  end
+
+  @doc false
+  def reconcile_lesson_planning(run_id, generation)
+      when is_binary(run_id) and is_integer(generation) and generation > 0 do
+    result =
+      Repo.transaction(fn ->
+        run = lock_run!(run_id)
+
+        :ok =
+          rollback_unless_ok(
+            ensure_parallel_generation(
+              run,
+              generation,
+              [:planning_lessons, :awaiting_lesson_approval]
+            )
+          )
+
+        reconcile_lesson_planning_locked(run, generation, DateTime.utc_now())
+      end)
+
+    announce_parallel_result(result)
+  end
+
+  def reconcile_lesson_planning(_run_id, _generation),
+    do: {:error, :invalid_lesson_planning_generation}
+
+  @doc false
+  def recover_parallel_lesson_planning(run_id, generation)
+      when is_binary(run_id) and is_integer(generation) and generation > 0 do
+    result =
+      Repo.transaction(fn ->
+        run = lock_run!(run_id)
+
+        :ok =
+          rollback_unless_ok(
+            ensure_parallel_generation(
+              run,
+              generation,
+              [:planning_lessons, :awaiting_lesson_approval]
+            )
+          )
+
+        now = DateTime.utc_now()
+
+        recovered_failures =
+          run.id
+          |> lock_selected_lessons()
+          |> Enum.filter(
+            &(&1.planning_generation == generation and
+                &1.planning_state in @active_lesson_planning_states)
+          )
+          |> Enum.map(&recover_lesson_job_locked(&1, now))
+          |> Enum.reject(&is_nil/1)
+
+        run
+        |> reconcile_lesson_planning_locked(generation, now)
+        |> Map.put(:recovered_failures, recovered_failures)
+      end)
+
+    announce_parallel_result(result)
+  end
+
+  def recover_parallel_lesson_planning(_run_id, _generation),
+    do: {:error, :invalid_lesson_planning_generation}
+
+  @doc false
+  def set_progress(run_id, progress, expected_status \\ nil)
+
+  def set_progress(run_id, progress, expected_status) when is_map(progress) do
+    result =
+      Repo.transaction(fn ->
+        run =
+          Repo.one(
+            from(run in Run,
+              where: run.id == ^run_id,
+              lock: "FOR UPDATE"
+            )
+          ) || Repo.rollback(:not_found)
+
+        allowed_statuses =
+          if is_nil(expected_status), do: @active_statuses, else: [expected_status]
+
+        if run.status in allowed_statuses do
+          merged =
+            run.progress
+            |> merge_progress(progress)
+            |> Map.put("stage", Atom.to_string(run.status))
+            |> touch_progress_timing(run, DateTime.utc_now())
+
+          run
+          |> Run.update_changeset(%{progress: merged})
+          |> Repo.update()
+          |> case do
+            {:ok, updated} -> updated
+            {:error, reason} -> Repo.rollback(reason)
+          end
+        else
+          expected = if is_nil(expected_status), do: @active_statuses, else: expected_status
+          Repo.rollback({:invalid_status, run.status, expected})
+        end
+      end)
+
+    case result do
+      {:ok, updated} ->
+        PubSub.broadcast(updated)
+        {:ok, updated}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  @doc false
+  def upsert_units_and_lessons(run_id, %{"units" => units} = outline)
+      when is_list(units) do
+    result =
+      Repo.transaction(fn ->
+        run =
+          Repo.one!(
+            from(r in Run,
+              where: r.id == ^run_id,
+              lock: "FOR UPDATE"
+            )
+          )
+
+        :ok = rollback_unless_ok(ensure_status(run.status, :planning_outline))
+        Repo.delete_all(from(unit in Unit, where: unit.run_id == ^run_id))
+
+        persisted =
+          units
+          |> Enum.map(fn unit_spec ->
+            lessons = unit_spec["lessons"] || []
+
+            unit =
+              %Unit{}
+              |> Unit.changeset(%{
+                run_id: run.id,
+                unit_name: unit_spec["unit_name"],
+                order: unit_spec["order"],
+                source_reference: unit_spec["source_reference"] || %{},
+                status: "ready_for_review",
+                source_sections_count:
+                  Enum.reduce(
+                    lessons,
+                    0,
+                    &(&2 + length(&1["source_sections"] || []))
+                  ),
+                plan_payload: %{
+                  "source_title" => outline["title"],
+                  "lesson_count" => length(lessons)
+                },
+                assessment_payload: Planner.build_unit_assessment(unit_spec, lessons),
+                selected: true
+              })
+              |> Repo.insert!()
+
+            Enum.each(lessons, fn lesson_spec ->
+              {mode, _} =
+                Planner.build_lesson_plan(
+                  lesson_spec,
+                  lesson_spec["order"] || 1
+                )
+
+              %Lesson{}
+              |> Lesson.changeset(%{
+                run_id: run.id,
+                unit_id: unit.id,
+                order: lesson_spec["order"],
+                title: lesson_spec["title"],
+                source_sections: lesson_spec["source_sections"] || [],
+                source_objectives: lesson_spec["source_objectives"] || [],
+                plan_mode: mode,
+                status: "pending",
+                last_plan_version: 0,
+                source_excerpt: lesson_spec["source_excerpt"],
+                source_evidence_links: lesson_spec["source_evidence_links"] || [],
+                source_word_count: lesson_spec["source_word_count"] || 0,
+                source_coverage: lesson_spec["source_coverage"] || %{},
+                selected: true
+              })
+              |> Repo.insert!()
+            end)
+
+            unit
+          end)
+
+        persisted
+      end)
+
+    case result do
+      {:ok, persisted} ->
+        with {:ok, _linked_count} <- maybe_link_lesson_sources(run_id),
+             {:ok, _run} <-
+               set_progress(
+                 run_id,
+                 %{
+                   "stage" => "planning_outline",
+                   "counts" => %{
+                     "lessons_outlined" =>
+                       Enum.reduce(units, 0, &(&2 + length(&1["lessons"] || [])))
+                   },
+                   "stage_totals" => [
+                     %{
+                       "label" => "Units planned",
+                       "completed" => length(persisted),
+                       "total" => length(persisted)
+                     },
+                     %{
+                       "label" => "Lessons outlined",
+                       "completed" => Enum.reduce(units, 0, &(&2 + length(&1["lessons"] || []))),
+                       "total" => Enum.reduce(units, 0, &(&2 + length(&1["lessons"] || [])))
+                     }
+                   ]
+                 },
+                 :planning_outline
+               ) do
+          {:ok, persisted}
+        end
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    exception -> {:error, {:outline_persistence_failed, Exception.message(exception)}}
+  end
+
+  @doc false
+  def generate_lesson_plans(run_id) do
+    plan_schema_version =
+      case Repo.get(Run, run_id) do
+        %Run{plan_schema_version: version} -> version
+        nil -> 2
+      end
+
+    lessons =
+      Repo.all(
+        from(lesson in Lesson,
+          join: unit in Unit,
+          on: unit.id == lesson.unit_id,
+          where: lesson.run_id == ^run_id and lesson.selected == true,
+          order_by: [asc: unit.order, asc: lesson.order],
+          preload: [:plans]
+        )
+      )
+
+    total = length(lessons)
+    completed_before_resume = Enum.count(lessons, &(&1.plans != []))
+
+    lessons
+    |> Enum.with_index(1)
+    |> Enum.reduce_while({:ok, completed_before_resume}, fn {lesson, index}, {:ok, completed} ->
+      if lesson.plans != [] do
+        {:cont, {:ok, completed}}
+      else
+        result =
+          with {:ok, _run} <-
+                 set_progress(
+                   run_id,
+                   %{
+                     "stage" => "planning_lessons",
+                     "work_state" => "running",
+                     "current_item" => %{
+                       "kind" => "lesson",
+                       "index" => index,
+                       "title" => lesson.title,
+                       "started_at" => DateTime.to_iso8601(DateTime.utc_now())
+                     },
+                     "counts" => %{"plans_checked" => completed},
+                     "stage_totals" => [
+                       %{
+                         "label" => "Lesson plans checked",
+                         "completed" => completed,
+                         "total" => total
+                       }
+                     ]
+                   },
+                   :planning_lessons
+                 ),
+               {:ok, %{plan_mode: mode, payload: payload, created_by: created_by}} <-
+                 AIPlanner.plan(lesson_source_map(lesson), index,
+                   plan_schema_version: plan_schema_version
+                 ) do
+            persist_lesson_plan(
+              lesson,
+              payload,
+              mode,
+              created_by,
+              true,
+              skip_if_exists: true
+            )
+          end
+
+        case result do
+          {:ok, _lesson} ->
+            next_completed = completed + 1
+
+            case set_progress(
+                   run_id,
+                   %{
+                     "stage" => "planning_lessons",
+                     "work_state" => "running",
+                     "current_item" => nil,
+                     "counts" => %{"plans_checked" => next_completed},
+                     "stage_totals" => [
+                       %{
+                         "label" => "Lesson plans checked",
+                         "completed" => next_completed,
+                         "total" => total
+                       }
+                     ]
+                   },
+                   :planning_lessons
+                 ) do
+              {:ok, _run} -> {:cont, {:ok, next_completed}}
+              {:error, reason} -> {:halt, {:error, reason}}
+            end
+
+          {:error, reason} ->
+            {:halt, {:error, reason}}
+        end
+      end
+    end)
+    |> case do
+      {:ok, count} when count > 0 ->
+        case finalize_lesson_planning(run_id) do
+          {:ok, _run} -> {:ok, count}
+          {:error, _} = error -> error
+        end
+
+      {:ok, 0} ->
+        {:error, :no_lessons_to_plan}
+
+      {:error, _} = error ->
+        error
+    end
+  end
+
+  @doc false
+  def finalize_lesson_planning(run_id) when is_binary(run_id) do
+    result =
+      Repo.transaction(fn ->
+        run =
+          Repo.one(
+            from(candidate in Run,
+              where: candidate.id == ^run_id,
+              lock: "FOR UPDATE"
+            )
+          ) || Repo.rollback(:not_found)
+
+        with :ok <- ensure_status(run.status, :planning_lessons),
+             :ok <- ensure_transition_allowed(run.status, :awaiting_lesson_approval) do
+          latest_plan_version =
+            Repo.one(
+              from(lesson in Lesson,
+                where: lesson.run_id == ^run_id and lesson.selected == true,
+                select: coalesce(max(lesson.last_plan_version), 0)
+              )
+            )
+
+          Repo.update_all(
+            from(unit in Unit, where: unit.run_id == ^run_id),
+            set: [status: "ready_for_review"]
+          )
+
+          with {:ok, updated} <-
+                 run
+                 |> Run.update_changeset(
+                   transition_attrs(run, :awaiting_lesson_approval, %{
+                     latest_plan_version: latest_plan_version
+                   })
+                 )
+                 |> Repo.update(),
+               :ok <- Outbox.persist(updated) do
+            updated
+          else
+            {:error, reason} -> Repo.rollback(reason)
+          end
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+
+    after_transition(result)
+  end
+
+  def finalize_lesson_planning(_), do: {:error, :invalid_input}
+
+  @doc false
+  def run_with_resources(run_id) do
+    with {:ok, run} <- fetch_run(run_id), do: {:ok, preload_run(run)}
+  end
+
+  @doc false
+  def mark_failed(run_id, phase, reason) do
+    error = failure_payload(phase, reason)
+
+    case fetch_run(run_id) do
+      {:ok, %Run{status: :failed} = run} ->
+        update_run(run.id, %{error: error})
+
+      {:ok, %Run{status: status}} when status in @active_statuses ->
+        transition_run(run_id, :failed, %{error: error})
+
+      {:ok, _run} ->
+        {:error, :not_recoverable}
+
+      {:error, _} = error_result ->
+        error_result
+    end
+  end
+
+  @doc false
+  def mark_failed_if_status(run_id, expected_status, phase, reason)
+      when is_binary(run_id) and is_atom(expected_status) do
+    error = failure_payload(phase, reason)
+
+    result =
+      Repo.transaction(fn ->
+        run =
+          Repo.one(
+            from(candidate in Run,
+              where: candidate.id == ^run_id,
+              lock: "FOR UPDATE"
+            )
+          ) || Repo.rollback(:not_found)
+
+        with :ok <- ensure_status(run.status, expected_status),
+             :ok <- ensure_transition_allowed(run.status, :failed),
+             {:ok, updated} <-
+               run
+               |> Run.update_changeset(transition_attrs(run, :failed, %{error: error}))
+               |> Repo.update(),
+             :ok <- Outbox.persist(updated) do
+          updated
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+
+    after_transition(result)
+  end
+
+  @doc false
+  def ensure_apply_preconditions(%Run{} = run) do
+    with %Project{} = project <- Repo.get(Project, run.project_id),
+         :ok <- ensure_project_root_empty(project, run.target_root_container_resource_id),
+         true <- all_lessons_approved?(run.id),
+         :ok <- ensure_required_media_ready(run) do
+      :ok
+    else
+      nil -> {:error, :project_not_found}
+      false -> {:error, :lessons_pending_approval}
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc false
+  def ensure_required_media_ready(%Run{} = run) do
+    with {:ok, checkpoint} <- compile_checkpoint(run),
+         {:ok, media_urls} <- MediaIngestor.required_media_urls(run.id),
+         true <-
+           Map.keys(media_urls) |> Enum.sort() == checkpoint["required_media_ids"] do
+      :ok
+    else
+      false -> {:error, :required_media_selection_changed}
+      {:error, _} = error -> error
+    end
+  end
+
+  @doc false
+  def complete_apply_in_transaction(%Run{status: :applying} = run, result)
+      when is_map(result) do
+    if Repo.in_transaction?() do
+      now = DateTime.utc_now()
+
+      with {:ok, updated} <-
+             run
+             |> Run.update_changeset(%{
+               status: :completed,
+               result: result,
+               progress:
+                 build_progress(:completed, run.progress, now)
+                 |> merge_progress(%{
+                   "counts" => %{
+                     "lessons_created" => result["lessons_applied"] || 0
+                   },
+                   "stage_totals" => [
+                     %{
+                       "label" => "Lessons created",
+                       "completed" => result["lessons_applied"] || 0,
+                       "total" => result["lessons_applied"] || 0
+                     }
+                   ]
+                 }),
+               finished_at: now
+             })
+             |> Repo.update(),
+           :ok <- Outbox.persist(updated) do
+        {:ok, updated}
+      end
+    else
+      {:error, :transaction_required}
+    end
+  end
+
+  def complete_apply_in_transaction(%Run{status: status}, _result),
+    do: {:error, {:invalid_status, status, :applying}}
+
+  @doc false
+  def announce_run_update(%Run{} = run) do
+    PubSub.broadcast(run)
+    dispatch_notification(run)
+    :ok
+  end
+
+  @doc false
+  def reset_for_test!(run_id) do
+    Repo.delete_all(from(run in Run, where: run.id == ^run_id))
+  end
+
+  defp create_run(project, author, target_resource_id, source_url, book_slug) do
+    {source_schema_version, plan_schema_version} = rich_content_versions(project)
+    now = DateTime.utc_now()
+
+    attrs = %{
+      project_id: project.id,
+      author_id: author.id,
+      target_root_container_resource_id: target_resource_id,
+      source_url: source_url,
+      book_slug: book_slug,
+      scope_manifest: %{"book_slug" => book_slug, "chapters" => []},
+      progress:
+        :preflighting
+        |> build_progress(%{}, now)
+        |> Map.put("work_state", "queued"),
+      source_schema_version: source_schema_version,
+      plan_schema_version: plan_schema_version,
+      lesson_planning_strategy: configured_lesson_planning_strategy(),
+      lesson_planning_parallelism: configured_lesson_planning_parallelism(),
+      started_at: now
+    }
+
+    Repo.transaction(fn ->
+      with :ok <- lock_and_validate_import_start(project, target_resource_id),
+           {:ok, run} <- Repo.insert(Run.create_changeset(%Run{}, attrs)),
+           {:ok, _job} <- Oban.insert(PreflightWorker.new(%{"run_id" => run.id})) do
+        run
+      else
+        {:error, reason} -> Repo.rollback(reason)
+      end
+    end)
+    |> case do
+      {:ok, run} ->
+        PubSub.broadcast(run)
+        {:ok, run}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        handle_run_changeset_error(changeset)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp create_invalid_source_run(project, author, target_resource_id, source_url) do
+    now = DateTime.utc_now()
+
+    error = %{
+      "phase" => "validation",
+      "reason" => "invalid_openstax_url",
+      "message" => "Use a URL matching https://openstax.org/details/books/<book-slug>.",
+      "recoverable" => false
+    }
+
+    attrs = %{
+      project_id: project.id,
+      author_id: author.id,
+      target_root_container_resource_id: target_resource_id,
+      status: :failed,
+      source_url: source_url,
+      book_slug: "invalid-source",
+      scope_manifest: %{},
+      progress: build_progress(:failed, %{}, now),
+      error: error,
+      started_at: now,
+      finished_at: now
+    }
+
+    result =
+      Repo.transaction(fn ->
+        with :ok <- lock_and_validate_import_start(project, target_resource_id),
+             {:ok, run} <- %Run{} |> Run.create_changeset(attrs) |> Repo.insert(),
+             :ok <- Outbox.persist(run) do
+          run
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+
+    case result do
+      {:ok, run} ->
+        announce_run_update(run)
+        {:ok, run}
+
+      {:error, %Ecto.Changeset{} = changeset} ->
+        handle_run_changeset_error(changeset)
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp lock_and_validate_import_start(project, target_resource_id) do
+    publication = Publishing.project_working_publication(project.slug)
+
+    with %{project_id: project_id, root_resource_id: root_resource_id} <- publication,
+         true <- project_id == project.id and root_resource_id == target_resource_id do
+      Repo.query!(
+        "SELECT pg_advisory_xact_lock($1::integer, $2::integer)",
+        [publication.id, target_resource_id]
+      )
+
+      with %{id: current_publication_id} <- Publishing.project_working_publication(project.slug),
+           true <- current_publication_id == publication.id,
+           :ok <- ensure_project_root_empty(project, target_resource_id),
+           :ok <- ensure_no_active_run(project.id, target_resource_id) do
+        :ok
+      else
+        false -> {:error, :project_publication_changed}
+        nil -> {:error, :invalid_target}
+        {:error, _} = error -> error
+      end
+    else
+      nil -> {:error, :invalid_target}
+      false -> {:error, :target_must_be_project_root}
+    end
+  end
+
+  defp scope_attrs(run, selected_ids) do
+    snapshot = run.preflight_snapshot || %{}
+    chapters = snapshot["chapters"] || []
+    available_ids = MapSet.new(Enum.map(chapters, & &1["id"]))
+    selected_set = MapSet.new(selected_ids)
+
+    if MapSet.subset?(selected_set, available_ids) do
+      selected_chapters =
+        Enum.map(chapters, fn chapter ->
+          Map.put(chapter, "selected", MapSet.member?(selected_set, chapter["id"]))
+        end)
+
+      {:ok,
+       %{
+         preflight_snapshot: Map.put(snapshot, "chapters", selected_chapters),
+         scope_manifest: %{
+           "book_slug" => run.book_slug,
+           "title" => snapshot["title"],
+           "chapters" => selected_chapters,
+           "selected_chapter_ids" => selected_ids
+         }
+       }}
+    else
+      {:error, :invalid_chapter_selection}
+    end
+  end
+
+  defp persist_lesson_plan(
+         lesson,
+         payload,
+         plan_mode,
+         created_by,
+         allow_repair?,
+         opts \\ []
+       ) do
+    result =
+      Repo.transaction(fn ->
+        locked_run =
+          Repo.one!(
+            from(r in Run,
+              where: r.id == ^lesson.run_id,
+              lock: "FOR UPDATE"
+            )
+          )
+
+        if locked_run.status not in [:planning_lessons, :awaiting_lesson_approval] do
+          Repo.rollback(
+            {:invalid_status, locked_run.status, [:planning_lessons, :awaiting_lesson_approval]}
+          )
+        end
+
+        locked_lesson =
+          Repo.one!(
+            from(l in Lesson,
+              where: l.id == ^lesson.id and l.run_id == ^locked_run.id,
+              lock: "FOR UPDATE"
+            )
+          )
+
+        if locked_run.status == :awaiting_lesson_approval do
+          :ok = rollback_unless_ok(ensure_lesson_not_busy(locked_lesson))
+        end
+
+        existing = latest_plan_or_nil(locked_lesson.id)
+
+        updated_lesson =
+          if Keyword.get(opts, :skip_if_exists, false) and not is_nil(existing) do
+            Repo.preload(locked_lesson, :plans, force: true)
+          else
+            persist_locked_lesson_plan(
+              locked_lesson,
+              existing,
+              payload,
+              plan_mode,
+              created_by,
+              allow_repair?
+            )
+          end
+
+        now = DateTime.utc_now()
+
+        updated_lesson =
+          updated_lesson
+          |> Lesson.changeset(%{
+            planning_state: "completed",
+            planning_last_progress_at: now,
+            planning_finished_at: now,
+            planning_error: nil
+          })
+          |> Repo.update!()
+          |> Repo.preload(:plans, force: true)
+
+        if updated_lesson.last_plan_version > locked_run.latest_plan_version do
+          locked_run
+          |> Run.update_changeset(%{latest_plan_version: updated_lesson.last_plan_version})
+          |> Repo.update!()
+        end
+
+        updated_lesson
+      end)
+
+    case result do
+      {:ok, updated_lesson} ->
+        sync_review_counts(updated_lesson.run_id)
+        maybe_reconcile_parallel_review_progress(updated_lesson.run_id)
+        latest_plan = Enum.max_by(updated_lesson.plans, & &1.version)
+
+        Telemetry.plan_checked(
+          updated_lesson.run_id,
+          updated_lesson.id,
+          latest_plan,
+          latest_plan.created_by == "system"
+        )
+
+        {:ok, updated_lesson}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  rescue
+    exception -> {:error, {:lesson_plan_persistence_failed, Exception.message(exception)}}
+  end
+
+  defp persist_locked_lesson_plan(
+         locked_lesson,
+         existing,
+         payload,
+         plan_mode,
+         created_by,
+         allow_repair?
+       ) do
+    normalized = normalize_lesson_payload(locked_lesson, payload, plan_mode, existing)
+
+    Repo.update_all(
+      from(plan in LessonPlan, where: plan.lesson_id == ^locked_lesson.id),
+      set: [approved_by_user: false, approved_at: nil]
+    )
+
+    first_version = next_plan_version(locked_lesson.id)
+    source_context = lesson_source_context(locked_lesson)
+    first_results = Checks.run(source_context, normalized)
+
+    first_plan =
+      insert_plan!(
+        locked_lesson,
+        first_version,
+        normalized,
+        created_by,
+        first_results
+      )
+
+    persist_checks!(locked_lesson.id, first_version, first_results)
+
+    {final_plan, final_results, repair_increment} =
+      if allow_repair? and not Checks.passed?(first_results) do
+        repaired =
+          Planner.repair_lesson_plan(
+            normalized,
+            combined_repair_plan(first_results),
+            lesson_source_context(locked_lesson)
+          )
+
+        repaired_version = first_version + 1
+        repaired_results = Checks.run(source_context, repaired)
+
+        repaired_plan =
+          insert_plan!(
+            locked_lesson,
+            repaired_version,
+            repaired,
+            "system",
+            repaired_results
+          )
+
+        persist_checks!(locked_lesson.id, repaired_version, repaired_results)
+
+        Repo.update_all(
+          from(check in LessonCheck,
+            where:
+              check.lesson_id == ^locked_lesson.id and
+                check.version == ^first_version and check.status == "failed"
+          ),
+          set: [repaired_plan_version: repaired_version]
+        )
+
+        {repaired_plan, repaired_results, 1}
+      else
+        {first_plan, first_results, 0}
+      end
+
+    status = if Checks.passed?(final_results), do: "ready_for_review", else: "needs_attention"
+
+    updated_lesson =
+      locked_lesson
+      |> Lesson.changeset(%{
+        plan_mode: plan_mode,
+        status: status,
+        last_plan_version: final_plan.version,
+        approved_by_author_id: nil,
+        approved_at: nil,
+        last_repair_attempt_at:
+          if(repair_increment == 1,
+            do: DateTime.utc_now(),
+            else: locked_lesson.last_repair_attempt_at
+          ),
+        repair_attempts: locked_lesson.repair_attempts + repair_increment
+      })
+      |> Repo.update!()
+
+    Repo.preload(updated_lesson, :plans, force: true)
+  end
+
+  defp insert_plan!(lesson, version, payload, created_by, results) do
+    %LessonPlan{}
+    |> LessonPlan.changeset(%{
+      lesson_id: lesson.id,
+      version: version,
+      content_payload: payload["content_payload"],
+      questions_payload: payload["questions_payload"],
+      checks_snapshot: checks_snapshot(results),
+      created_by: created_by,
+      approved_by_user: false
+    })
+    |> Repo.insert!()
+  end
+
+  defp persist_checks!(lesson_id, version, results) do
+    Enum.each(results, fn result ->
+      %LessonCheck{}
+      |> LessonCheck.changeset(%{
+        lesson_id: lesson_id,
+        version: version,
+        check_type: result.check_type,
+        status: result.status,
+        findings: result.findings,
+        repair_plan: result.repair_plan
+      })
+      |> Repo.insert!()
+    end)
+  end
+
+  defp checks_snapshot(results) do
+    %{
+      "status" => if(Checks.passed?(results), do: "passed", else: "failed"),
+      "results" =>
+        Enum.map(results, fn result ->
+          %{
+            "check_type" => result.check_type,
+            "status" => result.status,
+            "findings" => result.findings,
+            "repair_plan" => result.repair_plan
+          }
+        end)
+    }
+  end
+
+  defp combined_repair_plan(results) do
+    results
+    |> Enum.filter(&(&1.status == "failed"))
+    |> Enum.reduce(%{}, fn result, acc ->
+      Map.put(acc, result.check_type, result.repair_plan || %{})
+    end)
+  end
+
+  defp normalize_lesson_payload(lesson, payload, plan_mode, existing) do
+    existing_content = if(existing, do: existing.content_payload || %{}, else: %{})
+    existing_questions = if(existing, do: existing.questions_payload || %{}, else: %{})
+
+    incoming_content =
+      case payload["content_payload"] || payload[:content_payload] do
+        content when is_map(content) -> content
+        _ -> Map.drop(payload, ["questions_payload", :questions_payload, "questions", :questions])
+      end
+
+    objective =
+      incoming_content["objective"] || incoming_content[:objective] ||
+        existing_content["objective"] ||
+        "Explain and apply the lesson's core ideas"
+
+    objectives =
+      incoming_content["learning_objectives"] || incoming_content[:learning_objectives] ||
+        existing_content["learning_objectives"] || [objective]
+
+    content =
+      existing_content
+      |> Map.merge(stringify_keys(incoming_content))
+      |> Map.put("title", lesson.title)
+      |> Map.put("objective", objective)
+      |> Map.put("learning_objectives", List.wrap(objectives))
+      |> Map.put_new("narrative", lesson.source_excerpt || "")
+      |> Map.put("source_evidence_links", lesson.source_evidence_links || [])
+      |> Map.put("authoring_mode", plan_mode)
+
+    incoming_questions =
+      payload["questions_payload"] || payload[:questions_payload] ||
+        payload["questions"] || payload[:questions] || existing_questions
+
+    questions =
+      incoming_questions
+      |> normalize_questions()
+      |> Enum.with_index(1)
+      |> Enum.map(fn {question, index} ->
+        question
+        |> Map.put_new("id", "q#{index}")
+        |> Map.put_new("type", "short_answer")
+        |> Map.put("source_evidence_links", lesson.source_evidence_links || [])
+      end)
+
+    content = ensure_authoring_blueprint(content, questions, plan_mode)
+
+    %{
+      "content_payload" => content,
+      "questions_payload" => %{"items" => questions}
+    }
+  end
+
+  defp ensure_authoring_blueprint(content, _questions, mode) when mode != "advanced", do: content
+
+  defp ensure_authoring_blueprint(content, _questions, "advanced") do
+    screens = get_in(content, ["advanced_blueprint", "screens"])
+
+    if is_list(screens) and screens != [] do
+      content
+    else
+      sections = List.wrap(content["instructional_sections"])
+      section = Enum.find(sections, &present_plan_section?/1)
+      section_id = section && section["id"]
+
+      evidence_ids =
+        [
+          section && section["evidence_block_ids"],
+          content["source_block_ids"],
+          get_in(content, ["coverage_manifest", "included_block_ids"])
+        ]
+        |> Enum.flat_map(&List.wrap/1)
+        |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+        |> Enum.uniq()
+        |> Enum.take(2)
+
+      case {section_id, evidence_ids} do
+        {section_id, [_ | _]} when is_binary(section_id) ->
+          objective =
+            content["objective"] ||
+              List.first(List.wrap(content["learning_objectives"])) ||
+              content["title"] ||
+              "the source evidence"
+
+          heading = section["heading"] || section["title"] || objective
+          source_statement = plan_source_statement(section, heading)
+          screen_id = "author-decision-1"
+
+          decision_screen = %{
+            "id" => screen_id,
+            "kind" => "decision",
+            "title" => "Use the evidence",
+            "prompt" => "Which approach best applies #{objective} using the source evidence?",
+            "interaction_type" => "multiple_choice",
+            "choices" => [
+              %{
+                "id" => "evidence-based",
+                "text" => "Use this evidence from #{heading}: #{source_statement}",
+                "correct" => true,
+                "feedback" => "This choice connects the decision to the visible source evidence."
+              },
+              %{
+                "id" => "unsupported",
+                "text" => "Ignore this evidence from #{heading}: #{source_statement}",
+                "correct" => false,
+                "feedback" =>
+                  "Revisit #{heading} and identify which evidence supports the decision."
+              }
+            ],
+            "correct_choice_id" => "evidence-based",
+            "correct_feedback" => "The decision is supported by the lesson evidence.",
+            "incorrect_feedback" => "Return to #{heading} before trying again.",
+            "remediation_section_id" => section_id,
+            "placement_after_section_id" => section_id,
+            "evidence_block_ids" => evidence_ids
+          }
+
+          Map.put(content, "advanced_blueprint", %{
+            "screens" => [decision_screen],
+            "remediation_paths" => [
+              %{"from_question_id" => screen_id, "to_section_id" => section_id}
+            ]
+          })
+
+        _ ->
+          content
+      end
+    end
+  end
+
+  defp present_plan_section?(section) when is_map(section) do
+    is_binary(section["id"]) and String.trim(section["id"]) != "" and
+      List.wrap(section["evidence_block_ids"]) != []
+  end
+
+  defp present_plan_section?(_), do: false
+
+  defp plan_source_statement(section, heading) do
+    section
+    |> Map.get("explanation", "")
+    |> to_string()
+    |> String.split(~r/(?<=[.!?])\s+/, parts: 2)
+    |> List.first()
+    |> case do
+      value when is_binary(value) and value != "" -> String.slice(value, 0, 360)
+      _ -> heading
+    end
+  end
+
+  defp normalize_questions(%{"items" => items}) when is_list(items),
+    do: normalize_questions(items)
+
+  defp normalize_questions(%{"questions" => items}) when is_list(items),
+    do: normalize_questions(items)
+
+  defp normalize_questions(items) when is_list(items) do
+    items
+    |> Enum.map(fn
+      question when is_binary(question) -> %{"prompt" => String.trim(question)}
+      question when is_map(question) -> stringify_keys(question)
+      _ -> %{}
+    end)
+    |> Enum.filter(&(is_binary(&1["prompt"]) and String.trim(&1["prompt"]) != ""))
+    |> Enum.take(6)
+  end
+
+  defp normalize_questions(_), do: []
+
+  defp latest_plan_or_nil(lesson_id) do
+    Repo.one(
+      from(plan in LessonPlan,
+        where: plan.lesson_id == ^lesson_id,
+        order_by: [desc: plan.version],
+        limit: 1
+      )
+    )
+  end
+
+  defp next_plan_version(lesson_id) do
+    Repo.one(
+      from(plan in LessonPlan,
+        where: plan.lesson_id == ^lesson_id,
+        select: coalesce(max(plan.version), 0)
+      )
+    ) + 1
+  end
+
+  defp ensure_plan_approvable(%LessonPlan{rejection_reason: reason})
+       when reason not in [nil, ""],
+       do: {:error, :lesson_plan_rejected}
+
+  defp ensure_plan_approvable(%LessonPlan{}), do: :ok
+
+  defp lesson_source_map(lesson) do
+    base = %{
+      "title" => lesson.title,
+      "source_excerpt" => lesson.source_excerpt,
+      "source_sections" => lesson.source_sections || [],
+      "source_evidence_links" => lesson.source_evidence_links || [],
+      "source_objectives" => lesson.source_objectives || []
+    }
+
+    merge_lesson_source_corpus(base, lesson)
+  end
+
+  defp ensure_usable_lesson_source(%Run{source_schema_version: version}, source)
+       when version >= 2 do
+    source
+    |> Map.get("source_blocks", [])
+    |> List.wrap()
+    |> Enum.any?(&usable_source_block?/1)
+    |> case do
+      true -> :ok
+      false -> {:error, :missing_lesson_source}
+    end
+  end
+
+  defp ensure_usable_lesson_source(%Run{}, _source), do: :ok
+
+  defp usable_source_block?(block) when is_map(block) do
+    source_id = block["id"] || block[:id]
+    text = block["normalized_text"] || block[:normalized_text] || block["text"] || block[:text]
+
+    is_binary(source_id) and String.trim(source_id) != "" and
+      is_binary(text) and String.trim(text) != ""
+  end
+
+  defp usable_source_block?(_block), do: false
+
+  defp lesson_source_context(lesson) do
+    base = %{
+      "title" => lesson.title,
+      "source_excerpt" => lesson.source_excerpt || "",
+      "source_sections" => lesson.source_sections || [],
+      "source_objectives" => lesson.source_objectives || [],
+      "source_evidence_links" => lesson.source_evidence_links || []
+    }
+
+    merge_lesson_source_corpus(base, lesson)
+  end
+
+  defp merge_lesson_source_corpus(base, lesson) do
+    case RichSource.load_lesson_corpus(lesson.id) do
+      {:ok, corpus} ->
+        base
+        |> Map.merge(
+          Map.take(corpus, [
+            "source_blocks",
+            "source_media",
+            "source_word_count",
+            "source_coverage",
+            "attribution"
+          ])
+        )
+        |> Map.put("source_section_details", corpus["source_sections"] || [])
+
+      {:error, _reason} ->
+        base
+        |> Map.put_new("source_blocks", [])
+        |> Map.put_new("source_media", [])
+        |> Map.put_new("source_word_count", lesson.source_word_count || 0)
+        |> Map.put_new("source_coverage", lesson.source_coverage || %{})
+    end
+  end
+
+  defp maybe_transition_to_compiling_locked(%Run{} = locked_run) do
+    if all_lessons_approved?(locked_run.id) do
+      :ok = rollback_unless_ok(ensure_transition_allowed(locked_run.status, :compiling))
+
+      updated_run =
+        locked_run
+        |> Run.update_changeset(transition_attrs(locked_run, :compiling, %{}))
+        |> Repo.update!()
+
+      {:transitioned, updated_run}
+    else
+      :not_ready
+    end
+  end
+
+  defp transition_to_compiling_if_ready(run_id) do
+    result =
+      Repo.transaction(fn ->
+        locked_run =
+          Repo.one(from(run in Run, where: run.id == ^run_id, lock: "FOR UPDATE")) ||
+            Repo.rollback(:not_found)
+
+        :ok = rollback_unless_ok(ensure_status(locked_run.status, :awaiting_lesson_approval))
+
+        case maybe_transition_to_compiling_locked(locked_run) do
+          {:transitioned, updated_run} -> updated_run
+          :not_ready -> Repo.rollback(:lessons_pending_approval)
+        end
+      end)
+
+    after_transition(result)
+  end
+
+  defp return_compile_failure_to_review(run, reason) do
+    result =
+      Repo.transaction(fn ->
+        locked_run =
+          Repo.one(from(candidate in Run, where: candidate.id == ^run.id, lock: "FOR UPDATE")) ||
+            Repo.rollback(:not_found)
+
+        :ok = rollback_unless_ok(ensure_status(locked_run.status, :compiling))
+
+        affected_lesson_ids =
+          case lesson_ids_from_compile_failure(reason) do
+            [] -> selected_lesson_ids(locked_run.id)
+            ids -> ids
+          end
+
+        now = DateTime.utc_now()
+
+        Repo.update_all(
+          from(lesson in Lesson, where: lesson.id in ^affected_lesson_ids),
+          set: [
+            status: "needs_attention",
+            approved_by_author_id: nil,
+            approved_at: nil,
+            updated_at: now
+          ]
+        )
+
+        Repo.update_all(
+          from(plan in LessonPlan,
+            where: plan.lesson_id in ^affected_lesson_ids and plan.approved_by_user == true
+          ),
+          set: [approved_by_user: false, approved_at: nil, updated_at: now]
+        )
+
+        error = %{
+          "phase" => "compile",
+          "reason" => inspect(reason),
+          "message" =>
+            "One or more approved lesson plans could not be compiled. Edit or regenerate the affected plan and try again.",
+          "recoverable" => true,
+          "lesson_ids" => affected_lesson_ids
+        }
+
+        with {:ok, updated} <-
+               locked_run
+               |> Run.update_changeset(
+                 transition_attrs(locked_run, :awaiting_lesson_approval, %{
+                   error: error,
+                   result: Map.drop(locked_run.result || %{}, ["compile_checkpoint", "dry_run"])
+                 })
+               )
+               |> Repo.update(),
+             :ok <- Outbox.persist(updated) do
+          updated
+        else
+          {:error, transition_reason} -> Repo.rollback(transition_reason)
+        end
+      end)
+      |> after_transition()
+
+    case result do
+      {:ok, review_run} ->
+        affected_lesson_ids = get_in(review_run.error || %{}, ["lesson_ids"]) || []
+        Telemetry.compile_failed(run.id, reason, affected_lesson_ids)
+        {:error, {:compile_failed, reason}}
+
+      {:error, transition_reason} ->
+        {:error, transition_reason}
+    end
+  end
+
+  defp lesson_ids_from_compile_failure({:unit_compile_failed, _unit_id, reason}),
+    do: lesson_ids_from_compile_failure(reason)
+
+  defp lesson_ids_from_compile_failure({reason, lesson_id})
+       when reason in [:lesson_not_compilable, :lesson_not_approved] and is_binary(lesson_id),
+       do: [lesson_id]
+
+  defp lesson_ids_from_compile_failure({:lesson_artifact_invalid, lesson_id, _reason})
+       when is_binary(lesson_id),
+       do: [lesson_id]
+
+  defp lesson_ids_from_compile_failure(_reason), do: []
+
+  defp selected_lesson_ids(run_id) do
+    Repo.all(
+      from(lesson in Lesson,
+        where: lesson.run_id == ^run_id and lesson.selected == true,
+        select: lesson.id
+      )
+    )
+  end
+
+  defp all_lessons_approved?(run_id) do
+    plans_query = from(plan in LessonPlan, order_by: [desc: plan.version])
+
+    selected_lessons =
+      Repo.all(
+        from(lesson in Lesson,
+          where: lesson.run_id == ^run_id and lesson.selected == true,
+          preload: [plans: ^plans_query]
+        )
+      )
+
+    selected_lessons != [] and
+      Enum.all?(selected_lessons, &current_lesson_plan_approved?/1)
+  end
+
+  defp current_lesson_plan_approved?(%Lesson{
+         status: "approved",
+         last_plan_version: last_plan_version,
+         plans: [%LessonPlan{} = latest_plan | _]
+       }) do
+    latest_plan.version == last_plan_version and
+      latest_plan.approved_by_user and
+      latest_plan.rejection_reason in [nil, ""]
+  end
+
+  defp current_lesson_plan_approved?(_), do: false
+
+  defp approved_plan_digest(run) do
+    units =
+      run.units
+      |> Enum.filter(& &1.selected)
+      |> Enum.sort_by(& &1.order)
+      |> Enum.map(fn unit ->
+        %{
+          unit_id: unit.id,
+          assessment_payload: unit.assessment_payload || %{},
+          lessons:
+            unit.lessons
+            |> Enum.filter(& &1.selected)
+            |> Enum.sort_by(& &1.order)
+            |> Enum.map(fn lesson ->
+              plan = Enum.max_by(lesson.plans, & &1.version, fn -> nil end)
+
+              %{
+                lesson_id: lesson.id,
+                plan_id: plan && plan.id,
+                plan_version: plan && plan.version,
+                approved: plan && plan.approved_by_user,
+                mode: lesson.plan_mode
+              }
+            end)
+        }
+      end)
+
+    :crypto.hash(
+      :sha256,
+      :erlang.term_to_binary(
+        {run.plan_schema_version, units},
+        [:deterministic]
+      )
+    )
+    |> Base.encode16(case: :lower)
+  end
+
+  defp planned_required_media_ids(run) do
+    available =
+      Repo.all(
+        from(asset in SourceAsset,
+          where: asset.run_id == ^run.id,
+          select: asset.source_key
+        )
+      )
+      |> MapSet.new()
+
+    run.units
+    |> Enum.filter(& &1.selected)
+    |> Enum.flat_map(fn unit ->
+      lesson_payloads =
+        unit.lessons
+        |> Enum.filter(& &1.selected)
+        |> Enum.flat_map(fn lesson ->
+          case Enum.max_by(lesson.plans, & &1.version, fn -> nil end) do
+            %LessonPlan{} = plan -> [plan.content_payload || %{}, plan.questions_payload || %{}]
+            nil -> []
+          end
+        end)
+
+      [unit.assessment_payload || %{} | lesson_payloads]
+    end)
+    |> Enum.reduce(MapSet.new(), &collect_source_keys(&1, &2, available))
+    |> MapSet.to_list()
+    |> Enum.sort()
+  end
+
+  defp collect_source_keys(value, found, available) when is_binary(value) do
+    if MapSet.member?(available, value), do: MapSet.put(found, value), else: found
+  end
+
+  defp collect_source_keys(value, found, available) when is_list(value),
+    do: Enum.reduce(value, found, &collect_source_keys(&1, &2, available))
+
+  defp collect_source_keys(value, found, available) when is_map(value) do
+    Enum.reduce(value, found, fn {key, nested}, acc ->
+      with_key = collect_source_keys(key, acc, available)
+      collect_source_keys(nested, with_key, available)
+    end)
+  end
+
+  defp collect_source_keys(_value, found, _available), do: found
+
+  defp maybe_put_final_dry_run(result, [], dry_run), do: Map.put(result, "dry_run", dry_run)
+
+  defp maybe_put_final_dry_run(result, _required_media_ids, _dry_run),
+    do: Map.delete(result, "dry_run")
+
+  defp lessons_referencing_media(run_id, required_ids) do
+    required = MapSet.new(required_ids)
+    plans_query = from(plan in LessonPlan, order_by: [desc: plan.version])
+
+    lessons =
+      Repo.all(
+        from(lesson in Lesson,
+          where: lesson.run_id == ^run_id and lesson.selected == true,
+          preload: [plans: ^plans_query]
+        )
+      )
+
+    matching =
+      Enum.filter(lessons, fn
+        %Lesson{plans: [%LessonPlan{} = plan | _]} ->
+          payload_references_media?(
+            %{
+              "content_payload" => plan.content_payload,
+              "questions_payload" => plan.questions_payload
+            },
+            required
+          )
+
+        _ ->
+          false
+      end)
+
+    case matching do
+      [] when required_ids != [] -> Enum.map(lessons, & &1.id)
+      _ -> Enum.map(matching, & &1.id)
+    end
+  end
+
+  defp payload_references_media?(value, required) when is_binary(value),
+    do: MapSet.member?(required, value)
+
+  defp payload_references_media?(value, required) when is_list(value),
+    do: Enum.any?(value, &payload_references_media?(&1, required))
+
+  defp payload_references_media?(value, required) when is_map(value),
+    do:
+      Enum.any?(value, fn {key, nested} ->
+        payload_references_media?(key, required) or payload_references_media?(nested, required)
+      end)
+
+  defp payload_references_media?(_value, _required), do: false
+
+  defp run_has_lessons?(run_id) do
+    Repo.exists?(
+      from(lesson in Lesson,
+        where: lesson.run_id == ^run_id and lesson.selected == true
+      )
+    )
+  end
+
+  defp retry_target(%Run{} = run) do
+    phase = get_in(run.error || %{}, ["phase"]) || ""
+    recoverable = get_in(run.error || %{}, ["recoverable"])
+
+    cond do
+      recoverable == false ->
+        {:error, :not_recoverable}
+
+      phase in ["validation"] ->
+        {:error, :not_recoverable}
+
+      phase in ["preflight", "source_discovery"] ->
+        {:ok, :preflighting, PreflightWorker.new(%{"run_id" => run.id})}
+
+      phase in ["ingest", "outline", "outline_planning"] ->
+        if selected_scope?(run),
+          do: {:ok, :ingesting, OutlineWorker.new(%{"run_id" => run.id})},
+          else: {:ok, :preflighting, PreflightWorker.new(%{"run_id" => run.id})}
+
+      phase in ["media", "media_staging"] ->
+        {:ok, :staging_media, MediaWorker.new(%{"run_id" => run.id})}
+
+      phase in ["lesson_planning", "checks"] ->
+        {:ok, :planning_lessons, LessonPlannerWorker.new(%{"run_id" => run.id})}
+
+      phase in ["apply"] ->
+        {:ok, :applying, ApplyWorker.new(%{"run_id" => run.id})}
+
+      phase in ["compile"] ->
+        {:error, :retry_requires_lesson_review}
+
+      true ->
+        {:ok, :preflighting, PreflightWorker.new(%{"run_id" => run.id})}
+    end
+  end
+
+  defp selected_scope?(run) do
+    case get_in(run.scope_manifest || %{}, ["selected_chapter_ids"]) do
+      ids when is_list(ids) -> ids != []
+      _ -> false
+    end
+  end
+
+  defp transition_to_parallel_lesson_planning(%Run{} = run, attrs) do
+    generation = run.lesson_planning_generation + 1
+    parallelism = configured_lesson_planning_parallelism()
+
+    transition_with_job(
+      run,
+      :planning_lessons,
+      Map.merge(attrs, %{
+        lesson_planning_strategy: :parallel_v1,
+        lesson_planning_generation: generation,
+        lesson_planning_parallelism: parallelism,
+        error: nil
+      }),
+      LessonPlanningCoordinatorWorker.new(%{
+        "run_id" => run.id,
+        "generation" => generation
+      })
+    )
+  end
+
+  defp retry_parallel_lesson_planning(%Run{} = run) do
+    generation = run.lesson_planning_generation + 1
+
+    force_status_with_job(
+      run,
+      :planning_lessons,
+      LessonPlanningCoordinatorWorker.new(%{
+        "run_id" => run.id,
+        "generation" => generation
+      }),
+      %{
+        lesson_planning_strategy: :parallel_v1,
+        lesson_planning_generation: generation,
+        lesson_planning_parallelism: configured_lesson_planning_parallelism()
+      }
+    )
+  end
+
+  defp legacy_planner_job(%Run{} = run),
+    do: LessonPlannerWorker.new(%{"run_id" => run.id})
+
+  defp failure_phase(%Run{} = run), do: get_in(run.error || %{}, ["phase"]) || ""
+
+  defp configured_lesson_planning_strategy do
+    case Application.get_env(
+           :oli,
+           :openstax_course_import_lesson_planning_strategy,
+           :parallel_v1
+         ) do
+      :serial_v1 -> :serial_v1
+      _ -> :parallel_v1
+    end
+  end
+
+  defp configured_lesson_planning_parallelism do
+    Application.get_env(:oli, :openstax_course_import_max_parallel_lessons, 3)
+    |> case do
+      value when is_integer(value) -> value
+      _ -> 3
+    end
+    |> max(1)
+    |> min(8)
+  end
+
+  defp transition_with_job(%Run{} = run, next_status, attrs, job_changeset) do
+    attrs =
+      Map.update(attrs, :progress, %{"work_state" => "queued"}, fn progress ->
+        merge_progress(progress, %{"work_state" => "queued"})
+      end)
+
+    result =
+      Repo.transaction(fn ->
+        locked = Repo.one!(from(r in Run, where: r.id == ^run.id, lock: "FOR UPDATE"))
+
+        with :ok <- ensure_transition_allowed(locked.status, next_status),
+             {:ok, updated} <-
+               locked
+               |> Run.update_changeset(transition_attrs(locked, next_status, attrs))
+               |> Repo.update(),
+             :ok <- Outbox.persist(updated),
+             {:ok, _job} <- Oban.insert(job_changeset) do
+          updated
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+
+    after_transition(result)
+  end
+
+  defp force_status_with_job(run, status, job_changeset, extra_attrs \\ %{}) do
+    result =
+      Repo.transaction(fn ->
+        locked = Repo.one!(from(r in Run, where: r.id == ^run.id, lock: "FOR UPDATE"))
+        :ok = rollback_unless_ok(ensure_status(locked.status, :failed))
+
+        project = Repo.get(Project, locked.project_id) || Repo.rollback(:project_not_found)
+
+        attrs =
+          %{
+            status: status,
+            error: nil,
+            finished_at: nil,
+            progress:
+              status
+              |> build_progress(locked.progress)
+              |> Map.put("work_state", "queued"),
+            started_at: locked.started_at || DateTime.utc_now()
+          }
+          |> Map.merge(extra_attrs)
+
+        with :ok <-
+               lock_and_validate_import_start(
+                 project,
+                 locked.target_root_container_resource_id
+               ),
+             {:ok, updated} <- locked |> Run.update_changeset(attrs) |> Repo.update(),
+             {:ok, %Oban.Job{conflict?: false}} <- Oban.insert(job_changeset),
+             :ok <- Outbox.persist(updated) do
+          updated
+        else
+          {:ok, %Oban.Job{conflict?: true}} ->
+            Repo.rollback(:retry_job_already_active)
+
+          {:error, reason} ->
+            Repo.rollback(reason)
+        end
+      end)
+
+    after_transition(result)
+  end
+
+  defp after_transition({:ok, %Run{} = run}) do
+    PubSub.broadcast(run)
+    dispatch_notification(run)
+    {:ok, run}
+  end
+
+  defp after_transition({:error, reason}), do: {:error, reason}
+
+  defp transition_attrs(run, next_status, attrs) do
+    now = DateTime.utc_now()
+    {incoming_progress, attrs} = Map.pop(attrs, :progress)
+
+    progress =
+      next_status
+      |> build_progress(run.progress, now)
+      |> maybe_merge_transition_progress(incoming_progress)
+
+    %{
+      status: next_status,
+      progress: progress,
+      finished_at:
+        if(next_status in @terminal_statuses and run.status not in @terminal_statuses,
+          do: now,
+          else: run.finished_at
+        ),
+      failure_count:
+        if(next_status == :failed, do: run.failure_count + 1, else: run.failure_count)
+    }
+    |> Map.merge(attrs)
+  end
+
+  defp build_progress(status, progress, now \\ DateTime.utc_now()) do
+    progress = stringify_keys(progress || %{})
+    next_stage = Atom.to_string(status)
+
+    %{
+      "stage" => next_stage,
+      "counts" => progress["counts"] || %{},
+      "stage_totals" =>
+        if(progress["stage"] == next_stage, do: progress["stage_totals"] || [], else: []),
+      "timing" => transition_progress_timing(progress, next_stage, now)
+    }
+  end
+
+  defp sync_review_counts(run_id) do
+    plans_checked =
+      Repo.aggregate(
+        from(lesson in Lesson,
+          where:
+            lesson.run_id == ^run_id and lesson.selected == true and lesson.last_plan_version > 0
+        ),
+        :count
+      )
+
+    plans_validated =
+      Repo.aggregate(
+        from(lesson in Lesson,
+          where:
+            lesson.run_id == ^run_id and lesson.selected == true and
+              lesson.status in ["ready_for_review", "approved", "compiled", "applied"]
+        ),
+        :count
+      )
+
+    lessons_approved =
+      Repo.aggregate(
+        from(lesson in Lesson,
+          where:
+            lesson.run_id == ^run_id and lesson.selected == true and
+              lesson.status in ["approved", "compiled", "applied"]
+        ),
+        :count
+      )
+
+    set_progress(run_id, %{
+      "counts" => %{
+        "plans_checked" => plans_checked,
+        "plans_validated" => plans_validated,
+        "lessons_approved" => lessons_approved
+      }
+    })
+  end
+
+  defp maybe_link_lesson_sources(run_id) do
+    case Repo.get(Run, run_id) do
+      %Run{source_schema_version: version} when version >= 2 ->
+        RichSource.link_lessons(run_id)
+
+      %Run{} ->
+        {:ok, 0}
+
+      nil ->
+        {:error, :not_found}
+    end
+  end
+
+  defp merge_progress(existing, incoming) do
+    existing = stringify_keys(existing || %{})
+    incoming = stringify_keys(incoming || %{})
+
+    Map.merge(existing, incoming, fn
+      "counts", existing_counts, incoming_counts
+      when is_map(existing_counts) and is_map(incoming_counts) ->
+        Map.merge(existing_counts, incoming_counts)
+
+      _key, _existing_value, incoming_value ->
+        incoming_value
+    end)
+  end
+
+  defp maybe_merge_transition_progress(progress, incoming) when is_map(incoming) do
+    stage = progress["stage"]
+    timing = progress["timing"]
+
+    progress
+    |> merge_progress(incoming)
+    |> Map.put("stage", stage)
+    |> Map.put("timing", timing)
+  end
+
+  defp maybe_merge_transition_progress(progress, _incoming), do: progress
+
+  defp touch_progress_timing(progress, %Run{} = run, now) do
+    current_stage = Atom.to_string(run.status)
+
+    existing =
+      run.progress
+      |> Kernel.||(%{})
+      |> stringify_keys()
+      |> Map.put_new("updated_at", run.updated_at || run.started_at)
+
+    timing =
+      existing
+      |> transition_progress_timing(current_stage, now)
+      |> record_completed_item_durations(existing, progress, now)
+      |> Map.put("last_progress_at", DateTime.to_iso8601(now))
+
+    progress
+    |> Map.put("stage", current_stage)
+    |> Map.put("timing", timing)
+  end
+
+  defp transition_progress_timing(progress, next_stage, now) do
+    timing =
+      case progress["timing"] do
+        value when is_map(value) -> stringify_keys(value)
+        _ -> %{}
+      end
+
+    previous_stage = progress["stage"]
+    now_iso = DateTime.to_iso8601(now)
+    history = timing["stage_history"] |> List.wrap()
+
+    cond do
+      is_binary(previous_stage) and previous_stage != "" and previous_stage != next_stage ->
+        history =
+          history
+          |> Kernel.++([
+            stage_history_entry(
+              previous_stage,
+              timing["stage_started_at"],
+              now
+            )
+          ])
+          |> Enum.take(-@progress_timing_history_limit)
+
+        %{
+          "stage_started_at" => now_iso,
+          "last_progress_at" => now_iso,
+          "stage_history" => history,
+          "item_durations_seconds" => []
+        }
+
+      true ->
+        %{
+          "stage_started_at" =>
+            timing["stage_started_at"] ||
+              datetime_to_iso8601(run_progress_fallback_datetime(progress)) || now_iso,
+          "last_progress_at" => timing["last_progress_at"] || now_iso,
+          "stage_history" => history,
+          "item_durations_seconds" => timing["item_durations_seconds"] |> List.wrap()
+        }
+    end
+  end
+
+  defp record_completed_item_durations(
+         timing,
+         _previous_progress,
+         %{"lesson_planning" => planning},
+         _now
+       )
+       when is_map(planning),
+       do: timing
+
+  defp record_completed_item_durations(timing, previous_progress, progress, now) do
+    with {previous_completed, previous_total} <- progress_total(previous_progress),
+         {completed, total} <- progress_total(progress),
+         true <- total == previous_total and completed > previous_completed,
+         {:ok, sample_started_at, _offset} <-
+           DateTime.from_iso8601(item_started_at(previous_progress, timing) || "") do
+      duration =
+        now
+        |> DateTime.diff(sample_started_at, :millisecond)
+        |> max(0)
+        |> Kernel./(completed - previous_completed)
+        |> Kernel./(1_000)
+
+      samples =
+        timing["item_durations_seconds"]
+        |> List.wrap()
+        |> Kernel.++(List.duplicate(duration, completed - previous_completed))
+        |> Enum.take(-@progress_item_history_limit)
+
+      Map.put(timing, "item_durations_seconds", samples)
+    else
+      _ -> timing
+    end
+  end
+
+  defp item_started_at(previous_progress, timing) do
+    previous_progress
+    |> Map.get("current_item", %{})
+    |> case do
+      current when is_map(current) -> current["started_at"] || current[:started_at]
+      _ -> nil
+    end
+    |> Kernel.||(timing["last_progress_at"])
+  end
+
+  defp progress_total(progress) when is_map(progress) do
+    progress
+    |> Map.get("stage_totals", [])
+    |> List.wrap()
+    |> Enum.find_value(fn
+      total when is_map(total) ->
+        completed = total["completed"] || total[:completed]
+        count = total["total"] || total[:total]
+
+        if is_number(completed) and is_number(count) and count > 0,
+          do: {completed, count},
+          else: nil
+
+      _ ->
+        nil
+    end)
+  end
+
+  defp progress_total(_), do: nil
+
+  defp stage_history_entry(stage, started_at, finished_at) do
+    %{
+      "stage" => stage,
+      "started_at" => started_at,
+      "finished_at" => DateTime.to_iso8601(finished_at),
+      "duration_seconds" => elapsed_seconds(started_at, finished_at)
+    }
+  end
+
+  defp elapsed_seconds(started_at, finished_at) when is_binary(started_at) do
+    case DateTime.from_iso8601(started_at) do
+      {:ok, parsed, _offset} -> max(DateTime.diff(finished_at, parsed, :second), 0)
+      _ -> nil
+    end
+  end
+
+  defp elapsed_seconds(_started_at, _finished_at), do: nil
+
+  defp run_progress_fallback_datetime(progress) do
+    progress["updated_at"] || progress["started_at"]
+  end
+
+  defp datetime_to_iso8601(%DateTime{} = datetime), do: DateTime.to_iso8601(datetime)
+  defp datetime_to_iso8601(value) when is_binary(value), do: value
+  defp datetime_to_iso8601(_), do: nil
+
+  defp update_run(run_id, attrs) do
+    with %Run{} = run <- Repo.get(Run, run_id),
+         {:ok, updated} <- run |> Run.update_changeset(attrs) |> Repo.update() do
+      PubSub.broadcast(updated)
+      {:ok, updated}
+    else
+      nil -> {:error, :not_found}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp update_run_if_status(run_id, expected_status, attrs) do
+    result =
+      Repo.transaction(fn ->
+        run =
+          Repo.one(
+            from(run in Run,
+              where: run.id == ^run_id,
+              lock: "FOR UPDATE"
+            )
+          ) || Repo.rollback(:not_found)
+
+        :ok = rollback_unless_ok(ensure_status(run.status, expected_status))
+
+        attrs = touch_progress_attrs(attrs, run)
+
+        run
+        |> Run.update_changeset(attrs)
+        |> Repo.update()
+        |> case do
+          {:ok, updated} -> updated
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+
+    case result do
+      {:ok, updated} ->
+        PubSub.broadcast(updated)
+        {:ok, updated}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp touch_progress_attrs(attrs, %Run{} = run) do
+    case Map.fetch(attrs, :progress) do
+      {:ok, incoming} when is_map(incoming) ->
+        progress =
+          run.progress
+          |> merge_progress(incoming)
+          |> Map.put("stage", Atom.to_string(run.status))
+          |> touch_progress_timing(run, DateTime.utc_now())
+
+        Map.put(attrs, :progress, progress)
+
+      _ ->
+        attrs
+    end
+  end
+
+  defp reconcile_lesson_planning_locked(run, generation, now, duration_sample \\ nil) do
+    lessons = lock_selected_lessons(run.id)
+
+    active =
+      Enum.filter(
+        lessons,
+        &(&1.planning_generation == generation and
+            &1.planning_state in @active_lesson_planning_states)
+      )
+
+    pending =
+      Enum.filter(
+        lessons,
+        &(&1.planning_generation == generation and &1.planning_state == "pending")
+      )
+
+    open_slots = max(run.lesson_planning_parallelism - length(active), 0)
+
+    pending
+    |> Enum.take(open_slots)
+    |> Enum.each(&enqueue_lesson_job_locked(&1, run, generation, now))
+
+    lessons = lock_selected_lessons(run.id)
+    progress = parallel_lesson_progress(run, lessons, generation, now, duration_sample)
+    stats = lesson_planning_stats(lessons, generation)
+
+    cond do
+      run.status == :planning_lessons and stats.pending == 0 and stats.active == 0 and
+          stats.failed > 0 ->
+        failed_lessons =
+          lessons
+          |> Enum.filter(
+            &(&1.planning_generation == generation and &1.planning_state == "failed")
+          )
+          |> Enum.take(20)
+
+        error = %{
+          "phase" => "lesson_planning",
+          "reason" => "lesson_jobs_failed",
+          "message" =>
+            "#{stats.failed} lesson #{if(stats.failed == 1, do: "plan", else: "plans")} could not be generated after retries. Retry the import to regenerate only the failed lessons.",
+          "recoverable" => true,
+          "failed_count" => stats.failed,
+          "lesson_ids" => Enum.map(failed_lessons, & &1.id),
+          "lesson_titles" => Enum.map(failed_lessons, & &1.title),
+          "planning_generation" => generation
+        }
+
+        updated =
+          run
+          |> Run.update_changeset(
+            transition_attrs(run, :failed, %{error: error, progress: progress})
+          )
+          |> Repo.update!()
+
+        :ok = rollback_unless_ok(Outbox.persist(updated))
+        %{run: updated, terminal?: true}
+
+      run.status == :planning_lessons and stats.pending == 0 and stats.active == 0 and
+        stats.completed == stats.total and stats.total > 0 ->
+        latest_plan_version = Enum.max(Enum.map(lessons, & &1.last_plan_version), fn -> 0 end)
+
+        Repo.update_all(
+          from(unit in Unit, where: unit.run_id == ^run.id),
+          set: [status: "ready_for_review", updated_at: now]
+        )
+
+        updated =
+          run
+          |> Run.update_changeset(
+            transition_attrs(run, :awaiting_lesson_approval, %{
+              latest_plan_version: latest_plan_version,
+              progress: progress,
+              error: nil
+            })
+          )
+          |> Repo.update!()
+
+        :ok = rollback_unless_ok(Outbox.persist(updated))
+        %{run: updated, terminal?: true}
+
+      true ->
+        updated =
+          run
+          |> Run.update_changeset(%{progress: progress})
+          |> Repo.update!()
+
+        %{run: updated, terminal?: false}
+    end
+  end
+
+  defp enqueue_lesson_job_locked(%Lesson{} = lesson, %Run{} = run, generation, now) do
+    request_id = lesson.planning_request_id || Ecto.UUID.generate()
+
+    args = %{
+      "run_id" => run.id,
+      "lesson_id" => lesson.id,
+      "generation" => generation,
+      "request_id" => request_id,
+      "position" => lesson.planning_position,
+      "operation" => lesson.planning_operation,
+      "base_plan_version" => lesson.planning_base_plan_version,
+      "attempt_offset" => lesson.planning_attempts
+    }
+
+    job =
+      case insert_lesson_plan_job(LessonPlanWorker.new(args)) do
+        {:ok, %Oban.Job{} = job} -> job
+        {:error, reason} -> Repo.rollback({:lesson_job_enqueue_failed, lesson.id, reason})
+      end
+
+    if not is_integer(job.id) do
+      Repo.rollback({:lesson_job_enqueue_failed, lesson.id, :missing_job_id})
+    end
+
+    lesson
+    |> Lesson.changeset(%{
+      planning_state: "queued",
+      planning_generation: generation,
+      planning_request_id: request_id,
+      planning_oban_job_id: job.id,
+      planning_queued_at: lesson.planning_queued_at || now,
+      planning_last_progress_at: now,
+      planning_finished_at: nil
+    })
+    |> Repo.update!()
+
+    Telemetry.lesson_job_enqueued(run.id, lesson.id, generation, lesson.planning_operation)
+  end
+
+  defp insert_lesson_plan_job(job_changeset) do
+    case Application.get_env(:oli, :openstax_course_import_lesson_job_inserter) do
+      nil -> Oban.insert(job_changeset)
+      inserter when is_function(inserter, 1) -> inserter.(job_changeset)
+      _invalid -> {:error, :invalid_lesson_job_inserter}
+    end
+  end
+
+  defp parallel_lesson_progress(run, lessons, generation, now, duration_sample) do
+    stats = lesson_planning_stats(lessons, generation)
+    active_items = parallel_active_items(lessons, generation)
+
+    previous_lesson_planning =
+      run.progress
+      |> Kernel.||(%{})
+      |> Map.get("lesson_planning", %{})
+      |> stringify_keys()
+
+    lesson_planning = %{
+      "total" => stats.total,
+      "pending" => stats.pending,
+      "queued" => stats.queued,
+      "running" => stats.running,
+      "retrying" => stats.retrying,
+      "completed" => stats.completed,
+      "failed" => stats.failed,
+      "parallelism" => run.lesson_planning_parallelism,
+      "active_items" => active_items
+    }
+
+    incoming = %{
+      "work_state" => parallel_work_state(stats, run.status),
+      "lesson_planning" => lesson_planning,
+      "active_items" => active_items,
+      "current_items" => active_items,
+      "current_item" => List.first(active_items),
+      "counts" => %{
+        "plans_total" => stats.total,
+        "plans_pending" => stats.pending,
+        "plans_queued" => stats.queued,
+        "plans_running" => stats.running,
+        "plans_retrying" => stats.retrying,
+        "plans_checked" => stats.completed,
+        "plans_completed" => stats.completed,
+        "plans_failed" => stats.failed,
+        "plans_validated" => stats.validated,
+        "lessons_approved" => stats.approved,
+        "effective_parallelism" => min(run.lesson_planning_parallelism, max(stats.active, 1))
+      },
+      "stage_totals" => [
+        %{
+          "label" => "Lesson plans checked",
+          "completed" => stats.completed,
+          "total" => stats.total
+        }
+      ]
+    }
+
+    progress =
+      run.progress
+      |> merge_progress(incoming)
+      |> Map.put("stage", Atom.to_string(run.status))
+
+    progress =
+      if previous_lesson_planning == lesson_planning and is_nil(duration_sample) do
+        progress
+      else
+        touch_progress_timing(progress, run, now)
+      end
+
+    maybe_append_parallel_duration(progress, duration_sample)
+  end
+
+  defp lesson_planning_stats(lessons, generation) do
+    current = Enum.filter(lessons, &(&1.planning_generation == generation))
+
+    counts =
+      Enum.frequencies_by(current, fn lesson ->
+        if lesson.planning_state in Lesson.planning_states(),
+          do: lesson.planning_state,
+          else: "pending"
+      end)
+
+    completed =
+      Enum.count(lessons, &(&1.last_plan_version > 0 and &1.planning_state == "completed"))
+
+    %{
+      total: length(lessons),
+      pending: Map.get(counts, "pending", 0),
+      queued: Map.get(counts, "queued", 0),
+      running: Map.get(counts, "running", 0),
+      retrying: Map.get(counts, "retrying", 0),
+      completed: completed,
+      failed: Map.get(counts, "failed", 0),
+      active:
+        Map.get(counts, "queued", 0) + Map.get(counts, "running", 0) +
+          Map.get(counts, "retrying", 0),
+      validated:
+        Enum.count(
+          lessons,
+          &(&1.status in ["ready_for_review", "approved", "compiled", "applied"])
+        ),
+      approved: Enum.count(lessons, &(&1.status in ["approved", "compiled", "applied"]))
+    }
+  end
+
+  defp parallel_active_items(lessons, generation) do
+    lessons
+    |> Enum.filter(
+      &(&1.planning_generation == generation and
+          &1.planning_state in @active_lesson_planning_states)
+    )
+    |> Enum.sort_by(&(&1.planning_position || 0))
+    |> Enum.map(fn lesson ->
+      %{
+        "lesson_id" => lesson.id,
+        "title" => lesson.title,
+        "state" => lesson.planning_state,
+        "attempt" => lesson.planning_attempts,
+        "position" => lesson.planning_position,
+        "operation" => lesson.planning_operation
+      }
+    end)
+  end
+
+  defp parallel_work_state(%{running: running}, _status) when running > 0, do: "running"
+  defp parallel_work_state(%{retrying: retrying}, _status) when retrying > 0, do: "retrying"
+  defp parallel_work_state(%{queued: queued}, _status) when queued > 0, do: "queued"
+  defp parallel_work_state(%{pending: pending}, _status) when pending > 0, do: "queued"
+
+  defp parallel_work_state(%{failed: failed}, :awaiting_lesson_approval) when failed > 0,
+    do: "idle"
+
+  defp parallel_work_state(_stats, _status), do: "completed"
+
+  defp maybe_append_parallel_duration(progress, duration)
+       when is_number(duration) and duration >= 0 do
+    timing = stringify_keys(progress["timing"] || %{})
+
+    samples =
+      timing["item_durations_seconds"]
+      |> List.wrap()
+      |> Kernel.++([duration])
+      |> Enum.take(-@progress_item_history_limit)
+
+    Map.put(progress, "timing", Map.put(timing, "item_durations_seconds", samples))
+  end
+
+  defp maybe_append_parallel_duration(progress, _duration), do: progress
+
+  defp normalize_lesson_job_args(args) do
+    normalized = stringify_keys(args)
+
+    values = %{
+      run_id: normalized["run_id"],
+      lesson_id: normalized["lesson_id"],
+      generation: normalized["generation"],
+      request_id: normalized["request_id"],
+      position: normalized["position"],
+      operation: normalized["operation"],
+      base_plan_version: normalized["base_plan_version"] || 0
+    }
+
+    if is_binary(values.run_id) and is_binary(values.lesson_id) and
+         is_integer(values.generation) and values.generation > 0 and
+         is_binary(values.request_id) and is_integer(values.position) and values.position > 0 and
+         values.operation in Lesson.planning_operations() and
+         is_integer(values.base_plan_version) and values.base_plan_version >= 0 do
+      {:ok, values}
+    else
+      {:error, :invalid_lesson_job}
+    end
+  end
+
+  defp ensure_parallel_generation(%Run{} = run, generation, allowed_statuses) do
+    cond do
+      run.lesson_planning_strategy != :parallel_v1 ->
+        {:error, :stale_lesson_planning_job}
+
+      run.lesson_planning_generation != generation ->
+        {:error, :stale_lesson_planning_job}
+
+      run.status not in allowed_statuses ->
+        {:error, :stale_lesson_planning_job}
+
+      true ->
+        :ok
+    end
+  end
+
+  defp planning_statuses("initial"), do: [:planning_lessons]
+  defp planning_statuses("regenerate"), do: [:awaiting_lesson_approval]
+
+  defp pending_planning_attrs(lesson, generation, position, operation, now) do
+    if lesson.planning_generation == generation and is_binary(lesson.planning_request_id) do
+      %{
+        planning_position: position,
+        planning_operation: operation,
+        planning_last_progress_at: lesson.planning_last_progress_at || now
+      }
+    else
+      %{
+        planning_state: "pending",
+        planning_operation: operation,
+        planning_generation: generation,
+        planning_request_id: Ecto.UUID.generate(),
+        planning_position: position,
+        planning_oban_job_id: nil,
+        planning_attempts: 0,
+        planning_base_plan_version: lesson.last_plan_version,
+        planning_queued_at: nil,
+        planning_started_at: nil,
+        planning_last_progress_at: now,
+        planning_finished_at: nil,
+        planning_error: nil
+      }
+    end
+  end
+
+  defp completed_planning_attrs(lesson, generation, position, now) do
+    %{
+      planning_state: "completed",
+      planning_operation: "initial",
+      planning_generation: generation,
+      planning_request_id: nil,
+      planning_position: position,
+      planning_oban_job_id: nil,
+      planning_base_plan_version: lesson.last_plan_version,
+      planning_last_progress_at: now,
+      planning_finished_at: lesson.planning_finished_at || now,
+      planning_error: nil
+    }
+  end
+
+  defp lock_run!(run_id) do
+    Repo.one(from(run in Run, where: run.id == ^run_id, lock: "FOR UPDATE")) ||
+      Repo.rollback(:not_found)
+  end
+
+  defp lock_lesson!(lesson_id, run_id) do
+    Repo.one(
+      from(lesson in Lesson,
+        where: lesson.id == ^lesson_id and lesson.run_id == ^run_id,
+        lock: "FOR UPDATE"
+      )
+    ) || Repo.rollback(:not_found)
+  end
+
+  defp lock_selected_lessons(run_id) do
+    Repo.all(
+      from(lesson in Lesson,
+        join: unit in Unit,
+        on: unit.id == lesson.unit_id,
+        where: lesson.run_id == ^run_id and lesson.selected == true,
+        order_by: [asc: unit.order, asc: lesson.order, asc: lesson.id],
+        select: lesson,
+        lock: "FOR UPDATE"
+      )
+    )
+  end
+
+  defp planning_position_for_lesson(%Lesson{} = lesson) do
+    lesson.run_id
+    |> lock_selected_lessons()
+    |> Enum.find_index(&(&1.id == lesson.id))
+    |> case do
+      nil -> 1
+      index -> index + 1
+    end
+  end
+
+  defp review_status_for_lesson(%Lesson{status: status})
+       when status in ["needs_attention", "needs_repair"],
+       do: status
+
+  defp review_status_for_lesson(_lesson), do: "ready_for_review"
+
+  defp maybe_update_latest_plan_version_locked(run, version)
+       when is_integer(version) and version > run.latest_plan_version do
+    run
+    |> Run.update_changeset(%{latest_plan_version: version})
+    |> Repo.update!()
+  end
+
+  defp maybe_update_latest_plan_version_locked(run, _version), do: run
+
+  defp duration_seconds(%DateTime{} = started_at, %DateTime{} = finished_at) do
+    finished_at
+    |> DateTime.diff(started_at, :millisecond)
+    |> max(0)
+    |> Kernel./(1_000)
+  end
+
+  defp duration_seconds(_started_at, _finished_at), do: nil
+
+  defp recover_lesson_job_locked(%Lesson{} = lesson, now) do
+    job =
+      if is_integer(lesson.planning_oban_job_id),
+        do: Repo.get(Oban.Job, lesson.planning_oban_job_id),
+        else: nil
+
+    job_state = if job, do: to_string(job.state), else: nil
+    attempts = max(lesson.planning_attempts, if(job, do: job.attempt || 0, else: 0))
+
+    {attrs, failure_category} =
+      case job_state do
+        "available" ->
+          {%{planning_state: "queued", planning_last_progress_at: now}, nil}
+
+        "executing" ->
+          {%{planning_state: "running", planning_last_progress_at: now}, nil}
+
+        state when state in ["scheduled", "retryable"] ->
+          {
+            %{
+              planning_state: "retrying",
+              planning_attempts: attempts,
+              planning_last_progress_at: now
+            },
+            nil
+          }
+
+        state when state in ["discarded", "cancelled"] ->
+          category =
+            case state do
+              "discarded" -> :background_job_discarded
+              "cancelled" -> :background_job_cancelled
+            end
+
+          {
+            %{
+              planning_state: "failed",
+              planning_attempts: attempts,
+              planning_last_progress_at: now,
+              planning_finished_at: now,
+              planning_error: %{
+                "category" => Atom.to_string(category),
+                "attempt" => attempts,
+                "retryable" => false
+              }
+            },
+            category
+          }
+
+        _missing_or_completed when attempts >= 4 ->
+          category =
+            if is_nil(job),
+              do: :background_job_missing_exhausted,
+              else: :background_job_exhausted
+
+          {
+            %{
+              planning_state: "failed",
+              planning_attempts: attempts,
+              planning_last_progress_at: now,
+              planning_finished_at: now,
+              planning_error: %{
+                "category" => Atom.to_string(category),
+                "attempt" => attempts,
+                "retryable" => false
+              }
+            },
+            category
+          }
+
+        _missing_or_completed ->
+          {
+            %{
+              planning_state: "pending",
+              planning_oban_job_id: nil,
+              planning_attempts: attempts,
+              planning_last_progress_at: now,
+              planning_error: %{
+                "category" => "background_job_recovered",
+                "attempt" => attempts,
+                "retryable" => true
+              }
+            },
+            nil
+          }
+      end
+
+    updated_lesson =
+      lesson
+      |> Lesson.changeset(attrs)
+      |> Repo.update!()
+
+    case failure_category do
+      nil ->
+        nil
+
+      category ->
+        %{
+          lesson_id: updated_lesson.id,
+          attempt: updated_lesson.planning_attempts,
+          category: category
+        }
+    end
+  end
+
+  defp ensure_lesson_not_busy(%Lesson{planning_state: state})
+       when state in @active_lesson_planning_states,
+       do: {:error, :lesson_plan_busy}
+
+  defp ensure_lesson_not_busy(%Lesson{
+         planning_state: "pending",
+         planning_operation: "regenerate",
+         planning_request_id: request_id
+       })
+       when is_binary(request_id),
+       do: {:error, :lesson_plan_busy}
+
+  defp ensure_lesson_not_busy(_lesson), do: :ok
+
+  defp announce_parallel_result({:ok, %{run: run, terminal?: terminal?} = result}) do
+    result
+    |> Map.get(:recovered_failures, [])
+    |> Enum.each(fn failure ->
+      Telemetry.lesson_job_failed(
+        run.id,
+        failure.lesson_id,
+        failure.attempt,
+        failure.category
+      )
+    end)
+
+    announce_parallel_run(run, terminal?)
+    {:ok, run}
+  end
+
+  defp announce_parallel_result({:error, reason}), do: {:error, reason}
+
+  defp announce_parallel_run(%Run{} = run, terminal?) do
+    PubSub.broadcast(run)
+
+    if terminal? do
+      Telemetry.lesson_batch_finished(
+        run.id,
+        run.lesson_planning_generation,
+        run.status,
+        completed_stage_duration(run.progress, "planning_lessons"),
+        get_in(run.error || %{}, ["failed_count"]) || 0
+      )
+
+      dispatch_notification(run)
+    end
+
+    :ok
+  end
+
+  defp completed_stage_duration(progress, stage) do
+    progress
+    |> Kernel.||(%{})
+    |> get_in(["timing", "stage_history"])
+    |> List.wrap()
+    |> Enum.reverse()
+    |> Enum.find_value(fn
+      %{"stage" => ^stage, "duration_seconds" => duration} when is_number(duration) -> duration
+      _entry -> nil
+    end)
+  end
+
+  defp maybe_reconcile_parallel_review_progress(run_id) do
+    case Repo.get(Run, run_id) do
+      %Run{
+        status: :awaiting_lesson_approval,
+        lesson_planning_strategy: :parallel_v1,
+        lesson_planning_generation: generation
+      }
+      when generation > 0 ->
+        case reconcile_lesson_planning(run_id, generation) do
+          {:ok, _run} -> :ok
+          {:error, :stale_lesson_planning_job} -> :ok
+          {:error, _reason} -> :ok
+        end
+
+      _run ->
+        :ok
+    end
+  end
+
+  defp cancel_run_with_planning_fence(run_id) do
+    result =
+      Repo.transaction(fn ->
+        run = lock_run!(run_id)
+        :ok = rollback_unless_ok(ensure_transition_allowed(run.status, :cancelled))
+        now = DateTime.utc_now()
+
+        Repo.update_all(
+          from(lesson in Lesson,
+            where:
+              lesson.run_id == ^run.id and
+                lesson.planning_state in ^@unfinished_lesson_planning_states
+          ),
+          set: [
+            planning_state: "cancelled",
+            planning_finished_at: now,
+            planning_last_progress_at: now,
+            planning_error: %{"category" => "cancelled_by_user", "retryable" => false},
+            updated_at: now
+          ]
+        )
+
+        with {:ok, cancelled} <-
+               run
+               |> Run.update_changeset(
+                 transition_attrs(run, :cancelled, %{
+                   lesson_planning_generation: run.lesson_planning_generation + 1
+                 })
+               )
+               |> Repo.update(),
+             :ok <- Outbox.persist(cancelled) do
+          cancelled
+        else
+          {:error, reason} -> Repo.rollback(reason)
+        end
+      end)
+
+    after_transition(result)
+  end
+
+  defp enqueue_lesson_regeneration(%Run{} = run, lesson_id) do
+    result =
+      Repo.transaction(fn ->
+        locked_run = lock_run!(run.id)
+        :ok = rollback_unless_ok(ensure_status(locked_run.status, :awaiting_lesson_approval))
+
+        lesson = lock_lesson!(lesson_id, locked_run.id)
+        :ok = rollback_unless_ok(ensure_lesson_not_busy(lesson))
+
+        if lesson.last_plan_version <= 0 do
+          Repo.rollback(:missing_lesson_plan)
+        end
+
+        generation = max(locked_run.lesson_planning_generation, 1)
+        now = DateTime.utc_now()
+        request_id = Ecto.UUID.generate()
+
+        Repo.update_all(
+          from(plan in LessonPlan, where: plan.lesson_id == ^lesson.id),
+          set: [approved_by_user: false, approved_at: nil]
+        )
+
+        position = lesson.planning_position || planning_position_for_lesson(lesson)
+
+        queued_lesson =
+          lesson
+          |> Lesson.changeset(%{
+            status: review_status_for_lesson(lesson),
+            approved_by_author_id: nil,
+            approved_at: nil,
+            planning_state: "pending",
+            planning_operation: "regenerate",
+            planning_generation: generation,
+            planning_request_id: request_id,
+            planning_position: position,
+            planning_oban_job_id: nil,
+            planning_attempts: 0,
+            planning_base_plan_version: lesson.last_plan_version,
+            planning_queued_at: nil,
+            planning_started_at: nil,
+            planning_last_progress_at: now,
+            planning_finished_at: nil,
+            planning_error: nil
+          })
+          |> Repo.update!()
+
+        locked_run =
+          if locked_run.lesson_planning_strategy != :parallel_v1 or
+               locked_run.lesson_planning_generation != generation do
+            locked_run
+            |> Run.update_changeset(%{
+              lesson_planning_strategy: :parallel_v1,
+              lesson_planning_generation: generation,
+              lesson_planning_parallelism: configured_lesson_planning_parallelism()
+            })
+            |> Repo.update!()
+          else
+            locked_run
+          end
+
+        reconciliation = reconcile_lesson_planning_locked(locked_run, generation, now)
+        {Repo.reload!(queued_lesson), reconciliation.run}
+      end)
+
+    case result do
+      {:ok, {lesson, updated_run}} ->
+        PubSub.broadcast(updated_run)
+        {:ok, lesson}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp update_lesson_plan_job_failure(args, attempt, category, planning_state) do
+    with {:ok, job_args} <- normalize_lesson_job_args(args) do
+      result =
+        Repo.transaction(fn ->
+          run = lock_run!(job_args.run_id)
+
+          :ok =
+            rollback_unless_ok(
+              ensure_parallel_generation(
+                run,
+                job_args.generation,
+                planning_statuses(job_args.operation)
+              )
+            )
+
+          lesson = lock_lesson!(job_args.lesson_id, run.id)
+
+          if lesson.planning_request_id != job_args.request_id or
+               lesson.planning_generation != job_args.generation or
+               lesson.planning_state == "completed" do
+            Repo.rollback(:stale_lesson_planning_job)
+          end
+
+          now = DateTime.utc_now()
+          terminal? = planning_state == "failed"
+
+          updated_lesson =
+            lesson
+            |> Lesson.changeset(%{
+              planning_state: planning_state,
+              planning_attempts: max(lesson.planning_attempts, attempt),
+              planning_last_progress_at: now,
+              planning_finished_at: if(terminal?, do: now, else: nil),
+              planning_error: %{
+                "category" => Atom.to_string(category),
+                "attempt" => attempt,
+                "retryable" => not terminal?
+              }
+            })
+            |> Repo.update!()
+
+          duration =
+            if terminal?, do: duration_seconds(updated_lesson.planning_started_at, now), else: nil
+
+          reconciliation =
+            reconcile_lesson_planning_locked(run, job_args.generation, now, duration)
+
+          {updated_lesson, reconciliation.run, reconciliation.terminal?}
+        end)
+
+      case result do
+        {:ok, {lesson, updated_run, terminal?}} ->
+          announce_parallel_run(updated_run, terminal?)
+
+          if planning_state == "retrying" do
+            Telemetry.lesson_job_retrying(updated_run.id, lesson.id, attempt, category)
+          else
+            Telemetry.lesson_job_failed(updated_run.id, lesson.id, attempt, category)
+          end
+
+          {:ok, lesson, updated_run}
+
+        {:error, reason} ->
+          {:error, reason}
+      end
+    end
+  end
+
+  defp authorized_run(run_id, author) do
+    with {:ok, run} <- get_owned_run(run_id, author),
+         %Project{} = project <- Repo.get(Project, run.project_id),
+         :ok <- authorize_project(project, author) do
+      {:ok, run}
+    else
+      nil -> {:error, :not_found}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp get_owned_run(run_id, author) do
+    case Repo.get(Run, run_id) do
+      %Run{author_id: author_id} = run when author_id == author.id -> {:ok, run}
+      %Run{} -> {:error, :not_authorized}
+      nil -> {:error, :not_found}
+    end
+  end
+
+  defp lesson_with_run(lesson_id) do
+    case Repo.one(from(lesson in Lesson, where: lesson.id == ^lesson_id, preload: [:run])) do
+      nil -> {:error, :not_found}
+      lesson -> {:ok, lesson}
+    end
+  end
+
+  defp preload_run(run) do
+    Repo.preload(
+      run,
+      [
+        units:
+          from(unit in Unit,
+            order_by: [asc: unit.order],
+            preload: [
+              lessons:
+                ^from(lesson in Lesson,
+                  order_by: [asc: lesson.order],
+                  preload: [
+                    plans:
+                      ^from(plan in LessonPlan,
+                        order_by: [desc: plan.version]
+                      )
+                  ]
+                )
+            ]
+          )
+      ],
+      force: true
+    )
+  end
+
+  defp ensure_project_root_empty(project, resource_id) do
+    case AuthoringResolver.root_container(project.slug) do
+      %Revision{resource_id: ^resource_id, children: children} when children in [nil, []] -> :ok
+      %Revision{resource_id: ^resource_id} -> {:error, :project_root_not_empty}
+      %Revision{} -> {:error, :target_must_be_project_root}
+      nil -> {:error, :invalid_target}
+    end
+  end
+
+  defp target_resource_id(%Revision{resource_id: id}) when is_integer(id), do: {:ok, id}
+  defp target_resource_id(id) when is_integer(id), do: {:ok, id}
+  defp target_resource_id(_), do: {:error, :invalid_target}
+
+  defp ensure_no_active_run(project_id, target_resource_id) do
+    if Repo.exists?(
+         from(run in Run,
+           where:
+             run.project_id == ^project_id and
+               run.target_root_container_resource_id == ^target_resource_id and
+               run.status in ^@active_statuses
+         )
+       ),
+       do: {:error, :run_in_progress},
+       else: :ok
+  end
+
+  defp cancel_background_jobs(run_id) do
+    query =
+      from(job in Oban.Job,
+        where:
+          job.state in ["available", "scheduled", "executing", "retryable"] and
+            fragment("?->>'run_id' = ?", job.args, ^run_id)
+      )
+
+    {:ok, _cancelled_jobs} = Oban.cancel_all_jobs(query)
+    :ok
+  rescue
+    exception ->
+      Logger.warning(
+        "OpenStax course import #{run_id} was cancelled, but its background job cancellation raised: #{Exception.message(exception)}"
+      )
+
+      :ok
+  end
+
+  defp authorize_project(project, author) do
+    case EditingUtils.authorize_user(author, project) do
+      {:ok} -> :ok
+      _ -> {:error, :not_authorized}
+    end
+  rescue
+    _ -> {:error, :not_authorized}
+  end
+
+  defp ensure_feature_available(project) do
+    if ScopedFeatureFlags.enabled?(:openstax_course_import, project),
+      do: :ok,
+      else: {:error, :feature_disabled}
+  rescue
+    _ -> {:error, :feature_disabled}
+  end
+
+  defp ensure_status(current, expected) do
+    if current == expected,
+      do: :ok,
+      else: {:error, {:invalid_status, current, expected}}
+  end
+
+  defp rollback_unless_ok(:ok), do: :ok
+  defp rollback_unless_ok({:error, reason}), do: Repo.rollback(reason)
+
+  defp ensure_transition_allowed(current, next) do
+    if next in Map.get(@allowed_transitions, current, []),
+      do: :ok,
+      else: {:error, {:invalid_transition, current, next}}
+  end
+
+  defp validate_plan_mode(mode) when mode in ["basic", "advanced"], do: :ok
+  defp validate_plan_mode(_), do: {:error, :invalid_plan_mode}
+
+  defp handle_run_changeset_error(changeset) do
+    case changeset.errors[:target_root_container_resource_id] do
+      nil -> {:error, changeset}
+      _ -> {:error, :run_in_progress}
+    end
+  end
+
+  defp dispatch_notification(run) do
+    case Outbox.dispatch(run) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning(
+          "OpenStax course import notification for #{run.id} is durable but awaiting dispatcher recovery: #{inspect(reason)}"
+        )
+
+        :ok
+    end
+  end
+
+  defp count_snapshot_sections(chapters) do
+    Enum.reduce(chapters, 0, &(&2 + length(&1["sections"] || [])))
+  end
+
+  defp failure_message(_phase, {:source_scope_too_large, count, limit}) do
+    "This OpenStax book exposes #{count} course sections, which exceeds the importer limit of #{limit}. Use a smaller book or split the source before starting a course import."
+  end
+
+  defp failure_message(phase, reason) do
+    "The #{phase} stage failed: #{inspect(reason)}"
+  end
+
+  defp failure_payload(phase, reason) do
+    %{
+      "phase" => to_string(phase),
+      "reason" => inspect(reason),
+      "message" => failure_message(phase, reason),
+      "recoverable" => recoverable_failure?(phase, reason)
+    }
+  end
+
+  defp recoverable_failure?(:validation, _reason), do: false
+  defp recoverable_failure?("validation", _reason), do: false
+  defp recoverable_failure?(_phase, :invalid_openstax_url), do: false
+  defp recoverable_failure?(_phase, {:source_scope_too_large, _, _}), do: false
+  defp recoverable_failure?(_phase, _reason), do: true
+
+  defp stringify_keys(map) when is_map(map) do
+    Map.new(map, fn {key, value} -> {to_string(key), value} end)
+  end
+end

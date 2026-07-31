@@ -36,12 +36,23 @@ defmodule Oli.Authoring.Course.ProjectAttributes.License do
   embedded_schema do
     field(:license_type, Ecto.Enum, values: @license_opts, default: :none)
     field(:custom_license_details, :string, default: "")
+    field(:source_provider, :string)
+    field(:source_title, :string)
+    field(:source_url, :string)
+    field(:source_attribution, :string)
   end
 
   @type module_struct_or_changeset_type :: %License{} | %Ecto.Changeset{}
   @spec changeset(module_struct_or_changeset_type, map) :: %Ecto.Changeset{}
   def changeset(item, attrs \\ %{}) do
     item
-    |> cast(attrs, [:license_type, :custom_license_details])
+    |> cast(attrs, [
+      :license_type,
+      :custom_license_details,
+      :source_provider,
+      :source_title,
+      :source_url,
+      :source_attribution
+    ])
   end
 end

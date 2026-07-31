@@ -9,29 +9,18 @@ import { LeftArrow } from './LeftArrow';
 import { Portrait } from './Portrait';
 import { RightArrow } from './RightArrow';
 
-export type LessonSource = 'empty' | 'google_slides';
-
-interface GoogleSlidesImportConfig {
-  enabled: boolean;
-  available: boolean;
-}
-
 interface Props {
   onSetupComplete: (mode: ApplicationMode, title: string) => void;
-  onImportComplete?: (mode: ApplicationMode, title: string, presentationUrl: string) => void;
   startStep?: number;
   initialTitle?: string;
   presetMode?: ApplicationMode;
-  googleSlidesImport?: GoogleSlidesImportConfig;
 }
 
 export const OnboardWizard: React.FC<Props> = ({
   startStep,
   onSetupComplete,
-  onImportComplete,
   initialTitle,
   presetMode,
-  googleSlidesImport,
 }) => {
   const [step, setStep] = useState(startStep || 0);
   const [builderVersion, setBuilderVersion] = useState(
@@ -39,25 +28,7 @@ export const OnboardWizard: React.FC<Props> = ({
   );
   const [lessonType, setLessonType] = useState(1);
   const [title, setTitle] = useState(initialTitle || '');
-  const [lessonSource, setLessonSource] = useState<LessonSource>('empty');
-  const [presentationUrl, setPresentationUrl] = useState('');
-  const [importError, setImportError] = useState<string | null>(null);
   const compactAdvancedFlow = presetMode === 'expert';
-  const canImportSlides = Boolean(
-    googleSlidesImport?.enabled && googleSlidesImport?.available && onImportComplete,
-  );
-
-  const importUnavailableMessage = (() => {
-    if (canImportSlides) {
-      return null;
-    }
-
-    if (!googleSlidesImport?.enabled) {
-      return 'Google Slides import is not enabled for this project. Enable the google_slides_import feature in project settings.';
-    }
-
-    return 'Google Slides import is not configured on this server yet. Contact your administrator.';
-  })();
 
   const commitChanges = () => {
     setStep(workingStep());
@@ -67,34 +38,11 @@ export const OnboardWizard: React.FC<Props> = ({
     onSetupComplete(mode, title);
   };
 
-  const commitImport = async () => {
-    if (!onImportComplete) {
-      return;
-    }
-
-    setImportError(null);
-    setStep(workingStep());
-
-    try {
-      const mode =
-        presetMode || (builderVersion === 1 ? ('flowchart' as const) : ('expert' as const));
-      await onImportComplete(mode, title, presentationUrl);
-    } catch (error: any) {
-      const message =
-        error?.error ||
-        error?.message ||
-        'Import failed. Check the URL and sharing settings.';
-      setImportError(message);
-      setStep(sourceStep());
-    }
-  };
-
-  const workingStep = () => (compactAdvancedFlow ? 3 : 4);
-  const sourceStep = () => (compactAdvancedFlow ? 1 : 3);
+  const workingStep = () => (compactAdvancedFlow ? 1 : 3);
 
   const afterTitleNext = () => {
     if (compactAdvancedFlow) {
-      setStep(sourceStep());
+      commitChanges();
       return;
     }
 
@@ -102,21 +50,7 @@ export const OnboardWizard: React.FC<Props> = ({
   };
 
   const afterBuilderNext = () => {
-    if (builderVersion === 2) {
-      setStep(sourceStep());
-      return;
-    }
-
     setStep(2);
-  };
-
-  const afterSourceNext = () => {
-    if (lessonSource === 'google_slides') {
-      void commitImport();
-      return;
-    }
-
-    commitChanges();
   };
 
   return (
@@ -139,21 +73,6 @@ export const OnboardWizard: React.FC<Props> = ({
           />
         )}
 
-        {step === sourceStep() && (
-          <StepSource
-            selected={lessonSource}
-            setSelected={setLessonSource}
-            presentationUrl={presentationUrl}
-            setPresentationUrl={setPresentationUrl}
-            importError={importError}
-            importAvailable={canImportSlides}
-            importUnavailableMessage={importUnavailableMessage}
-            onNext={afterSourceNext}
-            onBack={() => setStep(compactAdvancedFlow ? 0 : builderVersion === 2 ? 1 : 2)}
-            compactMode={compactAdvancedFlow}
-          />
-        )}
-
         {step === 2 && builderVersion === 1 && (
           <Step3
             selected={lessonType}
@@ -163,7 +82,11 @@ export const OnboardWizard: React.FC<Props> = ({
           />
         )}
 
-        {(step === workingStep() || step === 3) && <Working compactMode={compactAdvancedFlow} />}
+        {step === 2 && builderVersion === 2 && (
+          <Step3Advanced onNext={commitChanges} onBack={() => setStep(1)} />
+        )}
+
+        {step === workingStep() && <Working compactMode={compactAdvancedFlow} />}
       </div>
     </div>
   );
@@ -185,101 +108,6 @@ const Working: React.FC<{ compactMode?: boolean }> = ({ compactMode = false }) =
             <div className="wizard-step">Step 3/3</div>
           </div>
         )}
-      </div>
-    </div>
-  );
-};
-
-const StepSource: React.FC<{
-  selected: LessonSource;
-  setSelected: (value: LessonSource) => void;
-  presentationUrl: string;
-  setPresentationUrl: (value: string) => void;
-  importError: string | null;
-  importAvailable: boolean;
-  importUnavailableMessage: string | null;
-  onNext: () => void;
-  onBack: () => void;
-  compactMode?: boolean;
-}> = ({
-  selected,
-  setSelected,
-  presentationUrl,
-  setPresentationUrl,
-  importError,
-  importAvailable,
-  importUnavailableMessage,
-  onNext,
-  onBack,
-  compactMode = false,
-}) => {
-  const canContinue =
-    selected === 'empty' ||
-    (selected === 'google_slides' && importAvailable && presentationUrl.trim().length > 0);
-
-  return (
-    <div className="wizard-content">
-      <h1 className="wizard-header">
-        {compactMode ? 'Choose a starting point' : 'Select a starting point'}
-      </h1>
-      <div className="wizard-body source-step">
-        <div className="builder-version-options">
-          <div
-            className={`builder-version-option ${selected === 'empty' ? 'active' : ''}`}
-            onClick={() => setSelected('empty')}
-          >
-            <label>Empty lesson</label>
-            <p>Start with a blank Advanced Author lesson and add screens manually.</p>
-          </div>
-          <div
-            className={`builder-version-option ${!importAvailable ? 'disabled' : ''} ${
-              selected === 'google_slides' ? 'active' : ''
-            }`}
-            onClick={() => {
-              if (importAvailable) {
-                setSelected('google_slides');
-              }
-            }}
-          >
-            <label>Import Google Slides</label>
-            <p>Create one screen per slide from a public Google Slides presentation.</p>
-            {!importAvailable && importUnavailableMessage && (
-              <p className="mt-2 mb-0">{importUnavailableMessage}</p>
-            )}
-          </div>
-        </div>
-        {selected === 'google_slides' && importAvailable && (
-          <div className="wizard-url-field mt-3">
-            <label className="wizard-url-label" htmlFor="google-slides-url">
-              Google Slides URL
-            </label>
-            <input
-              id="google-slides-url"
-              value={presentationUrl}
-              onChange={(e) => setPresentationUrl(e.target.value)}
-              type="url"
-              className="wizard-url-input"
-              placeholder="https://docs.google.com/presentation/d/..."
-            />
-            <p className="wizard-url-help mt-2 mb-0">
-              The presentation must be shared as <strong>Anyone with the link can view</strong>.
-            </p>
-            {importError && <p className="text-danger mt-2 mb-0">{importError}</p>}
-          </div>
-        )}
-      </div>
-      <div className="wizard-footer">
-        {!compactMode && <div className="wizard-step">Step 3/3</div>}
-        <div className="wizard-buttons">
-          <Button onClick={onBack}>
-            <LeftArrow stroke="#FFFFFF" />
-            Back
-          </Button>
-          <Button disabled={!canContinue} onClick={onNext}>
-            Next
-            <RightArrow stroke={!canContinue ? '#737373' : '#FFFFFF'} />
-          </Button>
-        </div>
       </div>
     </div>
   );

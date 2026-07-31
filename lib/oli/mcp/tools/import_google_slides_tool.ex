@@ -32,7 +32,8 @@ defmodule Oli.MCP.Tools.ImportGoogleSlidesTool do
   def execute(%{project_slug: project_slug, page_slug: page_slug, presentation_url: url}, frame) do
     UsageTracker.track_tool_usage("import_google_slides", frame)
 
-    with {:ok, %{author_id: author_id}} <- Authorization.validate_project_access(project_slug, frame),
+    with {:ok, %{author_id: author_id}} <-
+           Authorization.validate_project_access(project_slug, frame),
          {:ok, author} <- Accounts.get_author(author_id) |> wrap_author(),
          {:ok, result, warnings} <- SlidesImport.import(project_slug, page_slug, url, author) do
       text =

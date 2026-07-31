@@ -3,6 +3,7 @@ defmodule OliWeb.Curriculum.RollupTest do
 
   alias OliWeb.Curriculum.Rollup
   alias OliWeb.Curriculum.ActivityDelta
+  alias Oli.Resources.{ResourceType, Revision}
 
   def merge_changes(changes, state) do
     Map.merge(state, Enum.reduce(changes, %{}, fn {k, v}, m -> Map.put(m, k, v) end))
@@ -181,6 +182,19 @@ defmodule OliWeb.Curriculum.RollupTest do
 
       assert {:ok, rollup} = Rollup.new([page], project.slug)
       assert Map.keys(rollup.objective_map) == []
+    end
+
+    test "does not inspect direct child containers as page content", %{project: project} do
+      container = %Revision{
+        resource_id: -1,
+        resource_type_id: ResourceType.id_for_container(),
+        content: %{}
+      }
+
+      assert {:ok, rollup} = Rollup.new([container], project.slug)
+      assert rollup.page_activity_map == %{-1 => []}
+      assert rollup.activity_map == %{}
+      assert rollup.objective_map == %{}
     end
   end
 end

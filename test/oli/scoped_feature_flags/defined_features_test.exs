@@ -43,6 +43,15 @@ defmodule Oli.ScopedFeatureFlags.DefinedFeaturesTest do
       assert :mcp_authoring in DefinedFeatures.feature_names()
       assert "mcp_authoring" in DefinedFeatures.feature_strings()
     end
+
+    test "OpenStax rich content V3 is an authoring canary" do
+      feature = DefinedFeatures.get_feature(:openstax_rich_content_v3)
+
+      assert feature.scopes == [:authoring]
+      assert feature.metadata.rollout_mode == :canary
+      assert DefinedFeatures.feature_supports_scope?(feature.name, :authoring)
+      refute DefinedFeatures.feature_supports_scope?(feature.name, :delivery)
+    end
   end
 
   describe "undefined features" do

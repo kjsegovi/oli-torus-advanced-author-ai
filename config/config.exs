@@ -70,6 +70,9 @@ end
 config :oli,
   logger_truncation_enabled: get_env_as_boolean.("LOGGER_TRUNCATION_ENABLED", "true"),
   logger_truncation_length: get_env_as_integer.("LOGGER_TRUNCATION_LENGTH", "5000"),
+  openstax_rich_content_v3_enabled: Mix.env() in [:dev, :test],
+  openstax_course_import_max_parallel_lessons: 3,
+  openstax_course_import_lesson_planning_strategy: :parallel_v1,
   instructor_dashboard_details: get_env_as_boolean.("INSTRUCTOR_DASHBOARD_DETAILS", "true"),
   depot_coordinator: Oli.Delivery.DistributedDepotCoordinator,
   depot_warmer_days_lookback: System.get_env("DEPOT_WARMER_DAYS_LOOKBACK", "5"),
@@ -241,7 +244,10 @@ config :oli, Oban,
     {
       Oban.Plugins.Cron,
       crontab: [
-        {"*/2 * * * *", OliWeb.DatasetStatusPoller, queue: :default}
+        {"*/2 * * * *", OliWeb.DatasetStatusPoller, queue: :default},
+        {"*/5 * * * *", Oli.OpenStax.CourseImport.Worker.NotificationDispatchWorker,
+         queue: :course_import},
+        {"*/5 * * * *", Oli.OpenStax.CourseImport.Worker.RunHealthWorker, queue: :course_import}
       ]
     }
   ],
@@ -263,7 +269,10 @@ config :oli, Oban,
     mailer: 10,
     certificate_pdf: 3,
     certificate_mailer: 3,
-    certificate_eligibility: 10
+    certificate_eligibility: 10,
+    course_import: 2,
+    course_import_ai: 6,
+    course_import_media: 1
   ]
 
 config :ex_money,

@@ -173,6 +173,26 @@ defmodule OliWeb.Workspaces.CourseAuthor.CurriculumLiveTest do
              )
     end
 
+    test "labels adaptive curriculum entries as Advanced Author", %{
+      conn: conn,
+      author: author,
+      project: project,
+      adaptive_page_revision: adaptive_page_revision
+    } do
+      conn =
+        recycle(conn)
+        |> log_in_author(author)
+        |> get("/workspaces/course_author/#{project.slug}/curriculum/")
+
+      {:ok, view, _html} = live(conn)
+
+      assert has_element?(
+               view,
+               "div[phx-value-slug='#{adaptive_page_revision.slug}'] [data-authoring-mode='advanced']",
+               "Advanced Author"
+             )
+    end
+
     test "shows an error flash when adaptive duplication fails", %{
       conn: conn,
       author: author,

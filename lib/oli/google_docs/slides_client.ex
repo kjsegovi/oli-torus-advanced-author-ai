@@ -13,6 +13,12 @@ defmodule Oli.GoogleDocs.SlidesClient do
 
   @slides_api_url "https://slides.googleapis.com/v1/presentations"
   @slides_scope "https://www.googleapis.com/auth/presentations.readonly"
+  @max_presentation_bytes 25 * 1024 * 1024
+  @max_notes_page_bytes 2 * 1024 * 1024
+  @max_thumbnail_response_bytes 64 * 1024
+  @max_image_bytes 20 * 1024 * 1024
+  @supported_image_types ~w(image/png image/jpeg image/gif image/webp)
+  @thumbnail_sizes ~w(SMALL MEDIUM LARGE)
 
   @type credentials :: map()
   @type presentation_json :: map()
@@ -91,7 +97,8 @@ defmodule Oli.GoogleDocs.SlidesClient do
     with {:ok, presentation_id} <- get_presentation_id(presentation_url),
          url <- "#{@slides_api_url}/#{presentation_id}",
          headers <- auth_headers(access_token),
-         {:ok, %Response{status_code: 200, body: body}} <- Oli.HTTP.http().get(url, headers, []),
+         {:ok, %Response{status_code: 200, body: body}} <-
+           Oli.HTTP.http().get(url, headers, max_body_length: @max_presentation_bytes),
          {:ok, json} <- Jason.decode(body) do
       {:ok, json}
     else
@@ -152,7 +159,8 @@ defmodule Oli.GoogleDocs.SlidesClient do
     url = "#{@slides_api_url}/#{presentation_id}/pages/#{page_object_id}"
     headers = auth_headers(access_token)
 
-    with {:ok, %Response{status_code: 200, body: body}} <- Oli.HTTP.http().get(url, headers, []),
+    with {:ok, %Response{status_code: 200, body: body}} <-
+           Oli.HTTP.http().get(url, headers, max_body_length: @max_notes_page_bytes),
          {:ok, json} <- Jason.decode(body) do
       {:ok, json}
     else
@@ -163,6 +171,56 @@ defmodule Oli.GoogleDocs.SlidesClient do
         {:error, reason}
     end
   end
+
+  @doc """
+  Requests a short-lived Google-hosted thumbnail for one presentation page.
+
+  Callers must keep the returned capability URL transient. Google currently
+  expires it after roughly 30 minutes, so it must not be persisted with an
+  import run.
+  """
+  @spec fetch_page_thumbnail(String.t(), String.t(), String.t(), String.t()) ::
+          {:ok, map()} | {:error, term()}
+  def fetch_page_thumbnail(presentation_id, page_object_id, access_token, size \\ "LARGE")
+
+  def fetch_page_thumbnail(presentation_id, page_object_id, access_token, size)
+      when is_binary(presentation_id) and presentation_id != "" and
+             is_binary(page_object_id) and page_object_id != "" and
+             is_binary(access_token) and access_token != "" and size in @thumbnail_sizes do
+    url =
+      "#{@slides_api_url}/#{URI.encode_www_form(presentation_id)}/pages/#{URI.encode_www_form(page_object_id)}/thumbnail" <>
+        "?thumbnailProperties.mimeType=PNG&thumbnailProperties.thumbnailSize=#{size}"
+
+    with {:ok, %Response{status_code: 200, body: body}} <-
+           Oli.HTTP.http().get(
+             url,
+             auth_headers(access_token),
+             max_body_length: @max_thumbnail_response_bytes
+           ),
+         {:ok,
+          %{
+            "contentUrl" => content_url,
+            "width" => width,
+            "height" => height
+          }} <- Jason.decode(body),
+         true <- trusted_google_image_url?(content_url),
+         true <- is_integer(width) and width > 0,
+         true <- is_integer(height) and height > 0 do
+      {:ok, %{"url" => content_url, "width" => width, "height" => height}}
+    else
+      {:ok, %Response{status_code: status}} ->
+        {:error, {:thumbnail_http_status, status}}
+
+      {:error, _reason} = error ->
+        error
+
+      _invalid_response ->
+        {:error, :invalid_thumbnail_response}
+    end
+  end
+
+  def fetch_page_thumbnail(_presentation_id, _page_object_id, _access_token, _size),
+    do: {:error, :invalid_thumbnail_request}
 
   @spec get_speaker_notes_text(map(), presentation_json(), String.t()) ::
           {:ok, String.t()} | {:error, term()}
@@ -180,21 +238,60 @@ defmodule Oli.GoogleDocs.SlidesClient do
   @spec fetch_image_bytes(String.t(), String.t()) ::
           {:ok, binary(), String.t() | nil} | {:error, term()}
   def fetch_image_bytes(content_url, access_token) do
-    headers = [
-      {"authorization", "Bearer #{access_token}"},
-      {"accept", "*/*"}
-    ]
+    with true <- trusted_google_image_url?(content_url),
+         headers <- [
+           {"authorization", "Bearer #{access_token}"},
+           {"accept", Enum.join(@supported_image_types, ",")}
+         ],
+         {:ok, %Response{status_code: 200, body: body, headers: response_headers}}
+         when is_binary(body) <-
+           Oli.HTTP.http().get(content_url, headers, max_body_length: @max_image_bytes),
+         :ok <- validate_image_size(body),
+         {:ok, content_type} <- validate_image_content_type(response_headers) do
+      {:ok, body, content_type}
+    else
+      false ->
+        {:error, :untrusted_image_url}
 
-    case Oli.HTTP.http().get(content_url, headers, []) do
-      {:ok, %Response{status_code: 200, body: body, headers: response_headers}}
-      when is_binary(body) ->
-        {:ok, body, content_type_from_headers(response_headers)}
+      {:ok, %Response{status_code: status}} ->
+        # Response bodies can contain upstream internals and are intentionally
+        # excluded from persisted workflow errors.
+        {:error, {:http_status, status}}
 
-      {:ok, %Response{status_code: status, body: body}} ->
-        {:error, {:http_status, status, body}}
+      {:error, _reason} = error ->
+        error
 
-      {:error, reason} ->
-        {:error, reason}
+      other ->
+        {:error, {:invalid_image_response, other}}
+    end
+  end
+
+  @doc false
+  @spec trusted_google_image_url?(term()) :: boolean()
+  def trusted_google_image_url?(url) when is_binary(url) do
+    case URI.parse(String.trim(url)) do
+      %URI{scheme: "https", host: host, userinfo: nil, port: port}
+      when is_binary(host) and port in [nil, 443] ->
+        host = String.downcase(host)
+
+        host == "slides.googleapis.com" or
+          host == "googleusercontent.com" or
+          String.ends_with?(host, ".googleusercontent.com")
+
+      _ ->
+        false
+    end
+  end
+
+  def trusted_google_image_url?(_url), do: false
+
+  defp validate_image_size(body) when byte_size(body) <= @max_image_bytes, do: :ok
+  defp validate_image_size(_body), do: {:error, :source_image_too_large}
+
+  defp validate_image_content_type(headers) do
+    case content_type_from_headers(headers) do
+      content_type when content_type in @supported_image_types -> {:ok, content_type}
+      _content_type -> {:error, :unsupported_source_image_type}
     end
   end
 

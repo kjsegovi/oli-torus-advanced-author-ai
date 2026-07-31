@@ -11,8 +11,6 @@ defmodule OliWeb.Workspaces.CourseAuthor.Curriculum.EditorLive do
   alias Oli.Publishing
   alias Oli.Publishing.AuthoringResolver
   alias Oli.Resources
-  alias Oli.GoogleSlides.SlidesImport
-  alias Oli.ScopedFeatureFlags
   alias OliWeb.Common.Breadcrumb
   alias OliWeb.Common.React
   alias OliWeb.Components.Modal
@@ -581,9 +579,12 @@ defmodule OliWeb.Workspaces.CourseAuthor.Curriculum.EditorLive do
     <div class="container mx-auto">
       <div class="resource-editor row">
         <div class="col-span-12">
-          <div class="TitleBar w-100 align-items-baseline z-40" style="top: 64px;">
-            <div class="d-flex flex-wrap items-center justify-between gap-3 px-3 md:px-4 pt-1 pb-2">
-              <div class="d-flex align-items-baseline flex-grow-1 mr-2 min-w-0">
+          <div
+            id="authoring-shell-header"
+            class="TitleBar relative w-100 align-items-baseline z-40 bg-Background-bg-primary"
+          >
+            <div class="d-flex flex-nowrap items-center justify-between gap-3 px-3 md:px-4 pt-1 pb-2">
+              <div class="d-flex align-items-baseline flex-1 mr-2 min-w-0 overflow-hidden">
                 <%= if @title_editing do %>
                   <.form
                     for={%{}}
@@ -617,15 +618,22 @@ defmodule OliWeb.Workspaces.CourseAuthor.Curriculum.EditorLive do
                     </div>
                   </.form>
                 <% else %>
-                  <div class="d-flex align-items-center flex-wrap gap-2 min-w-0">
-                    <.page_identity_badges graded={@graded} />
-                    <h1 style="display: inline-block; white-space: normal; text-align: left; font-weight: normal; font-size: 1.5rem; margin: 0;">
+                  <div class="d-flex align-items-center flex-nowrap flex-1 gap-2 min-w-0 overflow-hidden">
+                    <.page_identity_badges
+                      graded={@graded}
+                      is_advanced_authoring={@is_advanced_authoring}
+                    />
+                    <h1
+                      class="flex-1 min-w-0 truncate"
+                      title={@title}
+                      style="display: inline-block; text-align: left; font-weight: normal; font-size: 1.5rem; margin: 0;"
+                    >
                       {@title}
                     </h1>
                     <button
                       type="button"
                       class={[
-                        "btn btn-link btn-sm",
+                        "btn btn-link btn-sm shrink-0",
                         if(!@title_editable, do: "disabled opacity-60 cursor-not-allowed")
                       ]}
                       phx-click="begin_title_edit"
@@ -648,7 +656,10 @@ defmodule OliWeb.Workspaces.CourseAuthor.Curriculum.EditorLive do
                   </div>
                 <% end %>
               </div>
-              <div class="d-flex shrink-0 items-center gap-3 whitespace-nowrap">
+              <div
+                id="authoring-preview-actions"
+                class="d-flex shrink-0 items-center gap-3 whitespace-nowrap"
+              >
                 <.read_only_toggle
                   :if={@is_advanced_authoring}
                   adaptive_read_only={@adaptive_read_only}
@@ -699,19 +710,32 @@ defmodule OliWeb.Workspaces.CourseAuthor.Curriculum.EditorLive do
   end
 
   attr(:graded, :boolean, required: true)
+  attr(:is_advanced_authoring, :boolean, required: true)
 
   def page_identity_badges(assigns) do
     ~H"""
     <div
-      class="d-inline-flex flex-wrap items-center gap-2"
-      aria-label={"Currently editing #{page_kind_label(@graded)}"}
+      class="d-inline-flex shrink-0 flex-nowrap items-center gap-2"
+      aria-label={
+        "Currently editing #{page_kind_label(@graded)} in #{authoring_mode_label(@is_advanced_authoring)}"
+      }
     >
       <span class="badge rounded-pill px-3 py-2 text-xs font-semibold bg-secondary text-white">
         {page_kind_label(@graded)}
       </span>
+      <span
+        id="authoring-mode-badge"
+        data-authoring-mode={if(@is_advanced_authoring, do: "advanced", else: "basic")}
+        class="badge rounded-pill px-3 py-2 text-xs font-semibold bg-primary text-white"
+      >
+        {authoring_mode_label(@is_advanced_authoring)}
+      </span>
     </div>
     """
   end
+
+  defp authoring_mode_label(true), do: "Advanced Author"
+  defp authoring_mode_label(false), do: "Basic Author"
 
   attr(:adaptive_read_only, :boolean, required: true)
   attr(:enabled, :boolean, required: true)
@@ -812,9 +836,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.Curriculum.EditorLive do
               activityTypes: activity_types,
               partComponentTypes: part_component_types,
               appsignalKey: Application.get_env(:appsignal, :client_key),
-              initialSidebarExpanded: socket.assigns[:sidebar_expanded],
-              googleSlidesImport:
-                google_slides_import_props(project, socket.assigns.current_author)
+              initialSidebarExpanded: socket.assigns[:sidebar_expanded]
             })
 
           {updated_content, ["authoring.js"] ++ activity_type_scripts}
@@ -1133,15 +1155,5 @@ defmodule OliWeb.Workspaces.CourseAuthor.Curriculum.EditorLive do
       <% end %>
     </nav>
     """
-  end
-
-  defp google_slides_import_props(project, author) do
-    enabled = ScopedFeatureFlags.enabled?(:google_slides_import, project)
-    available = enabled and SlidesImport.import_available?(project, author)
-
-    %{
-      enabled: enabled,
-      available: available
-    }
   end
 end

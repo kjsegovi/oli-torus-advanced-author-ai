@@ -63,7 +63,13 @@ defmodule Oli.GoogleSlides.Adaptive.TrapStateRulesBuilder do
     rules = [
       correct_rule(rule_id, parts, correct_actions, score),
       blank_rule(rule_id, parts, adaptivity),
-      max_attempt_incorrect_rule(rule_id, parts, max_attempt, incorrect_nav_actions)
+      max_attempt_incorrect_rule(
+        rule_id,
+        parts,
+        max_attempt,
+        incorrect_nav_actions,
+        Map.get(adaptivity, "exhaustedFeedback", @default_three_times_feedback)
+      )
     ]
 
     rules =
@@ -137,7 +143,7 @@ defmodule Oli.GoogleSlides.Adaptive.TrapStateRulesBuilder do
     }
   end
 
-  defp max_attempt_incorrect_rule(rule_id, parts, max_attempt, actions) do
+  defp max_attempt_incorrect_rule(rule_id, parts, max_attempt, actions, exhausted_feedback) do
     %{
       "id" => "#{rule_id}.incorrect-max-attempt",
       "name" => "incorrect-max-attempt",
@@ -153,7 +159,7 @@ defmodule Oli.GoogleSlides.Adaptive.TrapStateRulesBuilder do
           "actions" =>
             actions ++
               Enum.flat_map(parts, &set_correct_value_actions/1) ++
-              [feedback_action(@default_three_times_feedback)]
+              [feedback_action(exhausted_feedback)]
         }
       }
     }

@@ -655,7 +655,8 @@ defmodule OliWeb.Curriculum.ContainerLive do
      )}
   end
 
-  defp resource_edit_path(socket, slug, adaptive_mode) when adaptive_mode in ["flowchart", "expert"] do
+  defp resource_edit_path(socket, slug, adaptive_mode)
+       when adaptive_mode in ["flowchart", "expert"] do
     Routes.resource_path(socket, :edit, socket.assigns.project.slug, slug) <>
       "?creation_mode=" <> adaptive_mode
   end

@@ -14,7 +14,6 @@ import { AuthoringFlowchartPageEditor } from './AuthoringFlowchartPageEditor';
 import { ModalContainer } from './components/AdvancedAuthoringModal';
 import { FlowchartEditor } from './components/Flowchart/FlowchartEditor';
 import { onboardWizardComplete } from './components/Flowchart/flowchart-actions/onboard-wizard-complete';
-import { onboardWizardImportComplete } from './components/Flowchart/flowchart-actions/onboard-wizard-import-complete';
 import { verifyFlowchartLesson } from './components/Flowchart/flowchart-actions/verify-flowchart-lesson';
 import { OnboardWizard } from './components/Flowchart/onboard-wizard/OnboardWizard';
 import { validateScreen } from './components/Flowchart/screens/screen-validation';
@@ -59,10 +58,6 @@ export interface AuthoringProps {
   paths: Record<string, string>;
   appsignalKey: string | null;
   initialSidebarExpanded: boolean;
-  googleSlidesImport?: {
-    enabled: boolean;
-    available: boolean;
-  };
 }
 
 export const buildAdaptivePreviewUrl = (url: string, currentSequenceId?: string | null) => {
@@ -192,24 +187,6 @@ const Authoring: React.FC<AuthoringProps> = (props: AuthoringProps) => {
     const projectSlug = props.content.projectSlug || '';
     props.content.allObjectives || [];
     onboardWizardComplete(title, projectSlug, revisionSlug, appMode, pageContent);
-  };
-
-  const onOnboardImportComplete = async (
-    appMode: ApplicationMode,
-    title: string,
-    presentationUrl: string,
-  ) => {
-    const { revisionSlug } = props;
-    const pageContent = props.content.content;
-    const projectSlug = props.content.projectSlug || '';
-    await onboardWizardImportComplete(
-      title,
-      projectSlug,
-      revisionSlug,
-      appMode,
-      pageContent,
-      presentationUrl,
-    );
   };
 
   const handlePanelStateChange = ({
@@ -608,10 +585,8 @@ const Authoring: React.FC<AuthoringProps> = (props: AuthoringProps) => {
           {shouldShowOnboarding && (
             <OnboardWizard
               onSetupComplete={onOnboardComplete}
-              onImportComplete={onOnboardImportComplete}
               initialTitle={props.content.title}
               presetMode={props.creationModeHint}
-              googleSlidesImport={props.googleSlidesImport}
             />
           )}
         </ModalContainer>

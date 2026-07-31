@@ -15,7 +15,10 @@ defmodule Oli.GoogleSlides.PresentationParserTest do
     assert hd(slides).title_from_placeholder == true
     assert hd(slides).paragraphs == ["Intro paragraph text."]
     assert hd(slides).list_items == []
-    assert hd(slides).content_blocks == [%{type: "paragraph", text: "Intro paragraph text."}]
+
+    assert hd(slides).content_blocks == [
+             %{type: "paragraph", text: "Intro paragraph text.", object_id: "body1"}
+           ]
   end
 
   test "parse/2 extracts native bullet lists from Slides paragraph markers" do
@@ -72,7 +75,8 @@ defmodule Oli.GoogleSlides.PresentationParserTest do
                type: "list",
                list_type: "ul",
                list_id: "list-1",
-               items: ["First item", "Second item"]
+               items: ["First item", "Second item"],
+               object_id: "body1"
              }
            ]
   end
@@ -224,6 +228,50 @@ defmodule Oli.GoogleSlides.PresentationParserTest do
            end)
   end
 
+  test "uses accessibility text as a semantic fallback when known media is unavailable" do
+    presentation = %{
+      "presentationId" => "fallback123",
+      "slides" => [
+        %{
+          "objectId" => "slide1",
+          "pageElements" => [
+            %{
+              "objectId" => "image1",
+              "description" => "Unavailable image description",
+              "image" => %{}
+            },
+            %{
+              "objectId" => "video1",
+              "description" => "Unavailable video description",
+              "video" => %{"source" => "YOUTUBE"}
+            },
+            %{
+              "objectId" => "chart1",
+              "description" => "Unavailable chart description",
+              "sheetsChart" => %{"chartId" => 1}
+            },
+            %{
+              "objectId" => "table1",
+              "description" => "Empty table description",
+              "table" => %{"tableRows" => []}
+            }
+          ]
+        }
+      ]
+    }
+
+    {:ok, [slide], _warnings} = PresentationParser.parse(presentation)
+
+    assert Enum.map(slide.content_blocks, &{&1.type, &1.object_id}) == [
+             {"paragraph", "image1"},
+             {"paragraph", "video1"},
+             {"paragraph", "chart1"},
+             {"paragraph", "table1"}
+           ]
+
+    assert slide.images == []
+  end
+
   test "parse/2 skips empty layout placeholder shapes without exporting graphics" do
     presentation = %{
       "presentationId" => "placeholder123",
@@ -247,5 +295,63 @@ defmodule Oli.GoogleSlides.PresentationParserTest do
 
     assert slide.content_blocks == []
     assert slide.images == []
+  end
+
+  test "parse/2 keeps owning object ids on semantic text and table blocks" do
+    presentation = %{
+      "presentationId" => "owned-content",
+      "slides" => [
+        %{
+          "objectId" => "slide1",
+          "pageElements" => [
+            %{
+              "objectId" => "text1",
+              "shape" => %{
+                "text" => %{
+                  "textElements" => [
+                    %{"textRun" => %{"content" => "An explanation"}}
+                  ]
+                }
+              }
+            },
+            %{
+              "objectId" => "table1",
+              "table" => %{
+                "tableRows" => [
+                  %{
+                    "tableCells" => [
+                      %{
+                        "text" => %{
+                          "textElements" => [
+                            %{"textRun" => %{"content" => "Cell value"}}
+                          ]
+                        }
+                      }
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      ]
+    }
+
+    {:ok, [slide], _} = PresentationParser.parse(presentation)
+
+    assert [
+             %{type: "paragraph", object_id: "text1"},
+             %{type: "table", object_id: "table1"}
+           ] = slide.content_blocks
+  end
+
+  test "parse/2 supplies a deterministic slide id when the source omits one" do
+    presentation = %{
+      "presentationId" => "deck-id",
+      "slides" => [%{"pageElements" => []}]
+    }
+
+    assert {:ok, [%{object_id: "deck-id:slide:1"}], []} =
+             PresentationParser.parse(presentation)
   end
 end

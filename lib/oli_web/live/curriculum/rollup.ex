@@ -1,8 +1,10 @@
 defmodule OliWeb.Curriculum.Rollup do
   alias OliWeb.Curriculum.ActivityDelta
   alias Oli.Resources
-  alias Oli.Resources.Revision
+  alias Oli.Resources.{ResourceType, Revision}
   alias Oli.Publishing.AuthoringResolver
+
+  @page_resource_type_id ResourceType.id_for_page()
 
   defstruct page_activity_map: %{},
             activity_map: %{},
@@ -117,9 +119,13 @@ defmodule OliWeb.Curriculum.Rollup do
   end
 
   # extract all the activity ids referenced from a page model
-  defp get_activities_from_page(revision) do
+  defp get_activities_from_page(%Revision{resource_type_id: @page_resource_type_id} = revision) do
     Resources.activity_references(revision)
   end
+
+  # Containers can be direct curriculum children, but they do not have page
+  # activity references and legacy containers may not have a PageContent model.
+  defp get_activities_from_page(%Revision{}), do: []
 
   # creates a map of activity ids to activity revisions, based on the page_to_activities_map
   defp build_activity_map(project_slug, page_to_activities_map) do

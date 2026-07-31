@@ -126,7 +126,40 @@ defmodule Oli.GoogleSlides.Adaptive.PartBuilders do
         "responsiveLayoutWidth" => 960,
         "src" => src,
         "startTime" => 0,
-        "subtitles" => %{},
+        "subtitles" => Keyword.get(opts, :subtitles, []),
+        "triggerCheck" => false,
+        "width" => 100,
+        "x" => 0,
+        "y" => y,
+        "z" => 0
+      }
+    }
+  end
+
+  @spec audio_part(String.t(), keyword()) :: map()
+  def audio_part(src, opts \\ []) do
+    y = Keyword.get(opts, :y, 0)
+
+    %{
+      "id" => Util.new_id("audio"),
+      "type" => "janus-audio",
+      "custom" => %{
+        "autoPlay" => false,
+        "customCssClass" => "",
+        "enableReplay" => true,
+        "enabled" => true,
+        "endTime" => 0,
+        "height" => Keyword.get(opts, :height, 54),
+        "maxScore" => 1,
+        "requiresManualGrading" => false,
+        "responsiveLayoutWidth" => 960,
+        "src" => src,
+        "startTime" => 0,
+        "subtitles" => Keyword.get(opts, :subtitles, []),
+        "transcript" => %{
+          "transcriptText" => Keyword.get(opts, :transcript_text, ""),
+          "transcriptFile" => Keyword.get(opts, :transcript_file, "")
+        },
         "triggerCheck" => false,
         "width" => 100,
         "x" => 0,
@@ -389,9 +422,7 @@ defmodule Oli.GoogleSlides.Adaptive.PartBuilders do
          "janus-text-slider",
          "janus-dropdown",
          "janus-input-number",
-         "janus-input-text",
-         "janus-video",
-         "janus-capi-iframe"
+         "janus-input-text"
        ] do
       base
       |> Map.put("gradingApproach", "automatic")

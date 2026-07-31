@@ -65,7 +65,12 @@ defmodule Oli.GoogleSlides.PresentationParser do
 
     %Slide{
       index: index,
-      object_id: Map.get(slide, "objectId"),
+      object_id:
+        stable_slide_id(
+          Map.get(slide, "objectId"),
+          Map.get(presentation_json, "presentationId"),
+          index
+        ),
       title: title || "",
       title_from_placeholder: title_from_placeholder,
       paragraphs: paragraphs,
@@ -122,7 +127,7 @@ defmodule Oli.GoogleSlides.PresentationParser do
       shape_has_text?(shape) ->
         case parse_shape_content(Map.get(shape, "text")) do
           [] -> {:skip, title, from_ph}
-          blocks -> {:blocks, blocks, title, from_ph}
+          blocks -> {:blocks, attach_object_id(blocks, element), title, from_ph}
         end
 
       layout_placeholder_shape?(shape) ->
@@ -136,13 +141,13 @@ defmodule Oli.GoogleSlides.PresentationParser do
     end
   end
 
-  defp content_from_element(%{"table" => table} = _element, title, from_ph) do
+  defp content_from_element(%{"table" => table} = element, title, from_ph) do
     case extract_table_text(table) do
       "" ->
-        {:skip, title, from_ph}
+        accessibility_block(element, title, from_ph)
 
       content ->
-        {:blocks, [%{type: "table", text: content}], title, from_ph}
+        {:blocks, attach_object_id([%{type: "table", text: content}], element), title, from_ph}
     end
   end
 
@@ -150,7 +155,8 @@ defmodule Oli.GoogleSlides.PresentationParser do
          %{"objectId" => object_id, "image" => %{"contentUrl" => url}} = element,
          title,
          from_ph
-       ) do
+       )
+       when is_binary(url) and url != "" do
     size = Map.get(element, "size", %{})
     transform = Map.get(element, "transform", %{})
 
@@ -198,6 +204,8 @@ defmodule Oli.GoogleSlides.PresentationParser do
           type: "video",
           object_id: object_id,
           src: src,
+          provider: Map.get(video, "source"),
+          provider_media_id: Map.get(video, "id"),
           alt: Map.get(element, "description") || Map.get(element, "title") || "Slide video",
           height: video_height(size)
         }
@@ -209,14 +217,14 @@ defmodule Oli.GoogleSlides.PresentationParser do
     end
   end
 
-  defp content_from_element(%{"wordArt" => %{"renderedText" => text}} = _element, title, from_ph)
+  defp content_from_element(%{"wordArt" => %{"renderedText" => text}} = element, title, from_ph)
        when is_binary(text) and text != "" do
     trimmed = String.trim(text)
 
     if trimmed == "" do
       {:skip, title, from_ph}
     else
-      {:blocks, [%{type: "word_art", text: trimmed}], title, from_ph}
+      {:blocks, attach_object_id([%{type: "word_art", text: trimmed}], element), title, from_ph}
     end
   end
 
@@ -577,9 +585,16 @@ defmodule Oli.GoogleSlides.PresentationParser do
     if text == "" do
       {:skip, title, from_ph}
     else
-      {:blocks, [%{type: "paragraph", text: text}], title, from_ph}
+      {:blocks, attach_object_id([%{type: "paragraph", text: text}], element), title, from_ph}
     end
   end
+
+  defp attach_object_id(blocks, %{"objectId" => object_id})
+       when is_list(blocks) and is_binary(object_id) and object_id != "" do
+    Enum.map(blocks, &Map.put(&1, :object_id, object_id))
+  end
+
+  defp attach_object_id(blocks, _element), do: blocks
 
   defp video_src(%{"source" => "YOUTUBE", "id" => id}) when is_binary(id) and id != "" do
     "https://www.youtube.com/watch?v=#{id}"
@@ -636,4 +651,14 @@ defmodule Oli.GoogleSlides.PresentationParser do
   end
 
   defp size_value(_, _), do: nil
+
+  defp stable_slide_id(object_id, _presentation_id, _index)
+       when is_binary(object_id) and object_id != "",
+       do: object_id
+
+  defp stable_slide_id(_object_id, presentation_id, index)
+       when is_binary(presentation_id) and presentation_id != "",
+       do: "#{presentation_id}:slide:#{index}"
+
+  defp stable_slide_id(_object_id, _presentation_id, index), do: "slide:#{index}"
 end

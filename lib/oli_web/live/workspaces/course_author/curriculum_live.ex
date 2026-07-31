@@ -25,6 +25,8 @@ defmodule OliWeb.Workspaces.CourseAuthor.CurriculumLive do
 
   alias OliWeb.Workspaces.CourseAuthor.Curriculum.Entry
   alias OliWeb.Workspaces.CourseAuthor.Curriculum.EditorLive
+  alias OliWeb.Workspaces.CourseAuthor.GoogleSlidesImportLive
+  alias Oli.OpenStax.CourseImport
 
   alias OliWeb.Common.Hierarchy.MoveModal
   alias Oli.Publishing.ChangeTracker
@@ -122,6 +124,11 @@ defmodule OliWeb.Workspaces.CourseAuthor.CurriculumLive do
            creating_container: false,
            page_title: "Curriculum | " <> project.title,
            options_modal_assigns: nil,
+           google_slides_import_visible?:
+             Accounts.at_least_content_admin?(author) or
+               GoogleSlidesImportLive.available?(project, author),
+           openstax_course_import_visible?:
+             Accounts.at_least_content_admin?(author) or CourseImport.available?(project, author),
            import_state: new_import_state()
          )
          |> attach_hook(:has_show_links_uri_hash, :handle_params, fn _params, uri, socket ->

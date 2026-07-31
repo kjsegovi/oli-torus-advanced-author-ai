@@ -23,7 +23,7 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProvider do
 
     case api_post(config.api_url <> "/v1/chat/completions", params, config) do
       {:ok, response} ->
-        extract_content(response)
+        extract_generate_result(response)
 
       {:error, reason} ->
         {:error, reason}
@@ -299,10 +299,19 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProvider do
 
   defp normalize_response(response), do: response
 
-  defp extract_content(response) do
+  @doc false
+  def extract_generate_result(response) do
     response = decode_response(response)
 
     case response do
+      %{"choices" => [%{"message" => %{"tool_calls" => tool_calls}} | _]}
+      when is_list(tool_calls) and tool_calls != [] ->
+        {:ok, response}
+
+      %{choices: [%{message: %{tool_calls: tool_calls}} | _]}
+      when is_list(tool_calls) and tool_calls != [] ->
+        {:ok, response}
+
       %{"choices" => [%{"message" => %{"content" => content}} | _]}
       when is_binary(content) ->
         {:ok, content}

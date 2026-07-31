@@ -67,61 +67,12 @@ $headerColor: $darkForeground;
       }
     }
 
-    .wizard-url-field {
-      width: 100%;
-    }
-
-    .wizard-url-label {
-      display: block;
-      color: #373a44;
-      font-family: 'Open Sans';
-      font-size: 14px;
-      font-weight: 600;
-      margin-bottom: 8px;
-    }
-
-    .wizard-url-input {
-      width: 100%;
-      box-sizing: border-box;
-      background: #fafafa;
-      border-radius: 4px;
-      border: 1px solid #acbbc9;
-      outline: none;
-      font-family: 'Open Sans';
-      font-size: 14px;
-      line-height: 20px;
-      color: #373a44;
-      padding: 10px 12px;
-
-      &:focus {
-        border-color: $primary;
-        box-shadow: none;
-      }
-    }
-
-    .wizard-url-help {
-      color: #696974;
-      font-family: 'Open Sans';
-      font-size: 12px;
-      line-height: 18px;
-    }
-
     .wizard-body {
       position: relative;
       height: 320px;
       overflow: hidden;
       border-bottom: 1px solid #acbbc9;
 
-      &.source-step {
-        overflow-y: auto;
-
-        .builder-version-option {
-          height: auto;
-          min-height: 150px;
-          width: 100%;
-          max-width: 350px;
-        }
-      }
       &.step-1 {
         display: flex;
         justify-content: center;

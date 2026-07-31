@@ -37,39 +37,18 @@ defmodule OliWeb.ResourceController do
          conn,
          project_slug,
          revision_slug,
-         is_admin?
+         _is_admin?
        ) do
-    project = conn.assigns.project
-    activity_types = Activities.activities_for_project(project)
+    query_params =
+      case creation_mode_hint(conn.params, context) do
+        nil -> %{}
+        creation_mode -> %{"creation_mode" => creation_mode}
+      end
 
-    render(conn, "advanced.html",
-      app_params: %{
-        isAdmin: is_admin?,
-        revisionSlug: revision_slug,
-        projectSlug: project_slug,
-        graded: context.graded,
-        content: context,
-        creationModeHint: creation_mode_hint(conn.params, context),
-        paths: %{
-          images: Routes.static_path(conn, "/images")
-        },
-        activityTypes: activity_types,
-        partComponentTypes: PartComponents.part_components_for_project(project),
-        appsignalKey: Application.get_env(:appsignal, :client_key)
-      },
-      active: :curriculum,
-      activity_types: activity_types,
-      breadcrumbs:
-        Breadcrumb.trail_to(
-          project_slug,
-          revision_slug,
-          Oli.Publishing.AuthoringResolver,
-          project.customizations
-        ),
-      graded: context.graded,
-      part_scripts: PartComponents.get_part_component_scripts(:authoring_script),
-      raw_context: context,
-      scripts: Activities.get_activity_scripts(:authoring_script)
+    redirect(
+      conn,
+      to:
+        ~p"/workspaces/course_author/#{project_slug}/curriculum/#{revision_slug}/edit?#{query_params}"
     )
   end
 

@@ -60,6 +60,19 @@ defmodule Oli.ScopedFeatureFlags.DefinedFeatures do
     "Enable importing pages from Google Docs in curriculum authoring"
   )
 
+  deffeature(
+    :openstax_course_import,
+    [:authoring],
+    "Enable AI assisted OpenStax course generation in curriculum authoring"
+  )
+
+  deffeature(
+    :openstax_rich_content_v3,
+    [:authoring],
+    "Enable block-level OpenStax ingestion, LessonPlanV3, and staged source media",
+    rollout_mode: :canary
+  )
+
   # Test-only features for comprehensive testing
   if Mix.env() in [:test] do
     deffeature(:feature1, [:both], "Test feature for both scopes")

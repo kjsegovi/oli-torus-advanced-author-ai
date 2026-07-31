@@ -12,7 +12,13 @@ defmodule Oli.GenAI.FeatureConfig do
   import Ecto.Query, warn: false
   import Ecto.Changeset
 
-  @features [:student_dialogue, :instructor_dashboard_recommendation, :instructor_email]
+  @features [
+    :student_dialogue,
+    :instructor_dashboard_recommendation,
+    :instructor_email,
+    :google_slides_import,
+    :openstax_course_import
+  ]
 
   def features, do: @features
 

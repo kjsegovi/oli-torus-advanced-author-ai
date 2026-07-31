@@ -105,8 +105,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OverviewLive do
         course_sections_project_id: project.id,
         google_slides_client_email: Credentials.get_client_email(project.id),
         google_slides_credential_source: Credentials.credential_source(project.id),
-        google_slides_import_enabled:
-          ScopedFeatureFlags.enabled?(:google_slides_import, project)
+        google_slides_import_enabled: ScopedFeatureFlags.enabled?(:google_slides_import, project)
       )
       |> assign_async(:course_sections_data, fn ->
         load_course_sections_data(project.id, ctx, 0, @course_sections_limit, :asc, :title, "")

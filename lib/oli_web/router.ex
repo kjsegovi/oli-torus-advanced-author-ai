@@ -689,6 +689,46 @@ defmodule OliWeb.Router do
     post("/preferences", WorkspaceController, :update_preferences)
   end
 
+  # Durable, project-scoped OpenStax course import API. These routes deliberately
+  # remain outside the versioned authoring APIs because they are the public
+  # resume links used by import completion and failure notifications.
+  scope "/api", OliWeb.Api do
+    pipe_through([:api, :authoring_protected])
+
+    post("/projects/:project_id/course_imports", CourseImportController, :create)
+    get("/projects/:project_id/course_imports/:run_id", CourseImportController, :show)
+    patch("/course_imports/:run_id/scope", CourseImportController, :update_scope)
+    post("/course_imports/:run_id/outline/approve", CourseImportController, :approve_outline)
+
+    post(
+      "/course_imports/:run_id/lesson/:lesson_id/plan/approve",
+      CourseImportController,
+      :approve_lesson
+    )
+
+    patch(
+      "/course_imports/:run_id/lesson/:lesson_id/plan",
+      CourseImportController,
+      :update_lesson_plan
+    )
+
+    post(
+      "/course_imports/:run_id/lesson/:lesson_id/plan/reject",
+      CourseImportController,
+      :reject_lesson
+    )
+
+    post(
+      "/course_imports/:run_id/lesson/:lesson_id/regenerate",
+      CourseImportController,
+      :regenerate_lesson
+    )
+
+    post("/course_imports/:run_id/apply", CourseImportController, :apply)
+    post("/course_imports/:run_id/cancel", CourseImportController, :cancel)
+    post("/course_imports/:run_id/retry", CourseImportController, :retry)
+  end
+
   scope "/api/v1/project", OliWeb do
     pipe_through([:api, :authoring_protected])
 
@@ -709,14 +749,6 @@ defmodule OliWeb.Router do
     get("/:project/alternatives", Api.ResourceController, :alternatives)
 
     get("/:project/activities/with_report", Api.ResourceController, :activities_with_report)
-
-    get("/:project/google_slides_import/status", Api.GoogleSlidesImportController, :status)
-
-    post(
-      "/:project/resource/:resource/google_slides_import",
-      Api.GoogleSlidesImportController,
-      :create
-    )
   end
 
   # Storage Service
@@ -1073,6 +1105,22 @@ defmodule OliWeb.Router do
         live("/:project_id/objectives", ObjectivesLive)
         live("/:project_id/experiments", ExperimentsLive)
         live("/:project_id/bibliography", BibliographyLive)
+
+        live(
+          "/:project_id/curriculum/import/google-slides",
+          GoogleSlidesImportLive
+        )
+
+        live(
+          "/:project_id/curriculum/import/openstax",
+          OpenStaxCourseImportLive
+        )
+
+        live(
+          "/:project_id/curriculum/:container_slug/import/google-slides",
+          GoogleSlidesImportLive
+        )
+
         live("/:project_id/curriculum", CurriculumLive)
         live("/:project_id/curriculum/:container_slug", CurriculumLive)
         live("/:project_id/curriculum/:revision_slug/edit", Curriculum.EditorLive)

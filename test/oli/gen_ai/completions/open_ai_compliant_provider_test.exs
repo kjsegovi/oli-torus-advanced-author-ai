@@ -238,6 +238,42 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProviderTest do
     end
   end
 
+  describe "extract_generate_result/1" do
+    test "returns text content for ordinary completions" do
+      assert {:ok, "A completed response"} =
+               OpenAICompliantProvider.extract_generate_result(%{
+                 "choices" => [
+                   %{"message" => %{"role" => "assistant", "content" => "A completed response"}}
+                 ]
+               })
+    end
+
+    test "preserves normalized tool calls for synchronous tool loops" do
+      response = %{
+        "choices" => [
+          %{
+            "message" => %{
+              "role" => "assistant",
+              "content" => nil,
+              "tool_calls" => [
+                %{
+                  "id" => "call_1",
+                  "type" => "function",
+                  "function" => %{
+                    "name" => "add_screen",
+                    "arguments" => ~s({"title":"Introduction"})
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+
+      assert {:ok, ^response} = OpenAICompliantProvider.extract_generate_result(response)
+    end
+  end
+
   describe "process_stream_chunk/1" do
     test "ignores role-only delta chunks" do
       assert :ignore ==

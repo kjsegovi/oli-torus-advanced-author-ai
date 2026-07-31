@@ -32,11 +32,20 @@ defmodule Oli.MCP.Tools.CreateAdaptiveScreenTool do
   def execute(%{project_slug: project_slug, title: title, screen_json: screen_json}, frame) do
     UsageTracker.track_tool_usage("create_adaptive_screen", frame)
 
-    with {:ok, %{author_id: author_id}} <- Authorization.validate_project_access(project_slug, frame),
+    with {:ok, %{author_id: author_id}} <-
+           Authorization.validate_project_access(project_slug, frame),
          {:ok, author} <- fetch_author(author_id),
          {:ok, content} <- Jason.decode(screen_json),
          {:ok, {revision, _content}} <-
-           ActivityEditor.create(project_slug, "oli_adaptive", author, content, %{}, "embedded", title) do
+           ActivityEditor.create(
+             project_slug,
+             "oli_adaptive",
+             author,
+             content,
+             %{},
+             "embedded",
+             title
+           ) do
       text =
         Jason.encode!(%{
           activity_slug: revision.slug,
@@ -48,7 +57,9 @@ defmodule Oli.MCP.Tools.CreateAdaptiveScreenTool do
     else
       {:error, reason} ->
         UsageTracker.track_tool_usage("create_adaptive_screen", frame, "error")
-        {:reply, Response.error(Response.tool(), "Screen creation failed: #{inspect(reason)}"), frame}
+
+        {:reply, Response.error(Response.tool(), "Screen creation failed: #{inspect(reason)}"),
+         frame}
     end
   end
 

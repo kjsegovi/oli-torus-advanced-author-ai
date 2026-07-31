@@ -997,7 +997,9 @@ defmodule Oli.Publishing do
         if active_publication.id != id do
           Repo.rollback(:interupted_by_another_user)
         else
-          with latest_published_publication <-
+          with :ok <-
+                 Oli.Publishing.ChangeTracker.lock_project_root(active_publication),
+               latest_published_publication <-
                  Publishing.get_latest_published_publication_by_slug(project.slug),
                now <- DateTime.utc_now(),
 
@@ -1042,6 +1044,7 @@ defmodule Oli.Publishing do
 
             publication
           else
+            {:error, reason} -> Repo.rollback(reason)
             error -> Repo.rollback(error)
           end
         end
@@ -1052,6 +1055,12 @@ defmodule Oli.Publishing do
         Locks.release_all(id)
 
         {:error, "Another user has modified the active publication. Please try again."}
+
+      {:error, :course_import_in_progress} ->
+        Locks.release_all(id)
+
+        {:error,
+         "This project cannot be published while its OpenStax course import is in progress."}
 
       {:ok, publication} ->
         # Log the publication event

@@ -1,0 +1,1414 @@
+<div id="google-slides-ai-import" class="mx-auto max-w-5xl pb-12">
+  <div class="mb-6 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+    <div>
+      <h2 id="header_id" class="pb-2">{gettext("Import Google Slides")}</h2>
+      <p class="max-w-3xl text-sm text-gray-600">
+        {gettext(
+          "Analyze a Google Slides deck, review the proposed lesson structure, and then create complete Advanced Author lesson content."
+        )}
+      </p>
+    </div>
+    <.link navigate={@return_path} class="text-sm font-semibold text-primary hover:underline">
+      <.icon name="hero-arrow-left" class="mr-1 h-4 w-4" />
+      {gettext("Back to curriculum")}
+    </.link>
+  </div>
+
+  <div
+    :if={!@available?}
+    class="mb-6 rounded border border-yellow-300 bg-yellow-50 p-4 text-sm text-yellow-900"
+    role="alert"
+  >
+    <p class="font-semibold">{gettext("Google Slides import is unavailable")}</p>
+    <p class="mt-1">{@availability_message}</p>
+  </div>
+
+  <div
+    :if={(@available? and @service_account_email) && is_nil(@run)}
+    class="mb-6 rounded border border-blue-200 bg-blue-50 p-4 text-sm text-blue-900"
+  >
+    <p>
+      {gettext("Share the presentation with %{email} so Torus can read it.",
+        email: @service_account_email
+      )}
+    </p>
+  </div>
+
+  <div
+    :if={@error_message}
+    id="google-slides-import-error"
+    class="mb-6 rounded border border-red-200 bg-red-50 p-4 text-sm text-red-800"
+    role="alert"
+  >
+    {@error_message}
+  </div>
+
+  <%= if is_nil(@run) do %>
+    <section class="rounded border border-gray-200 bg-white p-6 shadow-sm">
+      <h3 class="mb-1 text-lg font-semibold text-gray-900">{gettext("Choose a presentation")}</h3>
+      <p class="mb-5 text-sm text-gray-600">
+        {gettext(
+          "Analysis is read-only. No lesson content is created until you review the plan and select Approve and Generate Lesson."
+        )}
+      </p>
+
+      <.form
+        id="google-slides-import-form"
+        for={@form}
+        phx-change="validate_import"
+        phx-submit="analyze"
+        class="space-y-6"
+      >
+        <div>
+          <.input
+            field={@form[:presentation_url]}
+            type="url"
+            label={gettext("Google Slides URL")}
+            placeholder="https://docs.google.com/presentation/d/..."
+            autocomplete="off"
+            disabled={!@available?}
+            required
+            aria-describedby="google-slides-url-hint"
+          />
+          <p id="google-slides-url-hint" class="mt-1 text-xs text-gray-500">
+            {gettext(
+              "Use the full URL from Google Slides. The service account needs view access."
+            )}
+          </p>
+        </div>
+
+        <div>
+          <.input
+            field={@form[:layout_mode]}
+            type="select"
+            label={gettext("Layout mode")}
+            options={[
+              {gettext("Accessible responsive templates (recommended)"), "responsive"},
+              {gettext("Pixel-oriented slide layout"), "pixel"}
+            ]}
+            disabled={!@available?}
+          />
+          <p class="mt-1 text-xs text-gray-500">
+            {gettext(
+              "Responsive mode prioritizes semantic reading order and device support. Pixel mode preserves slide positioning while retaining an accessible reading order."
+            )}
+          </p>
+        </div>
+
+        <div class="flex items-center gap-3">
+          <.button
+            type="submit"
+            variant={:primary}
+            size={:sm}
+            disabled={!@available?}
+            phx-disable-with={gettext("Starting analysis...")}
+          >
+            {gettext("Analyze presentation")}
+          </.button>
+          <.link navigate={@return_path} class="text-sm text-gray-600 hover:underline">
+            {gettext("Cancel")}
+          </.link>
+        </div>
+      </.form>
+    </section>
+  <% else %>
+    <% status = run_status(@run) %>
+
+    <nav aria-label={gettext("Import progress")} class="mb-6">
+      <ol class="grid gap-2 text-xs sm:grid-cols-3">
+        <li class={[
+          "rounded border p-3",
+          if(status in [:analyzing, :awaiting_structure, :awaiting_budget, :awaiting_answers],
+            do: "border-primary bg-blue-50 text-primary",
+            else: "border-gray-200 text-gray-600"
+          )
+        ]}>
+          <span class="font-semibold">{gettext("1. Analyze")}</span>
+        </li>
+        <li class={[
+          "rounded border p-3",
+          if(status == :ready_for_review,
+            do: "border-primary bg-blue-50 text-primary",
+            else: "border-gray-200 text-gray-600"
+          )
+        ]}>
+          <span class="font-semibold">{gettext("2. Review plan")}</span>
+        </li>
+        <li class={[
+          "rounded border p-3",
+          if(status in [:generating, :completed],
+            do: "border-primary bg-blue-50 text-primary",
+            else: "border-gray-200 text-gray-600"
+          )
+        ]}>
+          <span class="flex items-center gap-2 font-semibold">
+            <span
+              :if={status == :generating}
+              id="google-slides-generate-tab-activity"
+              class="relative flex h-2.5 w-2.5"
+              aria-hidden="true"
+            >
+              <span class="google-slides-generate-tab-ring"></span>
+              <span class="google-slides-generate-tab-dot"></span>
+            </span>
+            {gettext("3. Generate lesson")}
+          </span>
+        </li>
+      </ol>
+    </nav>
+
+    <%= case status do %>
+      <% :analyzing -> %>
+        <section
+          id="google-slides-import-analyzing"
+          class="rounded border border-gray-200 bg-white p-6 shadow-sm"
+          role="status"
+          aria-live="polite"
+          aria-busy="true"
+        >
+          <div class="flex items-start gap-3">
+            <span class="mt-0.5 text-primary" aria-hidden="true">
+              <.icon name="hero-arrow-path" class="h-5 w-5 motion-safe:animate-spin" />
+            </span>
+            <div>
+              <h3 class="font-semibold text-gray-900">{gettext("Analyzing the presentation")}</h3>
+              <p id="google-slides-import-analysis-description" class="mt-1 text-sm text-gray-600">
+                {gettext(
+                  "Torus is reading the slides, notes, project objectives, and approved components. This can take several minutes."
+                )}
+              </p>
+            </div>
+          </div>
+
+          <div class="mt-6">
+            <div class="mb-2 flex items-center justify-between gap-3 text-sm">
+              <span class="font-medium text-gray-700">{gettext("Presentation analysis")}</span>
+              <span class="text-gray-600">{analysis_progress_text(@run)}</span>
+            </div>
+            <div
+              id="google-slides-import-analysis-progress"
+              class="h-2 overflow-hidden rounded-full bg-gray-200"
+              role="progressbar"
+              aria-label={gettext("Presentation analysis progress")}
+              aria-valuemin={if(analysis_determinate?(@run), do: 0)}
+              aria-valuemax={if(analysis_determinate?(@run), do: analysis_total_units(@run))}
+              aria-valuenow={if(analysis_determinate?(@run), do: analysis_progress_value(@run))}
+              aria-valuetext={analysis_progress_text(@run)}
+              aria-describedby="google-slides-import-analysis-description"
+            >
+              <div
+                class={[
+                  "h-full rounded-full bg-primary motion-reduce:transition-none",
+                  if(analysis_determinate?(@run),
+                    do: "google-slides-import-progress-fill transition-[width] duration-300",
+                    else: "google-slides-import-progress-indicator"
+                  )
+                ]}
+                style={
+                  if(analysis_determinate?(@run),
+                    do: "width: #{analysis_progress_width(@run)}"
+                  )
+                }
+                aria-hidden="true"
+              >
+              </div>
+            </div>
+          </div>
+
+          <div id="google-slides-import-analysis-stages" class="mt-6">
+            <p class="text-xs font-semibold uppercase tracking-wide text-gray-500">
+              {gettext("Analysis includes")}
+            </p>
+            <ul class="mt-3 grid gap-3 text-sm text-gray-700 md:grid-cols-3">
+              <li class="flex items-start gap-2 rounded border border-gray-200 bg-gray-50 p-3">
+                <span class="mt-1 h-2 w-2 shrink-0 rounded-full bg-primary" aria-hidden="true">
+                </span>
+                <span>{gettext("Reading slide content and speaker notes")}</span>
+              </li>
+              <li class="flex items-start gap-2 rounded border border-gray-200 bg-gray-50 p-3">
+                <span class="mt-1 h-2 w-2 shrink-0 rounded-full bg-primary" aria-hidden="true">
+                </span>
+                <span>{gettext("Mapping objectives and approved components")}</span>
+              </li>
+              <li class="flex items-start gap-2 rounded border border-gray-200 bg-gray-50 p-3">
+                <span class="mt-1 h-2 w-2 shrink-0 rounded-full bg-primary" aria-hidden="true">
+                </span>
+                <span>{gettext("Checking adaptivity, feedback, and source fidelity")}</span>
+              </li>
+            </ul>
+          </div>
+
+          <.button
+            type="button"
+            variant={:secondary}
+            size={:sm}
+            class="mt-5"
+            phx-click="refresh_run"
+          >
+            {gettext("Refresh status")}
+          </.button>
+        </section>
+      <% :awaiting_structure -> %>
+        <% proposal = structure_proposal(@run) %>
+        <% one_lesson = run_value(proposal, :oneLesson, %{}) || %{} %>
+        <% split = split_lessons(@run) %>
+        <section
+          id="google-slides-import-structure"
+          class="rounded border border-gray-200 bg-white p-6 shadow-sm"
+        >
+          <p class="text-xs font-semibold uppercase tracking-wide text-primary">
+            {gettext("One decision before detailed planning")}
+          </p>
+          <h3 class="mt-1 text-lg font-semibold text-gray-900">
+            {gettext("How should this presentation become lesson content?")}
+          </h3>
+          <p class="mt-2 max-w-3xl text-sm text-gray-700">
+            {gettext(
+              "Torus found enough material for more than one lesson. Both choices preserve every slide and keep source-evidenced pathways together."
+            )}
+          </p>
+
+          <div class="mt-6 grid gap-4 md:grid-cols-2">
+            <article class="rounded border border-gray-300 p-4">
+              <h4 class="font-semibold text-gray-900">{gettext("Create one lesson")}</h4>
+              <p class="mt-1 text-sm text-gray-700">
+                {run_value(one_lesson, :title, gettext("Imported Slides Lesson"))}
+              </p>
+              <p class="mt-1 text-xs text-gray-500">
+                {gettext("Slides %{first}–%{last}",
+                  first: run_value(one_lesson, :startSlide, 1),
+                  last: run_value(one_lesson, :endSlide, 1)
+                )}
+              </p>
+              <.button
+                type="button"
+                variant={:secondary}
+                size={:sm}
+                class="mt-4"
+                phx-click="choose_structure"
+                phx-value-decision="one_lesson"
+              >
+                {gettext("Use one lesson")}
+              </.button>
+            </article>
+
+            <article class="rounded border border-primary bg-blue-50 p-4">
+              <h4 class="font-semibold text-gray-900">
+                {gettext("Create %{count} sibling lessons", count: length(split))}
+              </h4>
+              <ol class="mt-3 space-y-2 text-sm text-gray-700">
+                <li :for={lesson <- split}>
+                  <span class="font-medium">{run_value(lesson, :title)}</span>
+                  <span class="block text-xs text-gray-600">
+                    {gettext("Slides %{first}–%{last}",
+                      first: run_value(lesson, :startSlide),
+                      last: run_value(lesson, :endSlide)
+                    )}
+                  </span>
+                </li>
+              </ol>
+              <.button
+                type="button"
+                variant={:primary}
+                size={:sm}
+                class="mt-4"
+                phx-click="choose_structure"
+                phx-value-decision="split"
+              >
+                {gettext("Use the proposed split")}
+              </.button>
+            </article>
+          </div>
+        </section>
+      <% :awaiting_budget -> %>
+        <% {used_tokens, token_limit} = budget_usage(@run) %>
+        <% tranche_tokens = budget_tranche(@run) %>
+        <section
+          id="google-slides-import-budget"
+          class="rounded border border-yellow-300 bg-yellow-50 p-6 shadow-sm"
+        >
+          <h3 class="text-lg font-semibold text-yellow-950">
+            {gettext("Analysis progress is safely saved")}
+          </h3>
+          <p class="mt-2 max-w-3xl text-sm text-yellow-900">
+            {gettext(
+              "This presentation reached the current analysis budget after %{used} of %{limit} prompt tokens. No completed work will be repeated. Continue to grant the next %{tranche}-token tranche.",
+              used: used_tokens,
+              limit: token_limit,
+              tranche: tranche_tokens
+            )}
+          </p>
+          <p class="mt-3 text-sm font-medium text-yellow-950">
+            {analysis_progress_text(@run)}
+          </p>
+          <.button
+            type="button"
+            variant={:primary}
+            size={:sm}
+            class="mt-5"
+            phx-click="continue_analysis_budget"
+            phx-disable-with={gettext("Continuing analysis...")}
+          >
+            {gettext("Continue analysis")}
+          </.button>
+        </section>
+      <% :awaiting_answers -> %>
+        <section
+          id="google-slides-import-questions"
+          class="rounded border border-gray-200 bg-white p-6 shadow-sm"
+        >
+          <h3 class="text-lg font-semibold text-gray-900">
+            {gettext("Help Torus finish the lesson plan")}
+          </h3>
+          <p class="mt-2 max-w-3xl text-sm text-gray-700">
+            {gettext(
+              "Torus preserved the presentation automatically and grouped the few details that require author knowledge. Review each source slide, then complete the required fields. Your answers do not change the Google Slides presentation."
+            )}
+          </p>
+          <div class="mt-4 rounded border border-blue-200 bg-blue-50 p-4 text-sm text-blue-900">
+            <p class="font-semibold">{gettext("How to decide")}</p>
+            <p class="mt-1">
+              {gettext(
+                "Answer only what the source cannot establish safely, such as a correct response, caption or transcript, new objective approval, or runtime AI opt-in."
+              )}
+            </p>
+          </div>
+
+          <.form id="google-slides-blocker-form" for={%{}} phx-submit="submit_answers">
+            <div class="mt-6 space-y-6">
+              <%= for {question, index} <- Enum.with_index(questions(@run)) do %>
+                <% id = question_id(question, index) %>
+                <% source_preview = question_source_preview(question, @run) %>
+                <fieldset class="overflow-hidden rounded-lg border border-gray-300 bg-white">
+                  <legend class="sr-only">
+                    {question_prompt(question, @run)}
+                  </legend>
+
+                  <div class="border-b border-gray-200 bg-gray-50 px-5 py-4">
+                    <p class="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                      {gettext("Decision %{current} of %{total}",
+                        current: index + 1,
+                        total: length(questions(@run))
+                      )}
+                    </p>
+                    <h4 class="mt-1 text-base font-semibold text-gray-900">
+                      {question_source(question, @run) || question_prompt(question, @run)}
+                    </h4>
+                    <p :if={run_value(question, :lessonTitle)} class="mt-1 text-sm text-gray-600">
+                      {run_value(question, :lessonTitle)}
+                    </p>
+                  </div>
+
+                  <div class="space-y-5 p-5">
+                    <div
+                      :if={question_subject(question, @run)}
+                      class="rounded border-l-4 border-primary bg-blue-50 px-4 py-3"
+                    >
+                      <p class="text-xs font-semibold uppercase tracking-wide text-blue-800">
+                        {gettext("Content Torus is asking about")}
+                      </p>
+                      <p class="mt-1 text-sm text-gray-900">
+                        “{question_subject(question, @run)}”
+                      </p>
+                    </div>
+
+                    <div>
+                      <p class="text-sm font-semibold text-gray-900">
+                        {gettext("Why am I seeing this?")}
+                      </p>
+                      <p class="mt-1 text-sm leading-6 text-gray-700">
+                        {question_explanation(question, @run)}
+                      </p>
+                    </div>
+
+                    <div
+                      :if={question_source(question, @run)}
+                      class="flex flex-col gap-3 rounded border border-gray-200 bg-gray-50 p-4 sm:flex-row sm:items-center sm:justify-between"
+                    >
+                      <div class="min-w-0">
+                        <p class="text-xs font-semibold uppercase tracking-wide text-gray-500">
+                          {gettext("Original source")}
+                        </p>
+                        <p class="mt-1 truncate text-sm font-medium text-gray-900">
+                          {question_source(question, @run)}
+                        </p>
+                        <p
+                          :if={source_preview && source_preview.overlay_style}
+                          class="mt-1 text-xs text-gray-600"
+                        >
+                          {gettext(
+                            "The preview highlights the exact item Torus needs you to review."
+                          )}
+                        </p>
+                      </div>
+                      <.button
+                        :if={source_preview}
+                        id={"preview-source-slide-#{index}"}
+                        type="button"
+                        variant={:secondary}
+                        size={:sm}
+                        class="shrink-0"
+                        phx-click="open_source_preview"
+                        phx-value-question_id={id}
+                      >
+                        <.icon name="hero-magnifying-glass-plus" class="mr-1 h-4 w-4" />
+                        {gettext("View source slide")}
+                      </.button>
+                    </div>
+
+                    <div class="space-y-5">
+                      <div
+                        :for={field <- question_fields(question)}
+                        class="rounded border border-gray-200 p-4"
+                      >
+                        <% field_id = run_value(field, :id) || run_value(field, :key) %>
+                        <% field_options = question_options(field) %>
+                        <% field_recommendation = question_recommendation(field) %>
+                        <label
+                          for={"answer-#{field_id}"}
+                          class="block text-sm font-semibold text-gray-900"
+                        >
+                          {question_prompt(field, @run)}
+                        </label>
+                        <p class="mt-1 text-xs leading-5 text-gray-600">
+                          {question_explanation(field, @run)}
+                        </p>
+                        <%= if field_options == [] do %>
+                          <textarea
+                            id={"answer-#{field_id}"}
+                            name={"answers[#{field_id}]"}
+                            rows="3"
+                            required
+                            class="mt-2 block w-full rounded border border-gray-300 p-2 text-sm"
+                          ><%= field_recommendation || "" %></textarea>
+                        <% else %>
+                          <select
+                            id={"answer-#{field_id}"}
+                            name={"answers[#{field_id}]"}
+                            required
+                            class="mt-2 block w-full rounded border border-gray-300 p-2 text-sm"
+                          >
+                            <option value="">{gettext("Select what should happen")}</option>
+                            <%= for option <- field_options do %>
+                              <option
+                                value={option_value(option)}
+                                selected={option_value(option) == field_recommendation}
+                              >
+                                {question_option_label(field, @run, option)}
+                              </option>
+                            <% end %>
+                          </select>
+                        <% end %>
+                      </div>
+                    </div>
+                  </div>
+                </fieldset>
+              <% end %>
+            </div>
+
+            <.button
+              type="submit"
+              variant={:primary}
+              size={:sm}
+              class="mt-6"
+              phx-disable-with={gettext("Submitting answers...")}
+            >
+              {gettext("Continue analysis")}
+            </.button>
+          </.form>
+        </section>
+      <% :ready_for_review -> %>
+        <% plan = lesson_plan(@run) %>
+        <% screens = plan_screens(plan) %>
+        <% objectives = plan_objectives(plan) %>
+        <% assumptions = plan_assumptions(plan) %>
+        <% variables = plan_variables(plan) %>
+        <% coverage = source_coverage(plan) %>
+        <section id="google-slides-import-review" class="space-y-5">
+          <div class="rounded border border-gray-200 bg-white p-6 shadow-sm">
+            <div class="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+              <div>
+                <p class="text-xs font-semibold uppercase tracking-wide text-primary">
+                  {gettext("Lesson plan ready")}
+                </p>
+                <h3 class="mt-1 text-xl font-semibold text-gray-900">{plan_title(plan)}</h3>
+                <p class="mt-1 text-sm text-gray-600">
+                  {gettext("%{screens} screen(s) and %{objectives} objective mapping(s)",
+                    screens: length(screens),
+                    objectives: length(objectives)
+                  )}
+                </p>
+                <p class="mt-1 text-xs text-gray-500">{plan_layout_label(plan)}</p>
+              </div>
+              <span class="rounded bg-gray-100 px-3 py-1 text-xs font-semibold text-gray-700">
+                {gettext("Plan version %{version}", version: run_value(@run, :plan_version, 0))}
+              </span>
+            </div>
+
+            <section
+              id="source-fidelity-review"
+              aria-labelledby="source-fidelity-heading"
+              class="mt-6 rounded border border-gray-200 bg-gray-50 p-4"
+            >
+              <h4 id="source-fidelity-heading" class="text-sm font-semibold text-gray-900">
+                {gettext("Source fidelity")}
+              </h4>
+              <p class="mt-1 text-sm text-gray-600">
+                <%= if chunked_analysis?(@run) do %>
+                  {gettext(
+                    "Every meaningful Slides element is preserved with a native Torus component or a reviewed visual/static fallback. Meaningful source content is never silently omitted."
+                  )}
+                <% else %>
+                  {gettext(
+                    "Every meaningful Slides element must be represented in Torus or explicitly omitted by the author. Visual fallbacks are used when a native component cannot safely preserve the source."
+                  )}
+                <% end %>
+              </p>
+              <p id="source-background-policy" class="mt-2 text-xs text-gray-600">
+                {gettext(
+                  "Deck themes and slide background colors are intentionally not imported. The generated lesson uses the reviewed Torus background and theme defaults."
+                )}
+              </p>
+
+              <dl
+                :if={coverage != []}
+                id="source-fidelity-summary"
+                class="mt-4 grid grid-cols-2 gap-3 text-xs sm:grid-cols-5"
+              >
+                <div class="rounded bg-white p-3">
+                  <dt class="font-semibold text-gray-600">{gettext("Inventoried")}</dt>
+                  <dd class="mt-1 text-lg font-semibold text-gray-900">{length(coverage)}</dd>
+                </div>
+                <div class="rounded bg-white p-3">
+                  <dt class="font-semibold text-gray-600">{gettext("Included")}</dt>
+                  <dd class="mt-1 text-lg font-semibold text-gray-900">
+                    {source_coverage_count(coverage, "included")}
+                  </dd>
+                </div>
+                <div class="rounded bg-white p-3">
+                  <dt class="font-semibold text-gray-600">{gettext("Visual fallback")}</dt>
+                  <dd class="mt-1 text-lg font-semibold text-gray-900">
+                    {source_coverage_fidelity_count(coverage, "rasterized")}
+                  </dd>
+                </div>
+                <div class="rounded bg-white p-3">
+                  <dt class="font-semibold text-gray-600">{gettext("Linked media")}</dt>
+                  <dd class="mt-1 text-lg font-semibold text-gray-900">
+                    {source_coverage_fidelity_count(coverage, "linked")}
+                  </dd>
+                </div>
+                <div :if={!chunked_analysis?(@run)} class="rounded bg-white p-3">
+                  <dt class="font-semibold text-gray-600">{gettext("Author omitted")}</dt>
+                  <dd class="mt-1 text-lg font-semibold text-gray-900">
+                    {source_coverage_count(coverage, "author_omitted")}
+                  </dd>
+                </div>
+              </dl>
+
+              <p :if={coverage == []} class="mt-3 text-sm text-yellow-800">
+                {gettext("A source-fidelity ledger is not available for this plan.")}
+              </p>
+
+              <details
+                :if={source_coverage_review_total(coverage) > 0}
+                id="source-fidelity-details"
+                class="mt-4 rounded border border-gray-200 bg-white"
+              >
+                <summary class="cursor-pointer p-3 text-sm font-semibold text-gray-900">
+                  <%= if chunked_analysis?(@run) do %>
+                    {gettext("%{count} automatically preserved fallback(s)",
+                      count: source_coverage_review_total(coverage)
+                    )}
+                  <% else %>
+                    {gettext("%{count} element(s) require fidelity review",
+                      count: source_coverage_review_total(coverage)
+                    )}
+                  <% end %>
+                </summary>
+                <ol class="space-y-3 border-t border-gray-200 p-3">
+                  <li
+                    :for={
+                      {entry, index} <-
+                        Enum.with_index(source_coverage_review_entries(coverage))
+                    }
+                    id={"source-fidelity-entry-#{index}"}
+                    class="rounded border border-gray-200 p-3 text-xs"
+                  >
+                    <div class="flex flex-wrap items-start justify-between gap-2">
+                      <p class="font-semibold text-gray-900">
+                        {source_coverage_heading(entry, index)}
+                      </p>
+                      <span class="rounded bg-gray-100 px-2 py-1 font-semibold text-gray-700">
+                        {source_coverage_status(entry)} · {source_coverage_fidelity(entry)}
+                      </span>
+                    </div>
+                    <dl class="mt-2 grid gap-2 sm:grid-cols-2">
+                      <div>
+                        <dt class="font-semibold text-gray-600">{gettext("Source")}</dt>
+                        <dd class="mt-0.5 break-words text-gray-700">
+                          {source_coverage_source(entry, @run)}
+                        </dd>
+                      </div>
+                      <div>
+                        <dt class="font-semibold text-gray-600">{gettext("Torus target")}</dt>
+                        <dd class="mt-0.5 break-words text-gray-700">
+                          {source_coverage_targets(entry)}
+                        </dd>
+                      </div>
+                    </dl>
+                  </li>
+                </ol>
+                <p
+                  :if={source_coverage_review_remaining(coverage) > 0}
+                  class="border-t border-gray-200 p-3 text-xs text-gray-600"
+                >
+                  {gettext("%{count} additional review item(s) are included in the plan ledger.",
+                    count: source_coverage_review_remaining(coverage)
+                  )}
+                </p>
+              </details>
+            </section>
+
+            <div class="mt-6">
+              <h4 class="text-sm font-semibold text-gray-900">{gettext("Screen outline")}</h4>
+              <ol class="mt-2 space-y-3">
+                <%= for {screen, index} <- Enum.with_index(screens) do %>
+                  <% parts = screen_parts(screen) %>
+                  <% interactions = screen_interactions(screen) %>
+                  <% adaptivity = screen_adaptivity(screen) %>
+                  <% source_previews = review_source_previews(screen, @run) %>
+                  <li>
+                    <details
+                      id={"screen-review-#{index}"}
+                      open={index == 0}
+                      class="group rounded border border-gray-200 bg-gray-50"
+                    >
+                      <summary class="cursor-pointer list-none p-4 [&::-webkit-details-marker]:hidden">
+                        <span class="flex items-start justify-between gap-4">
+                          <span>
+                            <span class="block text-sm font-medium text-gray-900">
+                              {index + 1}. {screen_title(screen, index)}
+                            </span>
+                            <span
+                              :if={source_label(screen, @run)}
+                              class="mt-1 block break-words text-xs text-gray-500"
+                            >
+                              {source_label(screen, @run)}
+                            </span>
+                            <span class="mt-1 block text-xs text-gray-600">
+                              {screen_contents_label(screen)}
+                            </span>
+                          </span>
+                          <.icon
+                            name="hero-chevron-down"
+                            class="mt-0.5 h-4 w-4 shrink-0 text-gray-500 transition-transform group-open:rotate-180"
+                          />
+                        </span>
+                      </summary>
+
+                      <div class="space-y-6 border-t border-gray-200 bg-white p-4">
+                        <section
+                          :if={source_previews != []}
+                          id={"screen-#{index}-source-slides"}
+                          aria-labelledby={"screen-#{index}-source-slides-heading"}
+                        >
+                          <h5
+                            id={"screen-#{index}-source-slides-heading"}
+                            class="text-sm font-semibold text-gray-900"
+                          >
+                            {gettext("Original slides")}
+                          </h5>
+                          <p class="mt-1 text-sm text-gray-600">
+                            {gettext(
+                              "Open a source slide to compare its visual layout with this proposed screen."
+                            )}
+                          </p>
+                          <div class="mt-3 grid gap-3 sm:grid-cols-2">
+                            <button
+                              :for={{preview, preview_index} <- Enum.with_index(source_previews)}
+                              id={"review-source-slide-#{index}-#{preview_index}"}
+                              type="button"
+                              phx-click="open_review_source_preview"
+                              phx-value-slide_id={preview.slide_id}
+                              class="flex items-center gap-3 rounded border border-gray-200 bg-gray-50 p-3 text-left transition hover:border-primary hover:bg-blue-50 focus:outline-none focus:ring-2 focus:ring-primary"
+                            >
+                              <span
+                                class="flex h-10 w-10 shrink-0 items-center justify-center rounded bg-white text-primary shadow-sm"
+                                aria-hidden="true"
+                              >
+                                <.icon name="hero-photo" class="h-5 w-5" />
+                              </span>
+                              <span class="min-w-0 flex-1">
+                                <span class="block truncate text-sm font-semibold text-gray-900">
+                                  {preview.label}
+                                </span>
+                                <span class="mt-0.5 block text-xs text-gray-600">
+                                  {gettext("View source slide")}
+                                </span>
+                              </span>
+                              <.icon
+                                name="hero-magnifying-glass-plus"
+                                class="h-4 w-4 shrink-0 text-gray-500"
+                              />
+                            </button>
+                          </div>
+                        </section>
+
+                        <section aria-labelledby={"screen-#{index}-content-heading"}>
+                          <h5
+                            id={"screen-#{index}-content-heading"}
+                            class="text-sm font-semibold text-gray-900"
+                          >
+                            {gettext("Content parts")}
+                          </h5>
+                          <div class="mt-2 space-y-3">
+                            <article
+                              :for={{part, part_index} <- Enum.with_index(parts)}
+                              id={"screen-#{index}-part-#{part_index}"}
+                              class="rounded border border-gray-200 p-3"
+                            >
+                              <h6 class="text-sm font-medium text-gray-900">
+                                {part_heading(part, part_index)}
+                              </h6>
+                              <dl class="mt-2 grid gap-3 text-xs sm:grid-cols-2">
+                                <div class="sm:col-span-2">
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Content")}
+                                  </dt>
+                                  <dd class="mt-1 whitespace-pre-wrap break-words text-gray-700">
+                                    {part_content(part)}
+                                  </dd>
+                                </div>
+                                <div class="sm:col-span-2">
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Source provenance")}
+                                  </dt>
+                                  <dd class="mt-1 break-words text-gray-600">
+                                    {record_source_label(part, :sourceRefs, @run)}
+                                  </dd>
+                                </div>
+                                <%= if media_part?(part) do %>
+                                  <div
+                                    :for={{label, value} <- media_accessibility_fields(part)}
+                                    class="sm:col-span-2"
+                                  >
+                                    <dt class="font-semibold text-gray-700">{label}</dt>
+                                    <dd class="mt-1 whitespace-pre-wrap break-words text-gray-700">
+                                      {accessibility_value(value)}
+                                    </dd>
+                                  </div>
+                                <% end %>
+                              </dl>
+                            </article>
+                            <p :if={parts == []} class="text-sm text-gray-500">
+                              {gettext("No content parts are declared for this screen.")}
+                            </p>
+                          </div>
+                        </section>
+
+                        <section aria-labelledby={"screen-#{index}-interactions-heading"}>
+                          <h5
+                            id={"screen-#{index}-interactions-heading"}
+                            class="text-sm font-semibold text-gray-900"
+                          >
+                            {gettext("Interactions and feedback")}
+                          </h5>
+                          <div class="mt-2 space-y-3">
+                            <article
+                              :for={
+                                {interaction, interaction_index} <-
+                                  Enum.with_index(interactions)
+                              }
+                              id={"screen-#{index}-interaction-#{interaction_index}"}
+                              class="rounded border border-gray-200 p-3"
+                            >
+                              <h6 class="text-sm font-medium text-gray-900">
+                                {interaction_heading(interaction, interaction_index)}
+                              </h6>
+                              <dl class="mt-2 grid gap-3 text-xs sm:grid-cols-2">
+                                <div class="sm:col-span-2">
+                                  <dt class="font-semibold text-gray-700">{gettext("Prompt")}</dt>
+                                  <dd class="mt-1 whitespace-pre-wrap break-words text-gray-700">
+                                    {interaction_prompt(interaction)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Component")}
+                                  </dt>
+                                  <dd class="mt-1 break-words text-gray-700">
+                                    {interaction_component(interaction)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Correct response")}
+                                  </dt>
+                                  <dd class="mt-1 whitespace-pre-wrap break-words text-gray-700">
+                                    {interaction_correct_response(interaction)}
+                                  </dd>
+                                </div>
+                                <div class="sm:col-span-2">
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Component configuration")}
+                                  </dt>
+                                  <dd class="mt-1 whitespace-pre-wrap break-words text-gray-700">
+                                    {interaction_configuration(interaction)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Scoring")}
+                                  </dt>
+                                  <dd class="mt-1 text-gray-700">
+                                    {interaction_scoring(interaction)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Runtime AI feedback")}
+                                  </dt>
+                                  <dd class="mt-1 text-gray-700">
+                                    {runtime_ai_status(interaction)}
+                                  </dd>
+                                </div>
+                                <div class="sm:col-span-2">
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Standard evaluation behavior")}
+                                  </dt>
+                                  <dd class="mt-1 whitespace-pre-wrap break-words text-gray-700">
+                                    {interaction_evaluation_policy(interaction)}
+                                  </dd>
+                                </div>
+                                <div class="sm:col-span-2">
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Source provenance")}
+                                  </dt>
+                                  <dd class="mt-1 break-words text-gray-600">
+                                    {record_source_label(interaction, :sourceEvidence, @run)}
+                                  </dd>
+                                </div>
+                                <div
+                                  :if={static_feedback_entries(interaction) != []}
+                                  class="sm:col-span-2"
+                                >
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Static feedback")}
+                                  </dt>
+                                  <dd class="mt-1">
+                                    <ul class="space-y-1 text-gray-700">
+                                      <li
+                                        :for={
+                                          {label, feedback} <-
+                                            static_feedback_entries(interaction)
+                                        }
+                                        class="whitespace-pre-wrap break-words"
+                                      >
+                                        <span class="font-medium">{label}:</span> {feedback}
+                                      </li>
+                                    </ul>
+                                  </dd>
+                                </div>
+                                <div :if={runtime_ai_prompt(interaction)} class="sm:col-span-2">
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Runtime AI prompt")}
+                                  </dt>
+                                  <dd class="mt-1 whitespace-pre-wrap break-words text-gray-700">
+                                    {runtime_ai_prompt(interaction)}
+                                  </dd>
+                                </div>
+                                <div :if={runtime_ai_fallback(interaction)} class="sm:col-span-2">
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Static fallback")}
+                                  </dt>
+                                  <dd class="mt-1 break-words text-gray-700">
+                                    {runtime_ai_fallback(interaction)}
+                                  </dd>
+                                </div>
+                              </dl>
+                            </article>
+                            <p :if={interactions == []} class="text-sm text-gray-500">
+                              {gettext("No interactions are declared for this screen.")}
+                            </p>
+                          </div>
+                        </section>
+
+                        <section aria-labelledby={"screen-#{index}-adaptivity-heading"}>
+                          <h5
+                            id={"screen-#{index}-adaptivity-heading"}
+                            class="text-sm font-semibold text-gray-900"
+                          >
+                            {gettext("Adaptivity")}
+                          </h5>
+                          <div class="mt-2 space-y-3">
+                            <article
+                              :for={{rule, rule_index} <- Enum.with_index(adaptivity)}
+                              id={"screen-#{index}-adaptivity-#{rule_index}"}
+                              class="rounded border border-gray-200 p-3"
+                            >
+                              <h6 class="text-sm font-medium text-gray-900">
+                                {adaptivity_heading(rule, rule_index)}
+                              </h6>
+                              <dl class="mt-2 grid gap-3 text-xs sm:grid-cols-2">
+                                <div>
+                                  <dt class="font-semibold text-gray-700">
+                                    {gettext("Condition")}
+                                  </dt>
+                                  <dd class="mt-1 whitespace-pre-wrap break-words text-gray-700">
+                                    {adaptivity_condition(rule)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold text-gray-700">{gettext("Action")}</dt>
+                                  <dd class="mt-1 whitespace-pre-wrap break-words text-gray-700">
+                                    {adaptivity_action(rule)}
+                                  </dd>
+                                </div>
+                              </dl>
+                            </article>
+                            <p :if={adaptivity == []} class="text-sm text-gray-500">
+                              {gettext(
+                                "No source-specific adaptivity rules are declared. Any evaluated interaction uses the standard evaluation behavior shown above."
+                              )}
+                            </p>
+                          </div>
+                        </section>
+                      </div>
+                    </details>
+                  </li>
+                <% end %>
+                <li
+                  :if={screens == []}
+                  class="rounded border border-gray-200 p-3 text-sm text-gray-500"
+                >
+                  {gettext(
+                    "The workflow did not provide a screen outline. Refresh or analyze again."
+                  )}
+                </li>
+              </ol>
+            </div>
+
+            <div :if={objectives != []} class="mt-6">
+              <h4 class="text-sm font-semibold text-gray-900">{gettext("Objectives")}</h4>
+              <ul class="mt-2 list-disc space-y-1 pl-5 text-sm text-gray-700">
+                <li :for={objective <- objectives}>{objective_label(objective)}</li>
+              </ul>
+            </div>
+
+            <div id="declared-variables" class="mt-6">
+              <h4 class="text-sm font-semibold text-gray-900">{gettext("Declared variables")}</h4>
+              <div class="mt-2 space-y-3">
+                <article
+                  :for={{variable, variable_index} <- Enum.with_index(variables)}
+                  id={"declared-variable-#{variable_index}"}
+                  class="rounded border border-gray-200 p-3"
+                >
+                  <h5 class="text-sm font-medium text-gray-900">
+                    {variable_heading(variable, variable_index)}
+                  </h5>
+                  <dl class="mt-2 grid gap-3 text-xs sm:grid-cols-2">
+                    <div>
+                      <dt class="font-semibold text-gray-700">{gettext("Initial value")}</dt>
+                      <dd class="mt-1 whitespace-pre-wrap break-words text-gray-700">
+                        {variable_initial_value(variable)}
+                      </dd>
+                    </div>
+                    <div>
+                      <dt class="font-semibold text-gray-700">{gettext("Purpose")}</dt>
+                      <dd class="mt-1 whitespace-pre-wrap break-words text-gray-700">
+                        {variable_purpose(variable)}
+                      </dd>
+                    </div>
+                    <div class="sm:col-span-2">
+                      <dt class="font-semibold text-gray-700">
+                        {gettext("Source provenance")}
+                      </dt>
+                      <dd class="mt-1 break-words text-gray-600">
+                        {record_source_label(variable, :sourceRefs, @run)}
+                      </dd>
+                    </div>
+                  </dl>
+                </article>
+                <p :if={variables == []} class="text-sm text-gray-500">
+                  {gettext("No lesson variables are declared.")}
+                </p>
+              </div>
+            </div>
+
+            <div
+              :if={assumptions != []}
+              class="mt-6 rounded border border-yellow-200 bg-yellow-50 p-4"
+            >
+              <h4 class="text-sm font-semibold text-yellow-900">
+                {gettext("Assumptions to review")}
+              </h4>
+              <ul class="mt-2 list-disc space-y-1 pl-5 text-sm text-yellow-900">
+                <li :for={assumption <- assumptions}>{assumption_label(assumption)}</li>
+              </ul>
+            </div>
+          </div>
+
+          <div class="rounded border border-blue-200 bg-blue-50 p-4 text-sm text-blue-900">
+            {gettext(
+              "Approving creates the reviewed lesson in one atomic operation. The AI draft does not directly mutate your project."
+            )}
+          </div>
+
+          <div class="flex flex-wrap items-center gap-3">
+            <.button
+              id="generate-google-slides-lesson"
+              type="button"
+              variant={:primary}
+              size={:sm}
+              phx-click="generate_lesson"
+              disabled={run_value(@run, :plan_version, 0) < 1}
+              phx-disable-with={gettext("Starting generation...")}
+            >
+              {gettext("Approve and Generate Lesson")}
+            </.button>
+            <.button type="button" variant={:secondary} size={:sm} phx-click="refresh_run">
+              {gettext("Refresh plan")}
+            </.button>
+          </div>
+        </section>
+      <% :generating -> %>
+        <section
+          id="google-slides-import-generating"
+          class="rounded border border-gray-200 bg-white p-6 shadow-sm"
+          role="status"
+          aria-live="polite"
+          aria-busy="true"
+        >
+          <div class="flex items-start gap-3">
+            <.icon
+              name="hero-arrow-path"
+              class="mt-0.5 h-5 w-5 text-primary motion-safe:animate-spin"
+            />
+            <div>
+              <h3 class="font-semibold text-gray-900">{gettext("Generating the lesson")}</h3>
+              <p
+                id="google-slides-import-generation-description"
+                class="mt-1 text-sm text-gray-600"
+              >
+                {gettext(
+                  "Torus is compiling and validating the approved plan before creating the page and adaptive screens."
+                )}
+              </p>
+            </div>
+          </div>
+
+          <div class="mt-6">
+            <div class="mb-2 flex items-center justify-between gap-3 text-xs">
+              <span class="font-semibold text-gray-700">{gettext("Lesson generation")}</span>
+              <span class="text-gray-500">{gettext("Still working…")}</span>
+            </div>
+            <div
+              id="google-slides-import-generation-progress"
+              class="h-2 overflow-hidden rounded-full bg-gray-200"
+              role="progressbar"
+              aria-label={gettext("Lesson generation progress")}
+              aria-valuetext={gettext("Generation in progress")}
+              aria-describedby="google-slides-import-generation-description"
+            >
+              <div
+                class="google-slides-import-progress-indicator google-slides-import-progress-fill h-full rounded-full bg-primary"
+                aria-hidden="true"
+              >
+              </div>
+            </div>
+          </div>
+
+          <div
+            id="google-slides-import-generation-stages"
+            class="mt-6 grid gap-3 md:grid-cols-3"
+          >
+            <div class="flex items-center gap-2 rounded border border-gray-200 bg-gray-50 p-3 text-sm text-gray-700">
+              <span
+                class="h-2 w-2 shrink-0 rounded-full bg-primary motion-safe:animate-pulse"
+                aria-hidden="true"
+              >
+              </span>
+              {gettext("Preparing course structure")}
+            </div>
+            <div class="flex items-center gap-2 rounded border border-gray-200 bg-gray-50 p-3 text-sm text-gray-700">
+              <span
+                class="h-2 w-2 shrink-0 rounded-full bg-primary motion-safe:animate-pulse"
+                aria-hidden="true"
+              >
+              </span>
+              {gettext("Importing source visuals")}
+            </div>
+            <div class="flex items-center gap-2 rounded border border-gray-200 bg-gray-50 p-3 text-sm text-gray-700">
+              <span
+                class="h-2 w-2 shrink-0 rounded-full bg-primary motion-safe:animate-pulse"
+                aria-hidden="true"
+              >
+              </span>
+              {gettext("Validating and saving lesson")}
+            </div>
+          </div>
+
+          <.button
+            type="button"
+            variant={:secondary}
+            size={:sm}
+            class="mt-5"
+            phx-click="refresh_run"
+          >
+            {gettext("Refresh status")}
+          </.button>
+        </section>
+      <% :completed -> %>
+        <section
+          id="google-slides-import-completed"
+          class="rounded border border-green-200 bg-green-50 p-6 text-green-900"
+          role="status"
+          aria-live="polite"
+        >
+          <h3 class="text-lg font-semibold">{gettext("Lesson created successfully")}</h3>
+          <p class="mt-1 text-sm">
+            {gettext(
+              "The lesson was appended to the selected curriculum container. It has not been published."
+            )}
+          </p>
+          <div class="mt-5 flex flex-wrap gap-3">
+            <.link
+              :if={result_revision_slug(@run)}
+              navigate={
+                ~p"/workspaces/course_author/#{@project.slug}/curriculum/#{result_revision_slug(@run)}/edit"
+              }
+              class="inline-flex items-center rounded bg-primary px-4 py-2 text-sm font-semibold text-white hover:bg-delivery-primary-600"
+            >
+              {gettext("Open lesson in Advanced Author")}
+            </.link>
+            <.button type="button" variant={:secondary} size={:sm} phx-click="reset_import">
+              {gettext("Import another presentation")}
+            </.button>
+          </div>
+        </section>
+      <% status when status in [:failed, :cancelled] -> %>
+        <section
+          id="google-slides-import-failed"
+          class="rounded border border-red-200 bg-red-50 p-6 text-red-900"
+          role="alert"
+        >
+          <h3 class="text-lg font-semibold">
+            {if status == :cancelled,
+              do: gettext("Import cancelled"),
+              else: gettext("Import could not be completed")}
+          </h3>
+          <p :if={error_detail(@run)} class="mt-2 text-sm">{error_detail(@run)}</p>
+          <p :if={error_reference(@run)} class="mt-2 text-xs">
+            {gettext("Reference code:")}
+            <code id="google-slides-import-error-code" class="font-mono">
+              {error_reference(@run)}
+            </code>
+          </p>
+          <.button
+            type="button"
+            variant={:secondary}
+            size={:sm}
+            class="mt-5"
+            phx-click="reset_import"
+          >
+            {gettext("Start over")}
+          </.button>
+        </section>
+      <% _ -> %>
+        <section class="rounded border border-gray-200 bg-white p-6 shadow-sm">
+          <h3 class="font-semibold text-gray-900">{gettext("Import status is unavailable")}</h3>
+          <p class="mt-1 text-sm text-gray-600">
+            {gettext("Refresh the workflow status or start the import again.")}
+          </p>
+          <div class="mt-5 flex gap-3">
+            <.button type="button" variant={:secondary} size={:sm} phx-click="refresh_run">
+              {gettext("Refresh status")}
+            </.button>
+            <.button type="button" variant={:secondary} size={:sm} phx-click="reset_import">
+              {gettext("Start over")}
+            </.button>
+          </div>
+        </section>
+    <% end %>
+
+    <div
+      :if={status in [:analyzing, :awaiting_answers, :ready_for_review]}
+      class="mt-5"
+    >
+      <.button
+        id="discard-google-slides-import"
+        type="button"
+        variant={:secondary}
+        size={:sm}
+        phx-click="discard_import"
+        phx-disable-with={gettext("Discarding...")}
+        data-confirm={gettext("Discard this import plan and start over?")}
+      >
+        {gettext("Discard plan and start over")}
+      </.button>
+    </div>
+
+    <section :if={warnings(@run) != []} class="mt-6">
+      <h3 class="text-sm font-semibold text-gray-900">{gettext("Import warnings")}</h3>
+      <ul class="mt-2 space-y-2" role="status" aria-live="polite">
+        <li
+          :for={{warning, index} <- Enum.with_index(warnings(@run))}
+          data-warning-index={index}
+          class="rounded border border-yellow-200 bg-yellow-50 p-3 text-sm text-yellow-900"
+        >
+          {warning_message(warning)}
+        </li>
+      </ul>
+    </section>
+  <% end %>
+
+  <div
+    :if={@source_preview}
+    id="google-slides-source-preview"
+    class="fixed inset-0 z-50 overflow-y-auto bg-gray-950/75 p-4 sm:p-8"
+    role="dialog"
+    aria-modal="true"
+    aria-labelledby="google-slides-source-preview-title"
+    aria-describedby="google-slides-source-preview-description"
+    phx-window-keydown="close_source_preview"
+    phx-key="escape"
+  >
+    <div class="mx-auto flex min-h-full max-w-7xl items-center justify-center">
+      <div class="w-full overflow-hidden rounded-lg bg-white shadow-2xl">
+        <div class="flex flex-col gap-3 border-b border-gray-200 px-5 py-4 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <p class="text-xs font-semibold uppercase tracking-wide text-primary">
+              {gettext("Original Google Slides source")}
+            </p>
+            <h2
+              id="google-slides-source-preview-title"
+              class="mt-1 text-lg font-semibold text-gray-900"
+            >
+              {@source_preview.label}
+            </h2>
+            <p id="google-slides-source-preview-description" class="mt-1 text-sm text-gray-600">
+              <%= if @source_preview.overlay_style do %>
+                {gettext("The highlighted area is the content Torus needs you to review.")}
+              <% else %>
+                {gettext(
+                  "Review the full slide. Torus could not isolate this item to one visual area."
+                )}
+              <% end %>
+            </p>
+          </div>
+          <div class="flex shrink-0 items-center gap-2">
+            <.button
+              type="button"
+              variant={:secondary}
+              size={:sm}
+              phx-click="toggle_source_preview_zoom"
+              aria-pressed={to_string(@source_preview_zoomed?)}
+            >
+              <.icon
+                name={
+                  if(@source_preview_zoomed?,
+                    do: "hero-arrows-pointing-in",
+                    else: "hero-magnifying-glass-plus"
+                  )
+                }
+                class="mr-1 h-4 w-4"
+              />
+              <%= if @source_preview_zoomed? do %>
+                {gettext("Fit to window")}
+              <% else %>
+                {gettext("Magnify")}
+              <% end %>
+            </.button>
+            <.button
+              id="close-google-slides-source-preview"
+              type="button"
+              variant={:secondary}
+              size={:sm}
+              phx-click="close_source_preview"
+            >
+              <.icon name="hero-x-mark" class="mr-1 h-4 w-4" />
+              {gettext("Close")}
+            </.button>
+          </div>
+        </div>
+
+        <div class="bg-gray-100 p-4 sm:p-6">
+          <.async_result :let={image} assign={@source_preview_image}>
+            <:loading>
+              <div
+                id="google-slides-source-preview-loading"
+                class="flex min-h-80 items-center justify-center text-sm text-gray-700"
+                role="status"
+              >
+                <.icon name="hero-arrow-path" class="mr-2 h-5 w-5 motion-safe:animate-spin" />
+                {gettext("Loading the latest slide preview...")}
+              </div>
+            </:loading>
+            <:failed :let={_reason}>
+              <div
+                id="google-slides-source-preview-error"
+                class="rounded border border-yellow-300 bg-yellow-50 p-5 text-sm text-yellow-900"
+                role="alert"
+              >
+                <p class="font-semibold">
+                  {gettext("The slide preview is temporarily unavailable.")}
+                </p>
+                <p class="mt-1">
+                  {gettext(
+                    "You can still review the slide in the original Google Slides presentation."
+                  )}
+                </p>
+                <.link
+                  :if={@source_preview.original_url}
+                  href={@source_preview.original_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="mt-3 inline-block font-semibold text-primary hover:underline"
+                >
+                  {gettext("Open original slide")}
+                  <span class="sr-only">{gettext("(opens in a new tab)")}</span>
+                </.link>
+              </div>
+            </:failed>
+
+            <div
+              id="google-slides-source-preview-scroll"
+              class="max-h-[70vh] overflow-auto text-center"
+            >
+              <div
+                id="google-slides-source-preview-canvas"
+                class="relative mx-auto inline-block bg-white text-left shadow-lg"
+                style={source_preview_canvas_style(image, @source_preview_zoomed?)}
+              >
+                <img
+                  id="google-slides-source-preview-image"
+                  src={run_value(image, :url)}
+                  width={run_value(image, :width)}
+                  height={run_value(image, :height)}
+                  alt={source_preview_image_alt(@source_preview)}
+                  class="block h-auto w-full"
+                />
+                <span
+                  :if={@source_preview.overlay_style}
+                  id="google-slides-source-preview-highlight"
+                  class="pointer-events-none absolute border-4 border-red-600 bg-red-500/20 shadow-[0_0_0_3px_rgba(255,255,255,0.9)]"
+                  style={@source_preview.overlay_style}
+                  aria-hidden="true"
+                >
+                </span>
+              </div>
+            </div>
+          </.async_result>
+        </div>
+
+        <div
+          :if={@source_preview.subject}
+          class="border-t border-gray-200 bg-white px-5 py-4 text-sm text-gray-700"
+        >
+          <span class="font-semibold text-gray-900">{gettext("Highlighted content:")}</span>
+          {@source_preview.subject}
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

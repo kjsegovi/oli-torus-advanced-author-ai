@@ -7,12 +7,14 @@ defmodule Oli.GenAI.FeatureConfigTest do
   alias Oli.GenAI.FeatureConfig
 
   describe "features/0" do
-    test "lists :student_dialogue, :instructor_dashboard_recommendation, and :instructor_email" do
+    test "lists all supported product features" do
       features = FeatureConfig.features()
 
       assert :student_dialogue in features
       assert :instructor_dashboard_recommendation in features
       assert :instructor_email in features
+      assert :google_slides_import in features
+      assert :openstax_course_import in features
     end
   end
 
