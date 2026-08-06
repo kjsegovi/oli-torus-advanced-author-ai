@@ -8,7 +8,16 @@ defmodule Oli.OpenStax.CourseImport.Lesson do
   import Ecto.Changeset
 
   alias Oli.Accounts.Author
-  alias Oli.OpenStax.CourseImport.{LessonCheck, LessonPlan, LessonSource, Run, Unit}
+
+  alias Oli.OpenStax.CourseImport.{
+    EnrichmentProposal,
+    LessonCheck,
+    LessonPlan,
+    LessonSource,
+    Run,
+    SimulationArtifact,
+    Unit
+  }
 
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
@@ -30,6 +39,8 @@ defmodule Oli.OpenStax.CourseImport.Lesson do
     has_many :plans, LessonPlan, foreign_key: :lesson_id
     has_many :checks, LessonCheck, foreign_key: :lesson_id
     has_many :lesson_sources, LessonSource, foreign_key: :lesson_id
+    has_many :enrichment_proposals, EnrichmentProposal, foreign_key: :lesson_id
+    has_many :simulation_artifacts, SimulationArtifact, foreign_key: :lesson_id
 
     belongs_to :approved_by_author, Author, type: :id
 

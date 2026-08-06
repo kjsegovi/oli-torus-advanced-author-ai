@@ -7,7 +7,10 @@ defmodule Oli.OpenStax.CourseImport.Checks do
   validation remain hard requirements during apply.
   """
 
+  alias Oli.OpenStax.CourseImport.FullSource
+
   @check_types [:source_fidelity, :pedagogy_assessment, :torus_accessibility]
+  @v4_advanced_roles ~w(orientation prediction decision evidence exploration interpretation transfer remediation)
 
   # This intentionally favors a small, explainable grounding signal over a
   # broad similarity score. A claim only fails when it introduces at least two
@@ -17,15 +20,15 @@ defmodule Oli.OpenStax.CourseImport.Checks do
   @grounding_stop_words MapSet.new(~w(
     about accurately affect after again against also an and answer application
     applications apply are as at be been before begin best between beyond breaks by
-    can central change changes check checks choice choosing cited cites compare
+    both can central change changes check checks choice choosing cited cites compare
     comparison concept conclusion connect connection connects constraints continue
     continuing core could course decision defend definition describe demonstrate do
     down each evidence example examples examine explain explanation explains for from
-    give good guidance holds how idea ideas identify in instead introduction is
+    give good guidance holds how idea ideas identify in instead introduction is justify
     isolated it its learner lesson lesson's locate main mapped material matters more
     new objective of on only or our overview part practice predict prediction
     question real reason reasoning recalling related relevant response result review
-    section show shows situation solution source state steps strong student supported
+    section should show shows situation solution source state steps strong student supported
     supports take than that the their then these this through to transfer transfers
     trying unrelated use uses using what when where which why with work words your
   ))
@@ -109,14 +112,22 @@ defmodule Oli.OpenStax.CourseImport.Checks do
 
     advanced_blueprint_issues =
       if mode == "advanced" and v3_plan?(plan) do
-        validate_advanced_blueprint(lesson, content)
+        validate_advanced_blueprint(lesson, content, plan)
+      else
+        []
+      end
+
+    v4_contract_issues =
+      if v4_plan?(plan) do
+        validate_v4_question_contract(lesson, content, questions) ++
+          validate_v4_enrichment_proposals(lesson, plan)
       else
         []
       end
 
     instructional_words = instructional_word_count(content)
     rich_source? = rich_source?(lesson)
-    minimum_words = minimum_instructional_words(lesson)
+    minimum_words = minimum_instructional_words(lesson, plan)
     minimum_sections = if rich_source?, do: 4, else: 2
     minimum_questions = if rich_source?, do: 4, else: 2
     multiple_choice_count = Enum.count(questions, &(&1["type"] == "multiple_choice"))
@@ -137,7 +148,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
         "Add at least #{minimum_sections} substantive instructional sections before assessment"
       )
       |> maybe_add(
-        length(instructional_sections) > 7,
+        not v4_plan?(plan) and length(instructional_sections) > 7,
         "Limit a lesson to seven instructional sections and split it at an objective boundary"
       )
       |> maybe_add(
@@ -189,10 +200,12 @@ defmodule Oli.OpenStax.CourseImport.Checks do
         "Advanced lessons need a real exploration or decision screen and a remediation path"
       )
       |> Kernel.++(advanced_blueprint_issues)
+      |> Kernel.++(v4_contract_issues)
 
     result(:pedagogy_assessment, failures, %{
       "ensure_objective" => true,
-      "instructional_section_range" => [minimum_sections, 7],
+      "instructional_section_range" =>
+        if(v4_plan?(plan), do: [minimum_sections, nil], else: [minimum_sections, 7]),
       "minimum_instructional_words" => minimum_words,
       "ensure_worked_example" => true,
       "curiosity_prompt_range" => if(rich_source?, do: [2, 3], else: [0, 3]),
@@ -302,7 +315,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
   end
 
   defp block_coverage(lesson, plan) do
-    available_blocks = source_blocks(lesson)
+    available_blocks = source_blocks_for_plan(lesson, plan)
     available_ids = MapSet.new(Enum.map(available_blocks, & &1["id"]))
 
     if MapSet.size(available_ids) == 0 do
@@ -318,20 +331,34 @@ defmodule Oli.OpenStax.CourseImport.Checks do
       }
     else
       referenced_ids = referenced_block_ids(plan)
-      excluded = excluded_blocks(plan, available_ids)
+      excluded = excluded_blocks(lesson, plan, available_ids)
       excluded_ids = MapSet.new(Enum.map(excluded, & &1["id"]))
       known_referenced = MapSet.intersection(referenced_ids, available_ids)
       unknown_ids = MapSet.difference(referenced_ids, available_ids)
 
-      major_ids =
-        available_blocks
-        |> Enum.filter(&major_source_block?/1)
-        |> Enum.map(& &1["id"])
-        |> MapSet.new()
+      required_ids = required_source_block_ids(lesson, plan, available_blocks)
 
-      uncovered_major =
-        major_ids
+      missing_full_text_ids =
+        if v4_plan?(plan) do
+          missing_full_text_block_ids(
+            available_blocks,
+            required_ids,
+            excluded_ids,
+            content(plan)
+          )
+        else
+          []
+        end
+
+      uncovered_required =
+        required_ids
         |> MapSet.difference(MapSet.union(known_referenced, excluded_ids))
+
+      coverage_manifest = content(plan)["coverage_manifest"] || %{}
+      declared_unaccounted = MapSet.new(List.wrap(coverage_manifest["unaccounted_block_ids"]))
+
+      exclusion_issues =
+        if v4_plan?(plan), do: v4_exclusion_issues(lesson, plan, available_ids), else: []
 
       evidence_failures =
         []
@@ -352,9 +379,27 @@ defmodule Oli.OpenStax.CourseImport.Checks do
           "Every curiosity prompt, application problem, and Advanced screen must cite at least one source block"
         )
         |> maybe_add(
-          MapSet.size(uncovered_major) > 0,
-          "Cover or explicitly explain the exclusion of every objective, heading, callout, and figure"
+          MapSet.size(uncovered_required) > 0,
+          if(v4_plan?(plan),
+            do: "Include or validly exclude every substantive source block",
+            else:
+              "Cover or explicitly explain the exclusion of every objective, heading, callout, and figure"
+          )
         )
+        |> maybe_add(
+          missing_full_text_ids != [],
+          "Preserve the full learner-facing text of every substantive source block"
+        )
+        |> maybe_add(
+          v4_plan?(plan) and coverage_manifest["policy"] != "full_substantive_source",
+          "Schema v4 requires the full substantive source coverage policy"
+        )
+        |> maybe_add(
+          v4_plan?(plan) and
+            declared_unaccounted != uncovered_required,
+          "Schema v4 coverage must report the exact unaccounted substantive block ids"
+        )
+        |> Kernel.++(exclusion_issues)
 
       %{
         issues: Enum.reverse(evidence_failures),
@@ -363,7 +408,13 @@ defmodule Oli.OpenStax.CourseImport.Checks do
           "available_block_count" => MapSet.size(available_ids),
           "covered_block_count" => MapSet.size(known_referenced),
           "excluded_blocks" => excluded,
-          "uncovered_major_block_ids" => MapSet.to_list(uncovered_major) |> Enum.sort(),
+          "uncovered_major_block_ids" => MapSet.to_list(uncovered_required) |> Enum.sort(),
+          "uncovered_substantive_block_ids" =>
+            if(v4_plan?(plan),
+              do: MapSet.to_list(uncovered_required) |> Enum.sort(),
+              else: []
+            ),
+          "missing_full_text_block_ids" => missing_full_text_ids,
           "unknown_block_ids" => MapSet.to_list(unknown_ids) |> Enum.sort()
         }
       }
@@ -372,7 +423,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
 
   defp deterministic_grounding(lesson, plan, source_sections) do
     source_tokens = source_tokens(lesson)
-    source_blocks_by_id = Map.new(source_blocks(lesson), &{&1["id"], &1})
+    source_blocks_by_id = Map.new(source_blocks_for_plan(lesson, plan), &{&1["id"], &1})
 
     # A schema-v3-shaped fallback plan may still belong to a legacy URL/excerpt
     # run. Block-scoped V3 grounding is only meaningful when normalized source
@@ -741,7 +792,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
 
   defp rich_source?(lesson), do: source_blocks(lesson) != []
 
-  defp minimum_instructional_words(lesson) do
+  defp minimum_instructional_words(lesson, plan) do
     if rich_source?(lesson) do
       source_words =
         case lesson_value(lesson, :source_word_count) do
@@ -749,12 +800,28 @@ defmodule Oli.OpenStax.CourseImport.Checks do
           _ -> source_block_word_count(lesson)
         end
 
-      source_words
-      |> Kernel.*(0.6)
-      |> Float.ceil()
-      |> trunc()
-      |> max(600)
-      |> min(2_400)
+      if v4_plan?(plan) do
+        lesson
+        |> FullSource.substantive_text_blocks()
+        |> Enum.reject(fn block ->
+          Enum.any?(
+            excluded_blocks(lesson, plan, MapSet.new([block["id"]])),
+            &(&1["id"] == block["id"])
+          )
+        end)
+        |> Enum.map(& &1["text"])
+        |> Enum.join(" ")
+        |> String.split(~r/\s+/, trim: true)
+        |> length()
+        |> max(1)
+      else
+        source_words
+        |> Kernel.*(0.6)
+        |> Float.ceil()
+        |> trunc()
+        |> max(600)
+        |> min(2_400)
+      end
     else
       100
     end
@@ -768,6 +835,54 @@ defmodule Oli.OpenStax.CourseImport.Checks do
     |> String.split(~r/\s+/, trim: true)
     |> length()
   end
+
+  defp missing_full_text_block_ids(blocks, required_ids, excluded_ids, plan_content) do
+    rendered = plan_content |> learner_facing_instructional_text() |> FullSource.normalized_text()
+
+    blocks
+    |> Enum.filter(fn block ->
+      MapSet.member?(required_ids, block["id"]) and
+        not MapSet.member?(excluded_ids, block["id"]) and present?(block["text"])
+    end)
+    |> Enum.reject(fn block ->
+      source = FullSource.normalized_text(block["text"])
+      source != "" and String.contains?(rendered, source)
+    end)
+    |> Enum.map(& &1["id"])
+    |> Enum.sort()
+  end
+
+  defp learner_facing_instructional_text(content) do
+    fields = [
+      content["objective"],
+      content["learning_objectives"],
+      content["opening_hook"],
+      content["why_this_matters"],
+      content["narrative"],
+      content["instructional_sections"],
+      content["callouts"],
+      content["media"],
+      content["worked_examples"],
+      content["curiosity_prompts"],
+      content["application_problems"],
+      content["key_takeaways"]
+    ]
+
+    Enum.map_join(fields, " ", &learner_text_value/1)
+  end
+
+  defp learner_text_value(value) when is_binary(value), do: value
+
+  defp learner_text_value(value) when is_list(value),
+    do: Enum.map_join(value, " ", &learner_text_value/1)
+
+  defp learner_text_value(value) when is_map(value) do
+    ~w(heading title explanation body text alt caption credit scenario steps conclusion prompt)
+    |> Enum.map(&Map.get(value, &1))
+    |> Enum.map_join(" ", &learner_text_value/1)
+  end
+
+  defp learner_text_value(_value), do: ""
 
   defp invalid_question?(%{"type" => "multiple_choice"} = question) do
     choices = List.wrap(question["choices"])
@@ -788,6 +903,213 @@ defmodule Oli.OpenStax.CourseImport.Checks do
   end
 
   defp invalid_question?(_), do: true
+
+  defp validate_v4_question_contract(_lesson, content, questions) do
+    section_ids =
+      content
+      |> instructional_sections()
+      |> Enum.map(& &1["id"])
+      |> Enum.filter(&present?/1)
+      |> MapSet.new()
+
+    source_media_ids =
+      content
+      |> content_list("media")
+      |> Enum.map(fn
+        %{} = media ->
+          media["source_media_id"] || media["id"]
+
+        _ ->
+          nil
+      end)
+      |> Enum.filter(&present?/1)
+      |> MapSet.new()
+
+    Enum.flat_map(questions, fn question ->
+      question_id = question["id"] || "(unnamed)"
+      placement = question["placement"]
+      placement_id = if is_map(placement), do: placement["after_section_id"], else: nil
+      evidence_ids = normalize_block_ids(question)
+
+      evidence_ref_ids =
+        question
+        |> Map.get("evidence_refs", [])
+        |> List.wrap()
+        |> Enum.flat_map(fn
+          %{"kind" => "source_block", "id" => id} when is_binary(id) -> [id]
+          _ -> []
+        end)
+
+      media_ids = question["media_ids"]
+
+      []
+      |> maybe_add(
+        not is_map(placement) or not present?(placement_id) or
+          placement_id != question["placement_after_section_id"] or
+          not MapSet.member?(section_ids, placement_id),
+        "Schema v4 question #{inspect(question_id)} needs a stable valid placement reference"
+      )
+      |> maybe_add(
+        Enum.sort(Enum.uniq(evidence_ref_ids)) != Enum.sort(Enum.uniq(evidence_ids)),
+        "Schema v4 question #{inspect(question_id)} needs stable evidence references matching its source block ids"
+      )
+      |> maybe_add(
+        not is_list(media_ids) or
+          Enum.any?(List.wrap(media_ids), fn id ->
+            not present?(id) or not MapSet.member?(source_media_ids, id)
+          end),
+        "Schema v4 question #{inspect(question_id)} has invalid media references"
+      )
+      |> maybe_add(
+        not is_boolean(question["allow_not_sure"]) or
+          (question["allow_not_sure"] and question["type"] != "multiple_choice"),
+        "Schema v4 question #{inspect(question_id)} has an invalid Not sure contract"
+      )
+      |> maybe_add(
+        Map.has_key?(question, "hint") and not present?(question["hint"]),
+        "Schema v4 question #{inspect(question_id)} must omit an empty hint"
+      )
+    end)
+  end
+
+  defp validate_v4_enrichment_proposals(lesson, plan) do
+    proposals = Map.get(plan, "enrichment_proposals", [])
+    content = content(plan)
+
+    section_ids =
+      content
+      |> instructional_sections()
+      |> Enum.map(& &1["id"])
+      |> Enum.filter(&present?/1)
+      |> MapSet.new()
+
+    source_ids =
+      lesson
+      |> source_blocks_for_plan(plan)
+      |> Enum.map(& &1["id"])
+      |> MapSet.new()
+
+    source_urls =
+      (lesson_value(lesson, :source_evidence_links) || lesson_value(lesson, :source_sections) ||
+         [])
+      |> MapSet.new()
+
+    objectives =
+      content
+      |> Map.get("learning_objectives", [])
+      |> normalized_text_set()
+
+    base_issues =
+      []
+      |> maybe_add(not is_list(proposals), "Schema v4 enrichment proposals must be a list")
+      |> maybe_add(
+        is_list(proposals) and length(proposals) > 3,
+        "Limit enrichment proposals to three per lesson"
+      )
+      |> maybe_add(
+        is_list(proposals) and duplicate_ids?(Enum.filter(proposals, &is_map/1)),
+        "Give every enrichment proposal a stable unique id"
+      )
+
+    proposal_issues =
+      proposals
+      |> List.wrap()
+      |> Enum.flat_map(
+        &v4_enrichment_proposal_issues(&1, section_ids, source_ids, source_urls, objectives)
+      )
+
+    proposal_ids =
+      proposals
+      |> List.wrap()
+      |> Enum.flat_map(fn
+        %{"id" => id} when is_binary(id) -> [id]
+        _ -> []
+      end)
+      |> MapSet.new()
+
+    reference_issues =
+      content
+      |> advanced_blueprint_screens()
+      |> Enum.flat_map(fn screen ->
+        case screen["enrichment_proposal_id"] do
+          nil ->
+            []
+
+          id when is_binary(id) ->
+            if MapSet.member?(proposal_ids, id),
+              do: [],
+              else: ["Advanced screens may reference only a proposal declared for this lesson"]
+
+          _ ->
+            ["Advanced screens may reference only a proposal declared for this lesson"]
+        end
+      end)
+
+    base_issues ++ proposal_issues ++ reference_issues
+  end
+
+  defp v4_enrichment_proposal_issues(
+         proposal,
+         section_ids,
+         source_ids,
+         source_urls,
+         objectives
+       )
+       when is_map(proposal) do
+    proposal_id = proposal["id"] || "(unnamed)"
+    source_evidence = proposal["source_evidence"] || %{}
+    placement = proposal["placement"] || %{}
+    objective_ids = List.wrap(proposal["objective_ids"])
+    evidence_ids = List.wrap(source_evidence["block_ids"])
+    evidence_urls = List.wrap(source_evidence["source_urls"])
+
+    []
+    |> maybe_add(
+      proposal["kind"] not in [
+        "generated_simulation",
+        "existing_simulation",
+        "external_resource",
+        "article",
+        "video"
+      ],
+      "Enrichment proposal #{inspect(proposal_id)} uses an unsupported kind"
+    )
+    |> maybe_add(
+      not present?(proposal["instructional_rationale"]),
+      "Enrichment proposal #{inspect(proposal_id)} needs an instructional rationale"
+    )
+    |> maybe_add(
+      objective_ids == [] or
+        not MapSet.subset?(normalized_text_set(objective_ids), objectives),
+      "Enrichment proposal #{inspect(proposal_id)} must map to a lesson objective"
+    )
+    |> maybe_add(
+      evidence_ids == [] or Enum.any?(evidence_ids, &(not MapSet.member?(source_ids, &1))) or
+        evidence_urls == [] or Enum.any?(evidence_urls, &(not MapSet.member?(source_urls, &1))),
+      "Enrichment proposal #{inspect(proposal_id)} must cite valid lesson source evidence"
+    )
+    |> maybe_add(
+      not MapSet.member?(section_ids, placement["after_section_id"]),
+      "Enrichment proposal #{inspect(proposal_id)} needs a valid lesson placement"
+    )
+    |> maybe_add(
+      not present?(proposal["learner_task"]),
+      "Enrichment proposal #{inspect(proposal_id)} needs a learner task"
+    )
+    |> maybe_add(
+      not present?(proposal["research_query"]) or not is_map(proposal["research_evidence"]),
+      "Enrichment proposal #{inspect(proposal_id)} needs a research query and evidence map"
+    )
+  end
+
+  defp v4_enrichment_proposal_issues(
+         _proposal,
+         _section_ids,
+         _source_ids,
+         _source_urls,
+         _objectives
+       ),
+       do: ["Every schema v4 enrichment proposal must be an object"]
 
   defp objectives_assessed?([], _questions, _rich_source?), do: false
 
@@ -862,7 +1184,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
     |> MapSet.new()
   end
 
-  defp validate_advanced_blueprint(lesson, content) do
+  defp validate_advanced_blueprint(lesson, content, plan) do
     screens = advanced_blueprint_screens(content)
     remediation_paths = advanced_remediation_paths(content)
 
@@ -879,7 +1201,11 @@ defmodule Oli.OpenStax.CourseImport.Checks do
       |> Enum.filter(&present?/1)
 
     screen_id_set = MapSet.new(screen_ids)
-    available_block_ids = MapSet.new(Enum.map(source_blocks(lesson), & &1["id"]))
+
+    available_block_ids =
+      MapSet.new(Enum.map(source_blocks_for_plan(lesson, plan), & &1["id"]))
+
+    meaningful_screens = Enum.filter(screens, &meaningful_advanced_interaction?/1)
 
     []
     |> maybe_add(screens == [], "Add at least one Advanced Author screen")
@@ -891,9 +1217,19 @@ defmodule Oli.OpenStax.CourseImport.Checks do
       not Enum.any?(screens, &meaningful_advanced_interaction?/1),
       "Advanced lessons need a real exploration or decision screen"
     )
+    |> maybe_add(
+      v4_plan?(plan) and length(meaningful_screens) not in 2..4,
+      "Schema v4 Advanced lessons require two to four meaningful interactions"
+    )
+    |> maybe_add(
+      v4_plan?(plan) and not complete_v4_advanced_arc?(screens),
+      "Schema v4 Advanced interactions must cover prediction or decision, evidence or exploration, interpretation, and transfer"
+    )
     |> Kernel.++(
       screens
-      |> Enum.flat_map(&advanced_screen_issues(&1, section_ids, available_block_ids))
+      |> Enum.flat_map(
+        &advanced_screen_issues(&1, section_ids, available_block_ids, v4_plan?(plan))
+      )
     )
     |> Kernel.++(
       advanced_remediation_issues(
@@ -903,10 +1239,11 @@ defmodule Oli.OpenStax.CourseImport.Checks do
         section_ids
       )
     )
+    |> Kernel.++(v4_advanced_remediation_issues(meaningful_screens, remediation_paths, plan))
     |> Enum.uniq()
   end
 
-  defp advanced_screen_issues(screen, section_ids, available_block_ids) do
+  defp advanced_screen_issues(screen, section_ids, available_block_ids, v4?) do
     screen_id = screen["id"] || "(unnamed)"
     kind = screen["kind"]
     interaction_type = screen["interaction_type"]
@@ -941,6 +1278,18 @@ defmodule Oli.OpenStax.CourseImport.Checks do
       evidence_ids == [] or
         Enum.any?(evidence_ids, &(not MapSet.member?(available_block_ids, &1))),
       "Advanced screen #{inspect(screen_id)} must cite only valid source block ids"
+    )
+    |> maybe_add(
+      v4? and screen["role"] not in @v4_advanced_roles,
+      "Advanced screen #{inspect(screen_id)} needs a supported instructional role"
+    )
+    |> maybe_add(
+      v4? and invalid_enrichment_proposal_reference?(screen),
+      "Advanced screen #{inspect(screen_id)} may reference only one enrichment proposal identifier"
+    )
+    |> maybe_add(
+      v4? and model_authored_iframe_reference?(screen),
+      "Advanced screen #{inspect(screen_id)} must not contain a model-authored iframe or artifact URL"
     )
     |> Kernel.++(advanced_interaction_issues(screen, screen_id))
   end
@@ -1086,6 +1435,56 @@ defmodule Oli.OpenStax.CourseImport.Checks do
         MapSet.disjoint?(interaction_screen_ids, valid_path_sources),
       "At least one exploration or decision screen must have a valid remediation path"
     )
+  end
+
+  defp complete_v4_advanced_arc?(screens) do
+    roles = MapSet.new(Enum.map(screens, & &1["role"]))
+
+    Enum.any?(["prediction", "decision"], &MapSet.member?(roles, &1)) and
+      Enum.any?(["evidence", "exploration"], &MapSet.member?(roles, &1)) and
+      MapSet.member?(roles, "interpretation") and
+      MapSet.member?(roles, "transfer")
+  end
+
+  defp v4_advanced_remediation_issues(screens, remediation_paths, plan) do
+    if v4_plan?(plan) do
+      invalid? =
+        Enum.any?(screens, fn screen ->
+          screen_id = screen["id"]
+          target = screen["remediation_section_id"]
+
+          not present?(target) or
+            not Enum.any?(remediation_paths, fn
+              %{"from_question_id" => ^screen_id, "to_section_id" => ^target} -> true
+              _ -> false
+            end)
+        end)
+
+      if invalid?,
+        do: [
+          "Every schema v4 Advanced interaction must remediate to its exact instructional section"
+        ],
+        else: []
+    else
+      []
+    end
+  end
+
+  defp invalid_enrichment_proposal_reference?(screen) do
+    case Map.fetch(screen, "enrichment_proposal_id") do
+      :error -> false
+      {:ok, proposal_id} -> not present?(proposal_id)
+    end
+  end
+
+  defp model_authored_iframe_reference?(screen) do
+    forbidden_keys = ~w(url src iframe_url artifact_url storage_url approved_artifact_ref)
+
+    Enum.any?(forbidden_keys, &Map.has_key?(screen, &1)) or
+      case screen["configuration"] do
+        %{} = configuration -> Enum.any?(forbidden_keys, &Map.has_key?(configuration, &1))
+        _ -> false
+      end
   end
 
   defp advanced_blueprint_screens(content) when is_map(content) do
@@ -1266,6 +1665,49 @@ defmodule Oli.OpenStax.CourseImport.Checks do
     end)
   end
 
+  defp source_blocks_for_plan(lesson, plan) do
+    if v4_plan?(plan) do
+      lesson
+      |> lesson_value(:source_blocks)
+      |> recursive_source_blocks()
+    else
+      source_blocks(lesson)
+    end
+  end
+
+  defp recursive_source_blocks(blocks) do
+    blocks
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      %{} = block ->
+        id = block["id"] || block[:id]
+        kind = block["kind"] || block[:kind]
+        text = block["text"] || block[:text] || ""
+
+        direct =
+          if present?(id) and present?(kind),
+            do: [%{"id" => id, "kind" => kind, "text" => text}],
+            else: []
+
+        direct ++
+          recursive_source_blocks(block["blocks"] || block[:blocks]) ++
+          recursive_list_source_blocks(block["items"] || block[:items])
+
+      _ ->
+        []
+    end)
+    |> Enum.uniq_by(& &1["id"])
+  end
+
+  defp recursive_list_source_blocks(items) do
+    items
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      %{} = item -> recursive_source_blocks(item["children"] || item[:children])
+      _ -> []
+    end)
+  end
+
   defp referenced_block_ids(plan) do
     content = content(plan)
 
@@ -1284,21 +1726,88 @@ defmodule Oli.OpenStax.CourseImport.Checks do
     |> MapSet.new()
   end
 
-  defp excluded_blocks(plan, available_ids) do
+  defp excluded_blocks(lesson, plan, available_ids) do
     content(plan)
     |> Map.get("coverage_manifest", %{})
     |> Map.get("excluded_blocks", [])
     |> List.wrap()
     |> Enum.flat_map(fn
-      %{"id" => id, "reason" => reason}
+      %{"id" => id, "reason" => reason} = exclusion
       when is_binary(id) and is_binary(reason) ->
-        if MapSet.member?(available_ids, id) and String.trim(reason) != "",
-          do: [%{"id" => id, "reason" => String.trim(reason)}],
-          else: []
+        if MapSet.member?(available_ids, id) and String.trim(reason) != "" and
+             (not v4_plan?(plan) or valid_v4_exclusion?(lesson, exclusion)),
+           do:
+             if(v4_plan?(plan),
+               do: [Map.put(exclusion, "reason", String.trim(reason))],
+               else: [%{"id" => id, "reason" => String.trim(reason)}]
+             ),
+           else: []
 
       _ ->
         []
     end)
+  end
+
+  defp required_source_block_ids(lesson, plan, available_blocks) do
+    if v4_plan?(plan) do
+      available_ids = MapSet.new(Enum.map(available_blocks, & &1["id"]))
+
+      case get_in(lesson, ["source_coverage", "substantive_block_ids"]) do
+        ids when is_list(ids) and ids != [] ->
+          ids
+          |> Enum.filter(&is_binary/1)
+          |> MapSet.new()
+          |> MapSet.intersection(available_ids)
+
+        _ ->
+          available_blocks
+          |> Enum.reject(
+            &(&1["kind"] in ~w(navigation duplicated_boilerplate boilerplate unsafe_media))
+          )
+          |> Enum.map(& &1["id"])
+          |> MapSet.new()
+      end
+    else
+      available_blocks
+      |> Enum.filter(&major_source_block?/1)
+      |> Enum.map(& &1["id"])
+      |> MapSet.new()
+    end
+  end
+
+  defp valid_v4_exclusion?(lesson, exclusion) do
+    FullSource.deterministic_exclusion?(lesson, exclusion) or
+      valid_author_acknowledgement?(exclusion)
+  end
+
+  defp valid_author_acknowledgement?(exclusion) do
+    exclusion["author_acknowledged"] == true and
+      is_integer(exclusion["acknowledged_by_author_id"]) and
+      is_binary(exclusion["acknowledged_at"]) and
+      is_integer(exclusion["acknowledged_plan_version"])
+  end
+
+  defp v4_exclusion_issues(lesson, plan, available_ids) do
+    invalid? =
+      content(plan)
+      |> Map.get("coverage_manifest", %{})
+      |> Map.get("excluded_blocks", [])
+      |> List.wrap()
+      |> Enum.any?(fn
+        %{"id" => id, "reason" => reason} = exclusion
+        when is_binary(id) and is_binary(reason) ->
+          not MapSet.member?(available_ids, id) or String.trim(reason) == "" or
+            not valid_v4_exclusion?(lesson, exclusion)
+
+        _ ->
+          true
+      end)
+
+    if invalid?,
+      do: [
+        "Schema v4 exclusions need a deterministic reason code or explicit author acknowledgement"
+      ],
+      else: []
   end
 
   defp major_source_block?(%{"kind" => kind})
@@ -1338,7 +1847,15 @@ defmodule Oli.OpenStax.CourseImport.Checks do
   defp v3_plan?(plan) do
     case content(plan)["schema_version"] do
       version when is_integer(version) -> version >= 3
-      version when is_binary(version) -> version in ["3", "v3"]
+      version when is_binary(version) -> version in ["3", "4", "v3", "v4"]
+      _ -> false
+    end
+  end
+
+  defp v4_plan?(plan) do
+    case content(plan)["schema_version"] do
+      version when is_integer(version) -> version >= 4
+      version when is_binary(version) -> version in ["4", "v4"]
       _ -> false
     end
   end

@@ -7,13 +7,18 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
   Author pages.
   """
 
-  alias Oli.OpenStax.CourseImport.AuthoringCompiler
+  alias Oli.OpenStax.CourseImport.{AuthoringCompiler, Enrichment}
 
   @spec dry_run(map()) :: {:ok, map()} | {:error, term()}
   def dry_run(run), do: dry_run(run, [])
 
   @spec dry_run(map(), keyword()) :: {:ok, map()} | {:error, term()}
   def dry_run(%{units: units} = run, opts) when is_list(units) and is_list(opts) do
+    opts =
+      opts
+      |> put_run_plan_schema_version(run)
+      |> put_preloaded_enrichments(run)
+
     with false <- Enum.empty?(units),
          {:ok, compiled_units} <- compile_units(units, opts) do
       {:ok,
@@ -70,11 +75,19 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
 
     with false <- is_nil(plan),
          true <- plan.approved_by_user,
+         {:ok, content_payload} <-
+           inject_approved_enrichments(
+             plan.content_payload,
+             lesson.run_id,
+             lesson.id,
+             lesson.plan_mode,
+             opts
+           ),
          {:ok, artifact} <-
            AuthoringCompiler.compile(
              lesson.plan_mode,
              lesson.title,
-             plan.content_payload,
+             content_payload,
              plan.questions_payload,
              lesson.id,
              opts
@@ -85,7 +98,7 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
            "lesson_id" => lesson.id,
            "title" => lesson.title,
            "mode" => lesson.plan_mode,
-           "content_payload" => plan.content_payload,
+           "content_payload" => content_payload,
            "questions_payload" => plan.questions_payload,
            "source_evidence_links" => lesson.source_evidence_links
          },
@@ -100,6 +113,207 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
   end
 
   defp compile_lesson(lesson, _opts), do: {:error, {:lesson_not_approved, lesson.id}}
+
+  defp inject_approved_enrichments(content, run_id, lesson_id, plan_mode, opts)
+       when is_map(content) do
+    case Keyword.get(opts, :plan_schema_version) do
+      version when is_integer(version) and version >= 4 ->
+        if content["schema_version"] == 4 do
+          inject_v4_enrichments(content, run_id, lesson_id, plan_mode, opts)
+        else
+          {:error, :plan_schema_version_mismatch}
+        end
+
+      _legacy ->
+        {:ok, content}
+    end
+  end
+
+  defp inject_approved_enrichments(content, _run_id, _lesson_id, _plan_mode, _opts),
+    do: {:ok, content}
+
+  defp inject_v4_enrichments(content, run_id, lesson_id, plan_mode, opts) do
+    proposals =
+      proposals_for_lesson(opts, run_id, lesson_id)
+      |> Enum.filter(&(&1.state == "approved"))
+
+    generated = Enum.filter(proposals, &(&1.kind == "generated_simulation"))
+    curated = Enum.reject(proposals, &(&1.kind == "generated_simulation"))
+
+    with {:ok, content} <- inject_curated_proposals(content, curated) do
+      cond do
+        generated == [] ->
+          {:ok, content}
+
+        plan_mode != "advanced" ->
+          {:error, :generated_enrichment_requires_advanced_authoring}
+
+        true ->
+          inject_generated_proposals(content, generated)
+      end
+    end
+  end
+
+  defp put_run_plan_schema_version(opts, run) do
+    case Map.get(run, :plan_schema_version) do
+      version when is_integer(version) -> Keyword.put_new(opts, :plan_schema_version, version)
+      _ -> opts
+    end
+  end
+
+  defp put_preloaded_enrichments(opts, run) do
+    case Map.get(run, :enrichment_proposals) do
+      proposals when is_list(proposals) ->
+        opts
+        |> Keyword.put_new(
+          :enrichment_proposals_by_lesson,
+          Enum.group_by(proposals, & &1.lesson_id)
+        )
+        |> put_preloaded_artifact_resolver(proposals)
+
+      _not_loaded ->
+        opts
+    end
+  end
+
+  defp put_preloaded_artifact_resolver(opts, proposals) do
+    if Enum.all?(proposals, &is_list(Map.get(&1, :simulation_artifacts))) do
+      approved_by_proposal =
+        proposals
+        |> Enum.flat_map(&Map.get(&1, :simulation_artifacts, []))
+        |> Enum.filter(&(&1.status == "approved"))
+        |> Map.new(&{&1.proposal_id, &1})
+
+      Keyword.put_new(opts, :simulation_artifact_resolver, fn proposal_id ->
+        case Map.fetch(approved_by_proposal, proposal_id) do
+          {:ok, artifact} -> {:ok, artifact}
+          :error -> {:error, :artifact_not_approved}
+        end
+      end)
+    else
+      opts
+    end
+  end
+
+  defp proposals_for_lesson(opts, run_id, lesson_id) do
+    case Keyword.fetch(opts, :enrichment_proposals_by_lesson) do
+      {:ok, by_lesson} when is_map(by_lesson) -> Map.get(by_lesson, lesson_id, [])
+      _ -> Enrichment.list_proposals(run_id, lesson_id)
+    end
+  end
+
+  defp inject_generated_proposals(content, proposals) do
+    screens = get_in(content, ["advanced_blueprint", "screens"]) |> List.wrap()
+
+    proposals
+    |> Enum.reduce_while({:ok, screens, MapSet.new()}, fn proposal, {:ok, current, occupied} ->
+      placement = proposal.placement["after_section_id"] || proposal.placement[:after_section_id]
+
+      with {:ok, index} <- enrichment_screen_index(current, placement, occupied) do
+        updated =
+          List.update_at(current, index, &Map.put(&1, "enrichment_proposal_id", proposal.id))
+
+        {:cont, {:ok, updated, MapSet.put(occupied, index)}}
+      else
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, injected, _occupied} ->
+        {:ok, put_in(content, ["advanced_blueprint", "screens"], injected)}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp inject_curated_proposals(content, proposals) do
+    content = strip_enrichment_references(content)
+
+    proposals
+    |> Enum.sort_by(& &1.rank)
+    |> Enum.reduce_while({:ok, []}, fn proposal, {:ok, acc} ->
+      case curated_proposal_payload(proposal) do
+        {:ok, payload} -> {:cont, {:ok, acc ++ [payload]}}
+        {:error, reason} -> {:halt, {:error, reason}}
+      end
+    end)
+    |> case do
+      {:ok, curated} -> {:ok, Map.put(content, "curated_enrichments", curated)}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp curated_proposal_payload(proposal) do
+    with "completed" <- proposal.research_status,
+         evidence when is_map(evidence) and map_size(evidence) > 0 <- proposal.research_evidence,
+         {:ok, url} <- safe_curated_url(proposal.resource_url) do
+      uri = URI.parse(url)
+
+      {:ok,
+       %{
+         "proposal_id" => proposal.id,
+         "kind" => proposal.kind,
+         "delivery_mode" => "annotated_link",
+         "title" => proposal.resource_title || uri.host,
+         "url" => url,
+         "annotation" => proposal.instructional_rationale,
+         "learner_task" => proposal.learner_task,
+         "objective_ids" => proposal.objective_ids,
+         "placement" => proposal.placement,
+         "research_evidence" => evidence
+       }}
+    else
+      _ -> {:error, {:approved_curated_enrichment_invalid, proposal.id}}
+    end
+  end
+
+  defp safe_curated_url(url) when is_binary(url) do
+    with %URI{scheme: "https", host: host, userinfo: nil} = uri <- URI.parse(String.trim(url)),
+         true <- is_binary(host) and host != "",
+         true <- is_nil(uri.port) or uri.port == 443 do
+      {:ok, URI.to_string(uri)}
+    else
+      _ -> {:error, :unsafe_curated_resource_url}
+    end
+  end
+
+  defp safe_curated_url(_), do: {:error, :unsafe_curated_resource_url}
+
+  defp enrichment_screen_index(screens, placement, occupied) do
+    preferred_roles = ~w(evidence exploration interpretation transfer)
+
+    candidates =
+      screens
+      |> Enum.with_index()
+      |> Enum.filter(fn {screen, index} ->
+        not MapSet.member?(occupied, index) and
+          screen["placement_after_section_id"] == placement
+      end)
+
+    selected =
+      Enum.find(candidates, fn {screen, _index} -> screen["role"] in preferred_roles end) ||
+        List.first(candidates)
+
+    case selected do
+      {_screen, index} -> {:ok, index}
+      nil -> {:error, {:approved_enrichment_placement_invalid, placement}}
+    end
+  end
+
+  defp strip_enrichment_references(content) do
+    content
+    |> Map.delete("curated_enrichments")
+    |> update_in(
+      [Access.key("advanced_blueprint", %{}), Access.key("screens", [])],
+      fn screens ->
+        Enum.map(List.wrap(screens), fn
+          screen when is_map(screen) -> Map.delete(screen, "enrichment_proposal_id")
+          screen -> screen
+        end)
+      end
+    )
+  end
 
   defp compile_assessment(unit, opts) do
     assessment = unit.assessment_payload || %{}

@@ -50,6 +50,14 @@ config :oli,
          openstax_rich_content_v3_default
        )
 
+config :oli,
+       :openstax_refined_planning_v4_enabled,
+       get_env_as_boolean.("OPENSTAX_REFINED_PLANNING_V4_ENABLED", "false")
+
+config :oli,
+       :openstax_generated_enrichment_enabled,
+       get_env_as_boolean.("OPENSTAX_GENERATED_ENRICHMENT_ENABLED", "false")
+
 openstax_course_import_max_parallel_lessons =
   case System.get_env("OPENSTAX_COURSE_IMPORT_MAX_PARALLEL_LESSONS", "3")
        |> String.trim()
@@ -459,6 +467,29 @@ if runtime_env == :prod do
       For example: your_s3_media_bucket_url.s3.amazonaws.com
       """
 
+  # Generated bundles must use a dedicated origin rather than inheriting the
+  # general media origin. When this is not configured, generated enrichment is
+  # visibly unavailable while the core importer continues normally.
+  generated_simulation_origin = System.get_env("GENERATED_SIMULATION_ORIGIN")
+
+  enrichment_generator =
+    case System.get_env("OPENSTAX_ENRICHMENT_GENERATOR", "disabled") do
+      "template" -> Oli.OpenStax.CourseImport.Enrichment.Generator.Template
+      _ -> Oli.OpenStax.CourseImport.Enrichment.Generator.Disabled
+    end
+
+  enrichment_resource_catalog =
+    case System.get_env("OPENSTAX_ENRICHMENT_RESOURCE_CATALOG") do
+      nil ->
+        []
+
+      json ->
+        case Jason.decode(json) do
+          {:ok, entries} when is_list(entries) -> entries
+          _ -> []
+        end
+    end
+
   cloak_vault_key =
     System.get_env("CLOAK_VAULT_KEY") ||
       raise """
@@ -476,6 +507,16 @@ if runtime_env == :prod do
     s3_media_bucket_name: s3_media_bucket_name,
     s3_xapi_bucket_name: s3_xapi_bucket_name,
     media_url: media_url,
+    openstax_generated_simulation_origin: generated_simulation_origin,
+    generated_simulation_origins: List.wrap(generated_simulation_origin),
+    openstax_generated_simulation_csp_header_enforced:
+      get_env_as_boolean.("GENERATED_SIMULATION_CSP_HEADER_ENFORCED", "false"),
+    openstax_enrichment_generator: enrichment_generator,
+    openstax_enrichment_research: Oli.OpenStax.CourseImport.Enrichment.Research.Catalog,
+    openstax_enrichment_resource_catalog: enrichment_resource_catalog,
+    openstax_enrichment_sandbox: Oli.OpenStax.CourseImport.Enrichment.Sandbox.LocalContainer,
+    openstax_enrichment_artifact_storage:
+      Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media,
     email_from_name: System.get_env("EMAIL_FROM_NAME", "OLI Torus"),
     email_from_address: System.get_env("EMAIL_FROM_ADDRESS", "admin@example.edu"),
     email_errors_to_address: System.get_env("EMAIL_ERRORS_TO_ADDRESS"),
@@ -763,7 +804,12 @@ if runtime_env == :prod do
            args: %{refresh_all: true}, queue: :default},
           {"*/5 * * * *", Oli.OpenStax.CourseImport.Worker.NotificationDispatchWorker,
            queue: :course_import},
-          {"*/5 * * * *", Oli.OpenStax.CourseImport.Worker.RunHealthWorker, queue: :course_import}
+          {"*/5 * * * *", Oli.OpenStax.CourseImport.Worker.RunHealthWorker,
+           queue: :course_import},
+          {"*/15 * * * *", Oli.OpenStax.CourseImport.Worker.EnrichmentRecoveryWorker,
+           queue: :course_import_enrichment},
+          {"17 3 * * *", Oli.OpenStax.CourseImport.Worker.EnrichmentOrphanCleanupWorker,
+           queue: :course_import_enrichment}
         ]
       }
     ],
@@ -791,6 +837,8 @@ if runtime_env == :prod do
         String.to_integer(System.get_env("OBAN_QUEUE_SIZE_COURSE_IMPORT_AI", "6")),
       course_import_media:
         String.to_integer(System.get_env("OBAN_QUEUE_SIZE_COURSE_IMPORT_MEDIA", "1")),
+      course_import_enrichment:
+        String.to_integer(System.get_env("OBAN_QUEUE_SIZE_COURSE_IMPORT_ENRICHMENT", "1")),
       certificate_eligibility:
         String.to_integer(System.get_env("OBAN_QUEUE_SIZE_CERTIFICATE_ELIGIBILITY", "10"))
     ]

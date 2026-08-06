@@ -19,6 +19,9 @@ defmodule Oli.OpenStax.CourseImport do
     AIPlanner,
     Checks,
     Compiler,
+    Enrichment,
+    EnrichmentProposal,
+    FullSource,
     Lesson,
     LessonCheck,
     LessonPlan,
@@ -29,6 +32,7 @@ defmodule Oli.OpenStax.CourseImport do
     PubSub,
     RichSource,
     Run,
+    SimulationArtifact,
     SourceAsset,
     Telemetry,
     Unit
@@ -36,13 +40,17 @@ defmodule Oli.OpenStax.CourseImport do
 
   alias Oli.OpenStax.CourseImport.Worker.{
     ApplyWorker,
+    EnrichmentResearchWorker,
     LessonPlanningCoordinatorWorker,
     LessonPlanWorker,
     LessonPlannerWorker,
     MediaWorker,
     OutlineWorker,
-    PreflightWorker
+    PreflightWorker,
+    SimulationGenerationWorker
   }
+
+  alias Oli.OpenStax.CourseImport.Enrichment.{ArtifactStorage, Generator, Research, Sandbox}
 
   alias Oli.Publishing.AuthoringResolver
   alias Oli.Publishing
@@ -94,6 +102,48 @@ defmodule Oli.OpenStax.CourseImport do
   end
 
   def available?(_, _), do: false
+
+  @doc "Returns project-scoped enrichment availability for the author review UI."
+  @spec enrichment_capabilities(Project.t()) :: map()
+  def enrichment_capabilities(%Project{} = project) do
+    generated_enabled =
+      Application.get_env(:oli, :openstax_generated_enrichment_enabled, false) or
+        ScopedFeatureFlags.enabled?(:openstax_generated_enrichment, project)
+
+    generator_available = Generator.available?()
+    sandbox_available = Sandbox.available?()
+    storage_available = ArtifactStorage.available?()
+
+    %{
+      generated_enabled: generated_enabled,
+      generator_available: generator_available,
+      sandbox_available: sandbox_available,
+      storage_available: storage_available,
+      generated_available:
+        generated_enabled and generator_available and sandbox_available and storage_available,
+      research_available: Research.available?()
+    }
+  rescue
+    _ ->
+      %{
+        generated_enabled: false,
+        generator_available: false,
+        sandbox_available: false,
+        storage_available: false,
+        generated_available: false,
+        research_available: false
+      }
+  end
+
+  def enrichment_capabilities(_),
+    do: %{
+      generated_enabled: false,
+      generator_available: false,
+      sandbox_available: false,
+      storage_available: false,
+      generated_available: false,
+      research_available: false
+    }
 
   @spec start_import(Project.t(), Revision.t() | integer(), Author.t(), String.t()) ::
           {:ok, Run.t()} | {:error, term()}
@@ -323,6 +373,12 @@ defmodule Oli.OpenStax.CourseImport do
           plan = latest_plan_or_nil(lesson.id) || Repo.rollback(:missing_lesson_plan)
           :ok = rollback_unless_ok(ensure_plan_approvable(plan))
           now = DateTime.utc_now()
+          plan = acknowledged_plan_for_approval!(lesson, plan, author, now)
+
+          :ok =
+            rollback_unless_ok(
+              ensure_v4_full_source_approvable(lesson, plan, locked_run.plan_schema_version)
+            )
 
           approved_lesson =
             lesson
@@ -332,6 +388,7 @@ defmodule Oli.OpenStax.CourseImport do
               approved_at: now,
               planning_state: "completed",
               planning_error: nil,
+              last_plan_version: plan.version,
               planning_finished_at: lesson.planning_finished_at || now
             })
             |> Repo.update!()
@@ -370,6 +427,135 @@ defmodule Oli.OpenStax.CourseImport do
     end
   end
 
+  defp acknowledged_plan_for_approval!(lesson, plan, author, now) do
+    source_context = lesson_source_context(lesson)
+
+    exclusions =
+      get_in(plan.content_payload, ["coverage_manifest", "excluded_blocks"])
+      |> List.wrap()
+
+    if Enum.any?(
+         exclusions,
+         &exclusion_needs_acknowledgement?(source_context, &1, plan.version)
+       ) do
+      version = next_plan_version(lesson.id)
+
+      {acknowledged_exclusions, acknowledgements} =
+        Enum.map_reduce(exclusions, [], fn exclusion, history ->
+          if exclusion_needs_acknowledgement?(source_context, exclusion, plan.version) do
+            acknowledgement = %{
+              "exclusion_id" => exclusion["id"],
+              "author_id" => author.id,
+              "acknowledged_at" => DateTime.to_iso8601(now),
+              "plan_version" => version,
+              "reason" => exclusion["reason"]
+            }
+
+            updated =
+              exclusion
+              |> Map.put("author_acknowledged", true)
+              |> Map.put("acknowledged_by_author_id", author.id)
+              |> Map.put("acknowledged_at", DateTime.to_iso8601(now))
+              |> Map.put("acknowledged_plan_version", version)
+
+            {updated, history ++ [acknowledgement]}
+          else
+            {exclusion, history}
+          end
+        end)
+
+      content_payload =
+        put_in(
+          plan.content_payload,
+          ["coverage_manifest", "excluded_blocks"],
+          acknowledged_exclusions
+        )
+
+      payload = %{
+        "content_payload" => content_payload,
+        "questions_payload" => plan.questions_payload
+      }
+
+      results = Checks.run(source_context, payload)
+
+      acknowledged_plan =
+        %LessonPlan{}
+        |> LessonPlan.changeset(%{
+          lesson_id: lesson.id,
+          version: version,
+          content_payload: content_payload,
+          questions_payload: plan.questions_payload,
+          checks_snapshot: checks_snapshot(results),
+          created_by: "author",
+          approved_by_user: false,
+          exclusion_acknowledgements: acknowledgements
+        })
+        |> Repo.insert!()
+
+      persist_checks!(lesson.id, version, results)
+      acknowledged_plan
+    else
+      plan
+    end
+  end
+
+  defp exclusion_needs_acknowledgement?(source_context, exclusion, plan_version)
+       when is_map(exclusion) do
+    not FullSource.deterministic_exclusion?(source_context, exclusion) and
+      (exclusion["author_acknowledged"] != true or
+         not is_integer(exclusion["acknowledged_by_author_id"]) or
+         not is_binary(exclusion["acknowledged_at"]) or
+         exclusion["acknowledged_plan_version"] != plan_version)
+  end
+
+  defp exclusion_needs_acknowledgement?(_source_context, _exclusion, _plan_version), do: false
+
+  defp ensure_v4_full_source_approvable(
+         lesson,
+         %LessonPlan{} = plan,
+         run_plan_schema_version
+       )
+       when is_integer(run_plan_schema_version) and run_plan_schema_version >= 4 do
+    if plan.content_payload["schema_version"] != 4 do
+      {:error, :plan_schema_version_mismatch}
+    else
+      results =
+        Checks.run(lesson_source_context(lesson), %{
+          "content_payload" => plan.content_payload,
+          "questions_payload" => plan.questions_payload
+        })
+
+      coverage =
+        results
+        |> Enum.find(&(&1.check_type == "source_fidelity"))
+        |> case do
+          nil -> %{}
+          result -> get_in(result, [:findings, "evaluation", "coverage"]) || %{}
+        end
+
+      uncovered = List.wrap(coverage["uncovered_substantive_block_ids"])
+      missing_text = List.wrap(coverage["missing_full_text_block_ids"])
+
+      declared_unaccounted =
+        get_in(plan.content_payload, ["coverage_manifest", "unaccounted_block_ids"])
+        |> List.wrap()
+
+      if uncovered == [] and missing_text == [] and declared_unaccounted == [] do
+        :ok
+      else
+        {:error,
+         {:full_source_coverage_incomplete,
+          %{
+            uncovered_block_ids: uncovered,
+            missing_full_text_block_ids: missing_text,
+            declared_unaccounted_block_ids: declared_unaccounted
+          }}}
+      end
+    end
+  end
+
+  defp ensure_v4_full_source_approvable(_lesson, %LessonPlan{}, _run_plan_schema_version), do: :ok
+
   @spec approve_all_lessons(Run.t() | Ecto.UUID.t(), Author.t()) ::
           {:ok, Run.t()} | {:error, term()}
   def approve_all_lessons(%Run{id: run_id}, %Author{} = author),
@@ -388,7 +574,9 @@ defmodule Oli.OpenStax.CourseImport do
           {:error, :no_lessons_to_approve}
 
         all_lessons_approved?(run.id) ->
-          transition_to_compiling_if_ready(run.id)
+          with :ok <- Enrichment.ensure_generation_complete(run.id) do
+            transition_to_compiling_if_ready(run.id)
+          end
 
         true ->
           {:error, :lessons_pending_approval}
@@ -457,6 +645,154 @@ defmodule Oli.OpenStax.CourseImport do
 
   def reject_lesson(_, _, _, _), do: {:error, :invalid_input}
 
+  @spec approve_enrichment_proposal(Ecto.UUID.t(), Ecto.UUID.t(), Author.t()) ::
+          {:ok, EnrichmentProposal.t()} | {:error, term()}
+  def approve_enrichment_proposal(run_id, proposal_id, %Author{} = author)
+      when is_binary(run_id) and is_binary(proposal_id) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval),
+         {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
+         true <- proposal.run_id == run.id,
+         :ok <- ensure_generated_proposal_available(run, proposal) do
+      Enrichment.approve_proposal(proposal.id, author)
+    else
+      false -> {:error, :not_found}
+      {:error, _} = error -> error
+    end
+  end
+
+  def approve_enrichment_proposal(_, _, _), do: {:error, :invalid_input}
+
+  @spec request_enrichment_research(Ecto.UUID.t(), Ecto.UUID.t(), Author.t()) ::
+          {:ok, EnrichmentProposal.t()} | {:error, term()}
+  def request_enrichment_research(run_id, proposal_id, %Author{} = author)
+      when is_binary(run_id) and is_binary(proposal_id) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval),
+         true <- enrichment_capabilities(run_project(run)).research_available,
+         {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
+         true <- proposal.run_id == run.id and proposal.state == "proposed",
+         true <- proposal.research_status not in ["running", "completed"],
+         {:ok, _job} <-
+           Oban.insert(
+             EnrichmentResearchWorker.new(%{
+               "proposal_id" => proposal.id,
+               "run_id" => run.id
+             })
+           ) do
+      {:ok, proposal}
+    else
+      false -> {:error, :research_unavailable}
+      {:error, _} = error -> error
+    end
+  end
+
+  def request_enrichment_research(_, _, _), do: {:error, :invalid_input}
+
+  @spec omit_enrichment_proposal(Ecto.UUID.t(), Ecto.UUID.t(), Author.t(), String.t()) ::
+          {:ok, EnrichmentProposal.t()} | {:error, term()}
+  def omit_enrichment_proposal(
+        run_id,
+        proposal_id,
+        author,
+        reason \\ "Omitted during lesson review"
+      )
+
+  def omit_enrichment_proposal(run_id, proposal_id, %Author{} = author, reason)
+      when is_binary(run_id) and is_binary(proposal_id) and is_binary(reason) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval),
+         {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
+         true <- proposal.run_id == run.id,
+         {:ok, omitted} <- Enrichment.omit_proposal(proposal.id, author, reason) do
+      maybe_advance_after_enrichment_decision(run)
+      {:ok, omitted}
+    else
+      false -> {:error, :not_found}
+      {:error, _} = error -> error
+    end
+  end
+
+  def omit_enrichment_proposal(_, _, _, _), do: {:error, :invalid_input}
+
+  @spec request_simulation_generation(Ecto.UUID.t(), Ecto.UUID.t(), Author.t()) ::
+          {:ok, SimulationArtifact.t()} | {:error, term()}
+  def request_simulation_generation(run_id, proposal_id, %Author{} = author)
+      when is_binary(run_id) and is_binary(proposal_id) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval),
+         true <- enrichment_capabilities(run_project(run)).generated_available,
+         {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
+         true <- proposal.run_id == run.id,
+         true <- proposal.kind == "generated_simulation" and proposal.state == "approved",
+         false <- active_simulation_artifact?(proposal.id) do
+      case Repo.transaction(fn ->
+             with {:ok, artifact} <- Enrichment.begin_artifact_generation(proposal.id),
+                  {:ok, _job} <-
+                    Oban.insert(
+                      SimulationGenerationWorker.new(%{
+                        "artifact_id" => artifact.id,
+                        "run_id" => run.id
+                      })
+                    ) do
+               artifact
+             else
+               {:error, reason} -> Repo.rollback(reason)
+             end
+           end) do
+        {:ok, artifact} -> {:ok, artifact}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      false ->
+        {:error, :simulation_generation_unavailable}
+
+      true ->
+        {:error, :simulation_generation_in_progress}
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  def request_simulation_generation(_, _, _), do: {:error, :invalid_input}
+
+  @spec approve_simulation_artifact(Ecto.UUID.t(), Ecto.UUID.t(), Author.t()) ::
+          {:ok, SimulationArtifact.t()} | {:error, term()}
+  def approve_simulation_artifact(run_id, artifact_id, %Author{} = author)
+      when is_binary(run_id) and is_binary(artifact_id) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval),
+         %SimulationArtifact{run_id: ^run_id} <- Repo.get(SimulationArtifact, artifact_id),
+         {:ok, artifact} <- Enrichment.approve_artifact(artifact_id, author) do
+      maybe_advance_after_enrichment_decision(run)
+      {:ok, artifact}
+    else
+      nil -> {:error, :not_found}
+      %SimulationArtifact{} -> {:error, :not_found}
+      {:error, _} = error -> error
+    end
+  end
+
+  def approve_simulation_artifact(_, _, _), do: {:error, :invalid_input}
+
+  @spec reject_simulation_artifact(Ecto.UUID.t(), Ecto.UUID.t(), Author.t(), String.t()) ::
+          {:ok, SimulationArtifact.t()} | {:error, term()}
+  def reject_simulation_artifact(run_id, artifact_id, %Author{} = author, reason)
+      when is_binary(run_id) and is_binary(artifact_id) and is_binary(reason) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval),
+         %SimulationArtifact{run_id: ^run_id} <- Repo.get(SimulationArtifact, artifact_id) do
+      Enrichment.reject_artifact(artifact_id, author, reason)
+    else
+      nil -> {:error, :not_found}
+      %SimulationArtifact{} -> {:error, :not_found}
+      {:error, _} = error -> error
+    end
+  end
+
+  def reject_simulation_artifact(_, _, _, _), do: {:error, :invalid_input}
+
   @spec regenerate_lesson(Ecto.UUID.t(), Ecto.UUID.t(), Author.t()) ::
           {:ok, Lesson.t()} | {:error, term()}
   def regenerate_lesson(run_id, lesson_id, %Author{} = author) do
@@ -510,6 +846,7 @@ defmodule Oli.OpenStax.CourseImport do
     with {:ok, run} <- get_run(project, author, run_id),
          :ok <- ensure_status(run.status, :compiling),
          true <- all_lessons_approved?(run.id),
+         :ok <- Enrichment.ensure_generation_complete(run.id),
          :ok <- ensure_project_root_empty(project, run.target_root_container_resource_id) do
       planned_media_ids = planned_required_media_ids(run)
 
@@ -875,11 +1212,19 @@ defmodule Oli.OpenStax.CourseImport do
 
   @doc false
   def rich_content_versions(%Project{} = project) do
-    enabled? =
+    refined_v4_enabled? =
+      Application.get_env(:oli, :openstax_refined_planning_v4_enabled, false) or
+        ScopedFeatureFlags.enabled?(:openstax_refined_planning_v4, project)
+
+    rich_v3_enabled? =
       Application.get_env(:oli, :openstax_rich_content_v3_enabled, false) or
         ScopedFeatureFlags.enabled?(:openstax_rich_content_v3, project)
 
-    if enabled?, do: {2, 3}, else: {1, 2}
+    cond do
+      refined_v4_enabled? -> {2, 4}
+      rich_v3_enabled? -> {2, 3}
+      true -> {1, 2}
+    end
   rescue
     _ -> {1, 2}
   end
@@ -1022,9 +1367,11 @@ defmodule Oli.OpenStax.CourseImport do
   @doc false
   def complete_lesson_plan_job(
         args,
-        %{plan_mode: plan_mode, payload: payload, created_by: created_by}
+        %{plan_mode: plan_mode, payload: payload, created_by: created_by} = planning_result
       )
       when is_map(args) and is_map(payload) do
+    enrichment_proposals = Map.get(planning_result, :enrichment_proposals, [])
+
     with {:ok, job_args} <- normalize_lesson_job_args(args),
          :ok <- validate_plan_mode(plan_mode) do
       result =
@@ -1064,6 +1411,14 @@ defmodule Oli.OpenStax.CourseImport do
                 if job_args.operation == "initial" and not is_nil(existing) do
                   {Repo.preload(lesson, :plans, force: true), false}
                 else
+                  {:ok, payload} =
+                    sync_planned_enrichments(
+                      run,
+                      lesson,
+                      payload,
+                      enrichment_proposals
+                    )
+
                   {
                     persist_locked_lesson_plan(
                       lesson,
@@ -1071,7 +1426,8 @@ defmodule Oli.OpenStax.CourseImport do
                       payload,
                       plan_mode,
                       created_by,
-                      true
+                      true,
+                      run.plan_schema_version
                     ),
                     true
                   }
@@ -1421,18 +1777,13 @@ defmodule Oli.OpenStax.CourseImport do
                    },
                    :planning_lessons
                  ),
-               {:ok, %{plan_mode: mode, payload: payload, created_by: created_by}} <-
+               {:ok, planning_result} <-
                  AIPlanner.plan(lesson_source_map(lesson), index,
                    plan_schema_version: plan_schema_version
-                 ) do
-            persist_lesson_plan(
-              lesson,
-              payload,
-              mode,
-              created_by,
-              true,
-              skip_if_exists: true
-            )
+                 ),
+               {:ok, planned_lesson} <-
+                 persist_planned_lesson_result(run_id, lesson, planning_result) do
+            {:ok, planned_lesson}
           end
 
         case result do
@@ -1590,6 +1941,7 @@ defmodule Oli.OpenStax.CourseImport do
     with %Project{} = project <- Repo.get(Project, run.project_id),
          :ok <- ensure_project_root_empty(project, run.target_root_container_resource_id),
          true <- all_lessons_approved?(run.id),
+         :ok <- Enrichment.ensure_generation_complete(run.id),
          :ok <- ensure_required_media_ready(run) do
       :ok
     else
@@ -1850,13 +2202,31 @@ defmodule Oli.OpenStax.CourseImport do
           if Keyword.get(opts, :skip_if_exists, false) and not is_nil(existing) do
             Repo.preload(locked_lesson, :plans, force: true)
           else
+            payload =
+              case Keyword.fetch(opts, :enrichment_proposals) do
+                {:ok, proposals} ->
+                  {:ok, synced_payload} =
+                    sync_planned_enrichments(
+                      locked_run,
+                      locked_lesson,
+                      payload,
+                      proposals
+                    )
+
+                  synced_payload
+
+                :error ->
+                  payload
+              end
+
             persist_locked_lesson_plan(
               locked_lesson,
               existing,
               payload,
               plan_mode,
               created_by,
-              allow_repair?
+              allow_repair?,
+              locked_run.plan_schema_version
             )
           end
 
@@ -1904,15 +2274,153 @@ defmodule Oli.OpenStax.CourseImport do
     exception -> {:error, {:lesson_plan_persistence_failed, Exception.message(exception)}}
   end
 
+  defp persist_planned_lesson_result(
+         run_id,
+         lesson,
+         %{
+           plan_mode: plan_mode,
+           payload: payload,
+           created_by: created_by
+         } = planning_result
+       )
+       when is_binary(run_id) and is_map(payload) do
+    if lesson.run_id == run_id do
+      persist_lesson_plan(
+        lesson,
+        payload,
+        plan_mode,
+        created_by,
+        true,
+        skip_if_exists: true,
+        enrichment_proposals: Map.get(planning_result, :enrichment_proposals, [])
+      )
+    else
+      {:error, :lesson_run_mismatch}
+    end
+  end
+
+  defp persist_planned_lesson_result(_run_id, _lesson, _planning_result),
+    do: {:error, :invalid_lesson_plan_result}
+
+  defp sync_planned_enrichments(run, _lesson, payload, _proposals)
+       when run.plan_schema_version < 4,
+       do: {:ok, payload}
+
+  defp sync_planned_enrichments(run, lesson, payload, proposals)
+       when is_map(payload) and is_list(proposals) do
+    normalized = normalize_planned_enrichment_proposals(proposals)
+    payload = strip_model_enrichment_references(payload)
+
+    case Enrichment.sync_proposals(run.id, lesson.id, normalized) do
+      {:ok, _persisted} ->
+        {:ok, payload}
+
+      {:error, :proposal_sync_locked} ->
+        # Reviewer decisions and generated artifact history own the proposal
+        # records after planning. A lesson regeneration must not overwrite them.
+        {:ok, payload}
+
+      {:error, reason} ->
+        Logger.warning(
+          "OpenStax enrichment proposal persistence degraded to a normal lesson",
+          run_id: run.id,
+          lesson_id: lesson.id,
+          reason: inspect(reason)
+        )
+
+        {:ok, payload}
+    end
+  rescue
+    exception ->
+      Logger.warning(
+        "OpenStax enrichment proposal persistence raised and was omitted",
+        run_id: run.id,
+        lesson_id: lesson.id,
+        exception: exception.__struct__
+      )
+
+      {:ok, strip_model_enrichment_references(payload)}
+  end
+
+  defp sync_planned_enrichments(_run, _lesson, payload, _proposals),
+    do: {:ok, strip_model_enrichment_references(payload)}
+
+  defp normalize_planned_enrichment_proposals(proposals) do
+    proposals
+    |> Enum.take(Enrichment.max_proposals_per_lesson())
+    |> Enum.with_index(1)
+    |> Enum.map(fn {proposal, rank} ->
+      planner_id = proposal["id"] || proposal[:id] || "enrichment-proposal-#{rank}"
+      kind = proposal["kind"] || proposal[:kind]
+
+      metadata =
+        (proposal["metadata"] || proposal[:metadata] || %{})
+        |> Map.new()
+        |> Map.put("planner_id", planner_id)
+        |> maybe_put_map_value(
+          "research_query",
+          proposal["research_query"] || proposal[:research_query]
+        )
+        |> maybe_put_map_value(
+          "planner_research_evidence",
+          proposal["research_evidence"] || proposal[:research_evidence]
+        )
+
+      %{
+        "rank" => rank,
+        "kind" => normalize_enrichment_kind(kind),
+        "instructional_rationale" =>
+          proposal["instructional_rationale"] || proposal[:instructional_rationale],
+        "objective_ids" => proposal["objective_ids"] || proposal[:objective_ids] || [],
+        "source_evidence" => proposal["source_evidence"] || proposal[:source_evidence] || %{},
+        "placement" => proposal["placement"] || proposal[:placement] || %{},
+        "learner_task" => proposal["learner_task"] || proposal[:learner_task],
+        "metadata" => metadata
+      }
+    end)
+  end
+
+  defp normalize_enrichment_kind("curated_resource"), do: "external_resource"
+  defp normalize_enrichment_kind(kind), do: kind
+
+  defp strip_model_enrichment_references(payload) do
+    update_in(
+      payload,
+      [Access.key("content_payload", %{}), Access.key("advanced_blueprint", %{})],
+      fn blueprint ->
+        Map.update(blueprint, "screens", [], fn screens ->
+          Enum.map(List.wrap(screens), fn
+            screen when is_map(screen) -> Map.delete(screen, "enrichment_proposal_id")
+            screen -> screen
+          end)
+        end)
+      end
+    )
+  end
+
+  defp maybe_put_map_value(map, _key, value) when value in [nil, "", []], do: map
+  defp maybe_put_map_value(map, key, value), do: Map.put(map, key, value)
+
   defp persist_locked_lesson_plan(
          locked_lesson,
          existing,
          payload,
          plan_mode,
          created_by,
-         allow_repair?
+         allow_repair?,
+         run_plan_schema_version
        ) do
-    normalized = normalize_lesson_payload(locked_lesson, payload, plan_mode, existing)
+    :ok =
+      rollback_unless_ok(ensure_payload_schema_version(payload, run_plan_schema_version))
+
+    normalized =
+      normalize_lesson_payload(
+        locked_lesson,
+        payload,
+        plan_mode,
+        existing,
+        run_plan_schema_version
+      )
 
     Repo.update_all(
       from(plan in LessonPlan, where: plan.lesson_id == ^locked_lesson.id),
@@ -2045,7 +2553,13 @@ defmodule Oli.OpenStax.CourseImport do
     end)
   end
 
-  defp normalize_lesson_payload(lesson, payload, plan_mode, existing) do
+  defp normalize_lesson_payload(
+         lesson,
+         payload,
+         plan_mode,
+         existing,
+         run_plan_schema_version
+       ) do
     existing_content = if(existing, do: existing.content_payload || %{}, else: %{})
     existing_questions = if(existing, do: existing.questions_payload || %{}, else: %{})
 
@@ -2089,13 +2603,75 @@ defmodule Oli.OpenStax.CourseImport do
         |> Map.put("source_evidence_links", lesson.source_evidence_links || [])
       end)
 
-    content = ensure_authoring_blueprint(content, questions, plan_mode)
+    content =
+      content
+      |> enforce_system_schema_version(run_plan_schema_version)
+      |> strip_untrusted_exclusion_acknowledgements(run_plan_schema_version)
+      |> ensure_authoring_blueprint(questions, plan_mode)
 
     %{
       "content_payload" => content,
       "questions_payload" => %{"items" => questions}
     }
   end
+
+  defp ensure_payload_schema_version(payload, run_plan_schema_version)
+       when is_integer(run_plan_schema_version) and run_plan_schema_version >= 4 do
+    incoming = payload["content_payload"] || payload[:content_payload] || payload
+
+    case incoming do
+      %{} = content ->
+        case Map.fetch(content, "schema_version") do
+          {:ok, 4} ->
+            :ok
+
+          {:ok, _other} ->
+            {:error, :plan_schema_version_immutable}
+
+          :error ->
+            case Map.fetch(content, :schema_version) do
+              {:ok, 4} -> :ok
+              {:ok, _other} -> {:error, :plan_schema_version_immutable}
+              :error -> :ok
+            end
+        end
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp ensure_payload_schema_version(_payload, _run_plan_schema_version), do: :ok
+
+  defp enforce_system_schema_version(content, run_plan_schema_version)
+       when is_integer(run_plan_schema_version) and run_plan_schema_version >= 4,
+       do: Map.put(content, "schema_version", 4)
+
+  defp enforce_system_schema_version(content, _run_plan_schema_version), do: content
+
+  defp strip_untrusted_exclusion_acknowledgements(content, run_plan_schema_version)
+       when is_integer(run_plan_schema_version) and run_plan_schema_version >= 4 do
+    update_in(
+      content,
+      [Access.key("coverage_manifest", %{}), Access.key("excluded_blocks", [])],
+      fn exclusions ->
+        Enum.map(List.wrap(exclusions), fn
+          exclusion when is_map(exclusion) ->
+            Map.drop(exclusion, [
+              "author_acknowledged",
+              "acknowledged_by_author_id",
+              "acknowledged_at",
+              "acknowledged_plan_version"
+            ])
+
+          exclusion ->
+            exclusion
+        end)
+      end
+    )
+  end
+
+  defp strip_untrusted_exclusion_acknowledgements(content, _run_plan_schema_version), do: content
 
   defp ensure_authoring_blueprint(content, _questions, mode) when mode != "advanced", do: content
 
@@ -2310,7 +2886,8 @@ defmodule Oli.OpenStax.CourseImport do
   end
 
   defp maybe_transition_to_compiling_locked(%Run{} = locked_run) do
-    if all_lessons_approved?(locked_run.id) do
+    if all_lessons_approved?(locked_run.id) and
+         Enrichment.ensure_generation_complete(locked_run.id) == :ok do
       :ok = rollback_unless_ok(ensure_transition_allowed(locked_run.status, :compiling))
 
       updated_run =
@@ -2323,6 +2900,49 @@ defmodule Oli.OpenStax.CourseImport do
       :not_ready
     end
   end
+
+  defp ensure_generated_proposal_available(_run, %{kind: kind})
+       when kind != "generated_simulation",
+       do: :ok
+
+  defp ensure_generated_proposal_available(%Run{} = run, proposal) do
+    case {run_project(run), Repo.get(Lesson, proposal.lesson_id)} do
+      {%Project{} = project, %Lesson{plan_mode: "advanced", run_id: run_id}}
+      when run_id == run.id ->
+        if enrichment_capabilities(project).generated_available do
+          :ok
+        else
+          {:error, :simulation_generation_unavailable}
+        end
+
+      {%Project{}, %Lesson{}} ->
+        {:error, :generated_enrichment_requires_advanced_authoring}
+
+      _ ->
+        {:error, :project_or_lesson_not_found}
+    end
+  end
+
+  defp active_simulation_artifact?(proposal_id) do
+    proposal_id
+    |> Enrichment.list_artifacts()
+    |> Enum.any?(&(&1.status in ["generating", "ready_for_review"]))
+  end
+
+  defp maybe_advance_after_enrichment_decision(%Run{status: :awaiting_lesson_approval} = run) do
+    if all_lessons_approved?(run.id) and Enrichment.ensure_generation_complete(run.id) == :ok do
+      case transition_to_compiling_if_ready(run.id) do
+        {:ok, _updated} -> :ok
+        {:error, _reason} -> :ok
+      end
+    else
+      :ok
+    end
+  end
+
+  defp maybe_advance_after_enrichment_decision(_run), do: :ok
+
+  defp run_project(%Run{project_id: project_id}), do: Repo.get(Project, project_id)
 
   defp transition_to_compiling_if_ready(run_id) do
     result =
@@ -2489,10 +3109,31 @@ defmodule Oli.OpenStax.CourseImport do
         }
       end)
 
+    enrichments =
+      run.id
+      |> Enrichment.list_run_proposals()
+      |> Enum.filter(&(&1.state == "approved"))
+      |> Enum.map(fn proposal ->
+        approved_artifact =
+          proposal.simulation_artifacts
+          |> List.wrap()
+          |> Enum.find(&(&1.status == "approved"))
+
+        %{
+          proposal_id: proposal.id,
+          proposal_version: proposal.approved_version,
+          kind: proposal.kind,
+          artifact_id: approved_artifact && approved_artifact.id,
+          artifact_version: approved_artifact && approved_artifact.version,
+          content_hash: approved_artifact && approved_artifact.content_hash
+        }
+      end)
+      |> Enum.sort_by(& &1.proposal_id)
+
     :crypto.hash(
       :sha256,
       :erlang.term_to_binary(
-        {run.plan_schema_version, units},
+        {run.plan_schema_version, units, enrichments},
         [:deterministic]
       )
     )
@@ -3749,6 +4390,9 @@ defmodule Oli.OpenStax.CourseImport do
           ]
         )
 
+        {:ok, _cancelled_workflows} =
+          Enrichment.cancel_run_workflows(run.id, "Import cancelled by author")
+
         with {:ok, cancelled} <-
                run
                |> Run.update_changeset(
@@ -3939,6 +4583,16 @@ defmodule Oli.OpenStax.CourseImport do
     Repo.preload(
       run,
       [
+        enrichment_proposals:
+          from(proposal in EnrichmentProposal,
+            order_by: [asc: proposal.lesson_id, asc: proposal.rank],
+            preload: [
+              simulation_artifacts:
+                ^from(artifact in SimulationArtifact,
+                  order_by: [desc: artifact.version]
+                )
+            ]
+          ),
         units:
           from(unit in Unit,
             order_by: [asc: unit.order],

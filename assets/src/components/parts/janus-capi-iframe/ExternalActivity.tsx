@@ -17,7 +17,19 @@ import {
   getExternalIframeStyles,
   shouldAllowIframeScrolling,
 } from './iframeBehavior';
-import { CapiIframeModel } from './schema';
+import {
+  CapiIframeModel,
+  GENERATED_SIMULATION_REDACTED_CONFIG,
+  authorizeGeneratedSimulationMessage,
+  isGeneratedSimulation,
+  redactGeneratedSimulationHandshake,
+  resolveIframeDescription,
+  resolveIframePermissions,
+  resolveIframeReferrerPolicy,
+  resolveIframeSandbox,
+  resolveIframeTitle,
+  sanitizeGeneratedSimulationValueChange,
+} from './schema';
 import { resolveAdaptiveIframeSource, sanitizeAdaptiveIframeFallbackHref } from './sourceResolver';
 
 const externalActivityMap: Map<string, any> = new Map();
@@ -31,6 +43,11 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
   const [initStateBindToFacts, setInitStateBindToFacts] = useState<any>({});
   const [screenContext, setScreenContext] = useState('');
   const id: string = props.id;
+  const descriptionId = `${id}-description`;
+  const trustedGeneratedSrcRef = useRef<string>();
+  const generatedFrameLoadCountRef = useRef(0);
+  const generatedFrameBlockedRef = useRef(false);
+  const [generatedFrameBlocked, setGeneratedFrameBlocked] = useState(false);
   const contextRef = useRef('VIEWER');
 
   const [scriptEnv, setScriptEnv] = useState<any>();
@@ -52,7 +69,7 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
   const [lessonId, setLessonId] = useState('');
 
   // these rely on being set every render and the "model" useState value being set
-  const { configData, description } = model;
+  const { configData = [], description, title } = model;
   const iframeFallback = model?.dynamicLinkFallback;
   const showIframeFallback = iframeFallback?.type === 'unresolved_internal_source';
   const fallbackMessage =
@@ -60,6 +77,19 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
       ? iframeFallback.message
       : 'This embedded page is unavailable.';
   const fallbackHref = sanitizeAdaptiveIframeFallbackHref(iframeFallback?.href);
+  const generatedInputKeys = () =>
+    new Set<string>(
+      (model.capiInputs || []).map((declaration: { key: string }) => declaration.key),
+    );
+
+  const generatedInputsOnly = (values: Record<string, any>) => {
+    if (!isGeneratedSimulation(model)) {
+      return values;
+    }
+
+    const allowed = generatedInputKeys();
+    return Object.fromEntries(Object.entries(values).filter(([key]) => allowed.has(key)));
+  };
   const getInterestedVariable = (StateSnapshot: Record<string, any>, domain: string) => {
     return Object.keys(StateSnapshot).reduce((collect: Record<string, any>, key) => {
       if (key.indexOf(`${domain}.${id}.`) === 0) {
@@ -95,6 +125,16 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
     setFrameCssClass(dCssClass);
 
     const dSrc = pModel.src || frameSrc;
+    if (isGeneratedSimulation(pModel)) {
+      const generatedSourceChanged = trustedGeneratedSrcRef.current !== dSrc;
+      trustedGeneratedSrcRef.current = dSrc;
+
+      if (generatedSourceChanged) {
+        generatedFrameLoadCountRef.current = 0;
+        generatedFrameBlockedRef.current = false;
+        setGeneratedFrameBlocked(false);
+      }
+    }
     setFrameSrc(dSrc);
 
     const dX = pModel.x || frameX;
@@ -157,6 +197,7 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
           key: 'IFRAME_frameSrc',
           type: CapiVariableTypes.STRING,
           value: dSrc,
+          readonly: isGeneratedSimulation(pModel),
         },
       ],
     });
@@ -224,7 +265,9 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
     }
 
     const sSrc = currentStateSnapshot[`${domain}.${id}.IFRAME_frameSrc`];
-    if (sSrc !== undefined) {
+    if (trustedGeneratedSrcRef.current) {
+      setFrameSrc(trustedGeneratedSrcRef.current);
+    } else if (sSrc !== undefined) {
       setFrameSrc(sSrc);
     }
 
@@ -252,7 +295,15 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
     }
 
     writeCapiLog('MUTATE STATE APPLIED', 3, { interestedSnapshot });
-    const arrMutateStateVars = Object.keys(interestedSnapshot);
+    const allowedGeneratedInputs = generatedInputKeys();
+    const arrMutateStateVars = Object.keys(interestedSnapshot).filter((key) => {
+      if (!isGeneratedSimulation(model)) {
+        return true;
+      }
+
+      const baseKey = key.replace(`stage.${id}.`, '').replace(`app.${id}.`, '');
+      return allowedGeneratedInputs.has(baseKey);
+    });
     arrMutateStateVars.forEach((key: any) => {
       const formatted: Record<string, unknown> = {};
       const baseKey = key.replace(`stage.${id}.`, '').replace(`app.${id}.`, '');
@@ -321,7 +372,9 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
     }
 
     const sSrc = currentStateSnapshot[`${domain}.${id}.IFRAME_frameSrc`];
-    if (sSrc !== undefined) {
+    if (trustedGeneratedSrcRef.current) {
+      setFrameSrc(trustedGeneratedSrcRef.current);
+    } else if (sSrc !== undefined) {
       setFrameSrc(sSrc);
     }
 
@@ -451,7 +504,27 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
   const [simLife, setSimLife] = useState(getCleanSimLife());
   const [internalState, setInternalState] = useState(state || []);
 
+  const handleFrameLoad = useCallback(() => {
+    if (!trustedGeneratedSrcRef.current || generatedFrameBlockedRef.current) {
+      return;
+    }
+
+    generatedFrameLoadCountRef.current += 1;
+
+    if (generatedFrameLoadCountRef.current > 1) {
+      generatedFrameBlockedRef.current = true;
+      setGeneratedFrameBlocked(true);
+      setReady(false);
+      setFrameSrc('about:blank');
+      setSimLife((current: any) => ({ ...current, ready: false }));
+    }
+  }, []);
+
   const sendToIframe = (data: any) => {
+    if (generatedFrameBlockedRef.current) {
+      return;
+    }
+
     // using this hack to get latest reference to simFrame
     setSimFrame((currentFrame) => {
       /* console.log('DEBUG SEND TO IFRAME', { currentFrame, data }); */
@@ -501,7 +574,7 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
   };
 
   const sendReadonlyValueChangeInReview = () => {
-    if (!isReviewContext()) {
+    if (!isReviewContext() || isGeneratedSimulation(model)) {
       return;
     }
 
@@ -533,6 +606,10 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
         switch (notificationType) {
           case NotificationType.CHECK_STARTED:
             {
+              if (isGeneratedSimulation(model)) {
+                break;
+              }
+
               writeCapiLog('CHECK REQUEST STARTED STATE!!!!', 3, {
                 payload,
                 simLife,
@@ -547,6 +624,10 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
             break;
           case NotificationType.CHECK_COMPLETE:
             {
+              if (isGeneratedSimulation(model)) {
+                break;
+              }
+
               writeCapiLog('CHECK REQUEST COMPLETED STATE!!!!', 3, {
                 simLife,
                 payload,
@@ -603,13 +684,15 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
               if (payload.domain) {
                 simLife.domain = payload.domain;
               }
-              simLife.handshake.config = {
-                context: nextContext,
-                questionId: payload.currentActivityId,
-                sectionSlug: payload.sectionSlug,
-                lessonId: payload.currentLessonId,
-                userId: payload.currentUserId,
-              };
+              simLife.handshake.config = isGeneratedSimulation(model)
+                ? { ...GENERATED_SIMULATION_REDACTED_CONFIG }
+                : {
+                    context: nextContext,
+                    questionId: payload.currentActivityId,
+                    sectionSlug: payload.sectionSlug,
+                    lessonId: payload.currentLessonId,
+                    userId: payload.currentUserId,
+                  };
               notifyConfigChange();
               // we only send the Init state variables.
               const currentStateSnapshot = payload.initStateFacts;
@@ -710,8 +793,12 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
     type: JanusCAPIRequestTypes,
     values: any,
   ) => {
+    const responseHandshake = isGeneratedSimulation(model)
+      ? (redactGeneratedSimulationHandshake(handshake) as unknown as CapiHandshake)
+      : handshake;
+
     const responseMsg: CapiMessage = {
-      handshake,
+      handshake: responseHandshake,
       options,
       type,
       values,
@@ -728,17 +815,23 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
     simLife.handshake.requestToken = msgRequestToken;
 
     // taken from simcapi.js TODO move somewhere, use from settings
-    simLife.handshake.config = {
-      context: contextRef.current,
-      lessonId: uniqueLessonId ? `${lessonId}_${guid()}` : lessonId,
-      questionId,
-      sectionSlug,
-      userId: currentUserId,
-    };
+    simLife.handshake.config = isGeneratedSimulation(model)
+      ? { ...GENERATED_SIMULATION_REDACTED_CONFIG }
+      : {
+          context: contextRef.current,
+          lessonId: uniqueLessonId ? `${lessonId}_${guid()}` : lessonId,
+          questionId,
+          sectionSlug,
+          userId: currentUserId,
+        };
 
     // TODO: here in the handshake response we should send come config...
+    const responseHandshake = isGeneratedSimulation(model)
+      ? (redactGeneratedSimulationHandshake(simLife.handshake) as unknown as CapiHandshake)
+      : simLife.handshake;
+
     setTimeout(() => {
-      sendFormedResponse(simLife.handshake, {}, JanusCAPIRequestTypes.HANDSHAKE_RESPONSE, []);
+      sendFormedResponse(responseHandshake, {}, JanusCAPIRequestTypes.HANDSHAKE_RESPONSE, []);
     }, 500);
   };
 
@@ -747,7 +840,9 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
       return;
     }
     // should / will sim send onReady more than once??
-    const filterVars = createCapiObjectFromStateVars(simLife.currentState, simLife.domain);
+    const filterVars = generatedInputsOnly(
+      createCapiObjectFromStateVars(simLife.currentState, simLife.domain),
+    );
     if (filterVars && Object.keys(filterVars)?.length !== 0) {
       handleIFrameSpecificProperties(simLife.currentState, simLife.domain);
       writeCapiLog('SENDING SIM CONFIG DATA !!!!', 3, {
@@ -1066,11 +1161,33 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
       if (!(simFrame?.contentWindow === evnt.source)) {
         return;
       }
+      const generatedSimulation = isGeneratedSimulation(model);
+      if (generatedSimulation && generatedFrameBlockedRef.current) {
+        return;
+      }
+      if (generatedSimulation && (typeof evnt.data !== 'string' || evnt.data.length > 64_000)) {
+        return;
+      }
       let data: CapiMessage;
       try {
         data = JSON.parse(evnt.data);
       } catch (e) {
         // not json
+        return;
+      }
+      if (!data || typeof data !== 'object' || !Number.isInteger(data.type)) {
+        return;
+      }
+
+      if (
+        generatedSimulation &&
+        !authorizeGeneratedSimulationMessage(
+          data,
+          simLife.handshake,
+          simLife.handshakeMade,
+          data.type === JanusCAPIRequestTypes.HANDSHAKE_REQUEST,
+        )
+      ) {
         return;
       }
       // TODO: check that we haven't got wires crossed? i.e. requestToken is the same
@@ -1088,23 +1205,32 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
           break;
 
         case JanusCAPIRequestTypes.GET_DATA_REQUEST:
-          handleGetData(data);
+          if (!generatedSimulation) handleGetData(data);
           break;
 
         case JanusCAPIRequestTypes.VALUE_CHANGE:
-          if (!isReviewContext()) handleValueChange(data, simLife.domain);
+          if (!isReviewContext()) {
+            if (generatedSimulation) {
+              const values = sanitizeGeneratedSimulationValueChange(model, data.values);
+              if (Object.keys(values).length > 0) {
+                handleValueChange({ ...data, values }, simLife.domain);
+              }
+            } else {
+              handleValueChange(data, simLife.domain);
+            }
+          }
           break;
 
         case JanusCAPIRequestTypes.SET_DATA_REQUEST:
-          if (!isReviewContext()) handleSetData(data);
+          if (!generatedSimulation && !isReviewContext()) handleSetData(data);
           break;
 
         case JanusCAPIRequestTypes.CHECK_REQUEST:
-          if (!isReviewContext()) handleCheckRequest(data);
+          if (!generatedSimulation && !isReviewContext()) handleCheckRequest(data);
           break;
 
         case JanusCAPIRequestTypes.RESIZE_PARENT_CONTAINER_REQUEST:
-          handleResizeParentContainer(data.values);
+          if (!generatedSimulation) handleResizeParentContainer(data.values);
           break;
 
         default:
@@ -1133,6 +1259,11 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
     Object.keys(initStateBindToFacts).forEach((key: any) => {
       const formatted: Record<string, unknown> = {};
       const baseKey = key.replace(`stage.${id}.`, '').replace(`app.${id}.`, '');
+
+      if (isGeneratedSimulation(model) && !generatedInputKeys().has(baseKey)) {
+        return;
+      }
+
       const value = initStateBindToFacts[key];
       const cVar = new CapiVariable({
         key: baseKey,
@@ -1169,6 +1300,11 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
     arrInitStateVars.forEach((key: any) => {
       const formatted: Record<string, unknown> = {};
       const baseKey = key.replace(`stage.${id}.`, '').replace(`app.${id}.`, '');
+
+      if (isGeneratedSimulation(model) && !generatedInputKeys().has(baseKey)) {
+        return;
+      }
+
       const value = initState[key];
       const cVar = new CapiVariable({
         key: baseKey,
@@ -1225,6 +1361,11 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
       ? templatizeText(description, simLife?.snapshot, scriptEnv)
       : description;
   }, [description, simLife.snapshot, scriptEnv]);
+  const iframeTitle = resolveIframeTitle(title);
+  const iframeDescription = resolveIframeDescription(formattedDescription);
+  const iframeSecurityModel = trustedGeneratedSrcRef.current
+    ? { ...model, securityProfile: 'generated_simulation' as const }
+    : model;
 
   const resolvedFrameSrc = resolveAdaptiveIframeSource(frameSrc);
 
@@ -1233,18 +1374,31 @@ const ExternalActivity: React.FC<PartComponentProps<CapiIframeModel>> = (props) 
       <iframe
         data-janus-type={tagName}
         ref={frameRef}
+        onLoad={handleFrameLoad}
         style={getExternalIframeStyles(externalActivityStyles, iframeScrollingEnabled)}
-        title={formattedDescription || description}
+        title={iframeTitle}
         src={resolvedFrameSrc}
         scrolling={scrolling}
-        aria-label={formattedDescription || description}
-        aria-describedby={id}
-        allow="accelerometer *; magnetometer; gyroscope; fullscreen; autoplay; clipboard-write; encrypted-media; xr-spatial-tracking; gamepad *;"
+        aria-describedby={iframeDescription ? descriptionId : undefined}
+        sandbox={resolveIframeSandbox(iframeSecurityModel)}
+        referrerPolicy={resolveIframeReferrerPolicy(iframeSecurityModel)}
+        allow={resolveIframePermissions(iframeSecurityModel)}
       />
+      {iframeDescription && (
+        <span id={descriptionId} className="sr-only">
+          {iframeDescription}
+        </span>
+      )}
       {showIframeFallback && (
         <div role="status" aria-live="polite" style={fallbackOverlayStyles}>
           <div>{fallbackMessage}</div>
           <a href={fallbackHref}>Return to lesson</a>
+        </div>
+      )}
+      {generatedFrameBlocked && (
+        <div role="alert" style={fallbackOverlayStyles}>
+          This exploration was stopped because it attempted to navigate away from its approved
+          artifact.
         </div>
       )}
     </div>

@@ -18,8 +18,48 @@ export interface IframeDynamicLinkFallback {
   href: string;
 }
 
+export type IframeSecurityProfile = 'generated_simulation';
+
+export type CapiDeclarationType =
+  | 'number'
+  | 'string'
+  | 'array'
+  | 'boolean'
+  | 'enum'
+  | 'math_expr'
+  | 'array_point';
+
+export interface CapiVariableDeclaration {
+  key: string;
+  type: CapiDeclarationType;
+  defaultValue?: unknown;
+  allowedValues?: string[];
+  branching?: {
+    operator:
+      | 'equal'
+      | 'notEqual'
+      | 'greaterThan'
+      | 'greaterThanInclusive'
+      | 'lessThan'
+      | 'lessThanInclusive';
+    value: unknown;
+    remediation_section_id: string;
+    feedback?: string;
+  };
+}
+
+export interface GeneratedSimulationArtifactIdentity {
+  proposalId: string;
+  artifactId: string;
+  version: number;
+  contentHash: string;
+  storageOrigin: string;
+}
+
 export interface CapiIframeModel extends JanusAbsolutePositioned, JanusCustomCss {
   src: string;
+  title?: string;
+  description?: string;
   source?: string;
   sourceType?: IframeSourceMode;
   sourcePageSlug?: string;
@@ -29,7 +69,188 @@ export interface CapiIframeModel extends JanusAbsolutePositioned, JanusCustomCss
   dynamicLinkFallback?: IframeDynamicLinkFallback;
   configData: any;
   allowScrolling: boolean;
+  securityProfile?: IframeSecurityProfile;
+  artifactIdentity?: GeneratedSimulationArtifactIdentity;
+  capiInputs?: CapiVariableDeclaration[];
+  capiOutputs?: CapiVariableDeclaration[];
 }
+
+export const DEFAULT_IFRAME_TITLE = 'Embedded content';
+export const GENERATED_SIMULATION_SANDBOX = 'allow-scripts';
+export const THIRD_PARTY_IFRAME_PERMISSIONS =
+  'accelerometer *; magnetometer; gyroscope; fullscreen; autoplay; clipboard-write; encrypted-media; xr-spatial-tracking; gamepad *;';
+
+export const isGeneratedSimulation = (model: Partial<CapiIframeModel>): boolean =>
+  model.securityProfile === 'generated_simulation';
+
+export const resolveIframeTitle = (title?: string): string =>
+  title?.trim() ? title : DEFAULT_IFRAME_TITLE;
+
+export const resolveIframeDescription = (description?: string): string | undefined =>
+  description?.trim() ? description : undefined;
+
+export const resolveIframeSandbox = (model: Partial<CapiIframeModel>): string | undefined =>
+  isGeneratedSimulation(model) ? GENERATED_SIMULATION_SANDBOX : undefined;
+
+export const resolveIframePermissions = (model: Partial<CapiIframeModel>): string =>
+  isGeneratedSimulation(model) ? '' : THIRD_PARTY_IFRAME_PERMISSIONS;
+
+export const resolveIframeReferrerPolicy = (
+  model: Partial<CapiIframeModel>,
+): 'no-referrer' | undefined => (isGeneratedSimulation(model) ? 'no-referrer' : undefined);
+
+export const GENERATED_SIMULATION_REDACTED_CONFIG = Object.freeze({
+  context: 'VIEWER',
+  lessonId: '',
+  questionId: '',
+  sectionSlug: '',
+  userId: '',
+});
+
+interface GeneratedHandshake {
+  requestToken?: unknown;
+  authToken?: unknown;
+  version?: unknown;
+  config?: unknown;
+}
+
+export const redactGeneratedSimulationHandshake = (
+  handshake: GeneratedHandshake,
+): Record<string, unknown> => ({
+  requestToken: typeof handshake.requestToken === 'string' ? handshake.requestToken : '',
+  authToken: typeof handshake.authToken === 'string' ? handshake.authToken : '',
+  ...(typeof handshake.version === 'string' ? { version: handshake.version } : {}),
+  config: { ...GENERATED_SIMULATION_REDACTED_CONFIG },
+});
+
+export const authorizeGeneratedSimulationMessage = (
+  message: { handshake?: GeneratedHandshake },
+  expected: GeneratedHandshake,
+  handshakeMade: boolean,
+  handshakeRequest: boolean,
+): boolean => {
+  const requestToken = message?.handshake?.requestToken;
+
+  if (handshakeRequest) {
+    return (
+      !handshakeMade &&
+      typeof requestToken === 'string' &&
+      requestToken.length > 0 &&
+      requestToken.length <= 256
+    );
+  }
+
+  return (
+    handshakeMade &&
+    typeof requestToken === 'string' &&
+    requestToken === expected.requestToken &&
+    typeof message?.handshake?.authToken === 'string' &&
+    message.handshake.authToken === expected.authToken
+  );
+};
+
+const GENERATED_VALUE_MAX_BYTES = 16_384;
+const GENERATED_ARRAY_MAX_ITEMS = 256;
+
+const capiTypeCode = (type: CapiDeclarationType): CapiVariableTypes => {
+  switch (type) {
+    case 'number':
+      return CapiVariableTypes.NUMBER;
+    case 'string':
+      return CapiVariableTypes.STRING;
+    case 'array':
+      return CapiVariableTypes.ARRAY;
+    case 'boolean':
+      return CapiVariableTypes.BOOLEAN;
+    case 'enum':
+      return CapiVariableTypes.ENUM;
+    case 'math_expr':
+      return CapiVariableTypes.MATH_EXPR;
+    case 'array_point':
+      return CapiVariableTypes.ARRAY_POINT;
+  }
+};
+
+const boundedSerializedValue = (value: unknown): boolean => {
+  try {
+    const serialized = JSON.stringify(value);
+    return typeof serialized === 'string' && serialized.length <= GENERATED_VALUE_MAX_BYTES;
+  } catch (_error) {
+    return false;
+  }
+};
+
+const validDeclaredValue = (declaration: CapiVariableDeclaration, value: unknown): boolean => {
+  if (!boundedSerializedValue(value)) {
+    return false;
+  }
+
+  switch (declaration.type) {
+    case 'number':
+      return typeof value === 'number' && Number.isFinite(value);
+    case 'string':
+    case 'math_expr':
+      return typeof value === 'string';
+    case 'boolean':
+      return typeof value === 'boolean';
+    case 'enum':
+      return (
+        typeof value === 'string' &&
+        Array.isArray(declaration.allowedValues) &&
+        declaration.allowedValues.includes(value)
+      );
+    case 'array':
+    case 'array_point':
+      return Array.isArray(value) && value.length <= GENERATED_ARRAY_MAX_ITEMS;
+  }
+};
+
+/**
+ * Reduces an untrusted generated-simulation VALUE_CHANGE payload to the exact
+ * compiler-declared output contract. Undeclared keys, type mismatches, invalid
+ * enum values, and oversized values are ignored before they reach adaptivity.
+ */
+export const sanitizeGeneratedSimulationValueChange = (
+  model: Partial<CapiIframeModel>,
+  values: unknown,
+): Record<string, { type: CapiVariableTypes; value: unknown; allowedValues?: string[] }> => {
+  const sanitized: Record<
+    string,
+    { type: CapiVariableTypes; value: unknown; allowedValues?: string[] }
+  > = Object.create(null);
+
+  if (!isGeneratedSimulation(model) || !values || typeof values !== 'object') {
+    return sanitized;
+  }
+
+  const rawValues = values as Record<string, unknown>;
+
+  (model.capiOutputs || []).forEach((declaration) => {
+    if (!Object.prototype.hasOwnProperty.call(rawValues, declaration.key)) {
+      return;
+    }
+
+    const raw = rawValues[declaration.key];
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return;
+    }
+
+    const variable = raw as { type?: unknown; value?: unknown };
+    const expectedType = capiTypeCode(declaration.type);
+
+    if (variable.type !== expectedType || !validDeclaredValue(declaration, variable.value)) {
+      return;
+    }
+
+    sanitized[declaration.key] = {
+      type: expectedType,
+      value: variable.value,
+      ...(declaration.allowedValues ? { allowedValues: declaration.allowedValues } : {}),
+    };
+  });
+
+  return sanitized;
+};
 
 const SOURCE_PREFIX = '/course/link/';
 const defaultSourceConfig = (): IframeSourceEditorConfig => ({
@@ -107,9 +328,14 @@ export const simpleSchema: JSONSchema7Object = {
     title: 'Allow Scrolling',
     type: 'boolean',
   },
+  title: {
+    title: 'Title',
+    description: 'Provides an accessible title for the embedded content',
+    type: 'string',
+  },
   description: {
-    title: 'description',
-    description: 'provides title and aria-label content',
+    title: 'Description',
+    description: 'Provides additional accessible context for the embedded content',
     type: 'string',
   },
 };
@@ -123,9 +349,14 @@ export const schema: JSONSchema7Object = {
     title: 'Source',
     type: 'string',
   },
+  title: {
+    title: 'Title',
+    description: 'Provides an accessible title for the embedded content',
+    type: 'string',
+  },
   description: {
-    title: 'description',
-    description: 'provides title and aria-label content',
+    title: 'Description',
+    description: 'Provides additional accessible context for the embedded content',
     type: 'string',
   },
   allowScrolling: {
@@ -228,11 +459,33 @@ export const transformModelToSchema = (model: Partial<CapiIframeModel>) => {
 
   return {
     ...model,
+    title: resolveIframeTitle(model.title),
     source: encodeSourceConfig(sourceConfig),
   };
 };
 
 export const transformSchemaToModel = (schema: Partial<CapiIframeModel>) => {
+  if (isGeneratedSimulation(schema)) {
+    const {
+      source: _source,
+      sourceType: _sourceType,
+      sourcePageSlug: _sourcePageSlug,
+      linkType: _linkType,
+      idref: _idref,
+      resource_id: _resourceId,
+      dynamicLinkFallback: _dynamicLinkFallback,
+      ...trustedArtifactModel
+    } = schema;
+
+    // A generated simulation source is compiler-resolved from an approved
+    // artifact. Never convert author-entered source editor data back into src.
+    return {
+      ...trustedArtifactModel,
+      title: resolveIframeTitle(schema.title),
+      sourceType: 'url' as const,
+    };
+  }
+
   const sourceConfig = decodeSourceConfig(schema.source, schema.src || '');
   const {
     source: _source,
@@ -282,6 +535,8 @@ export const simpleUISchema = {
 
 export const createSchema = (): Partial<CapiIframeModel> => ({
   customCssClass: '',
+  title: DEFAULT_IFRAME_TITLE,
+  description: '',
   src: '',
   source: encodeSourceConfig(defaultSourceConfig()),
   sourceType: 'url',

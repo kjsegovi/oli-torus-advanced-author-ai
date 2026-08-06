@@ -10,6 +10,24 @@ get_env_as_boolean = fn key, default ->
   end
 end
 
+generated_simulation_origin =
+  System.get_env(
+    "GENERATED_SIMULATION_ORIGIN",
+    "http://generated-simulations.localhost:9000/torus-media-dev"
+  )
+
+enrichment_resource_catalog =
+  case System.get_env("OPENSTAX_ENRICHMENT_RESOURCE_CATALOG") do
+    nil ->
+      []
+
+    json ->
+      case Jason.decode(json) do
+        {:ok, entries} when is_list(entries) -> entries
+        _ -> []
+      end
+  end
+
 if System.get_env("ADD_OBAN_CRONTAB_IN_DEV", "false") != "true" do
   config :oli, Oban, plugins: [Oban.Plugins.Pruner, {Oban.Plugins.Cron, crontab: []}]
 else
@@ -21,6 +39,16 @@ config :oli,
   s3_xapi_bucket_name: System.get_env("S3_XAPI_BUCKET_NAME", "torus-xapi-dev"),
   s3_media_bucket_name: System.get_env("S3_MEDIA_BUCKET_NAME", "torus-media-dev"),
   media_url: System.get_env("MEDIA_URL", "http://localhost:9000/torus-media-dev"),
+  openstax_generated_simulation_origin: generated_simulation_origin,
+  generated_simulation_origins: [generated_simulation_origin],
+  openstax_enrichment_generator: Oli.OpenStax.CourseImport.Enrichment.Generator.Template,
+  openstax_enrichment_research: Oli.OpenStax.CourseImport.Enrichment.Research.Catalog,
+  openstax_enrichment_resource_catalog: enrichment_resource_catalog,
+  openstax_enrichment_sandbox: Oli.OpenStax.CourseImport.Enrichment.Sandbox.LocalContainer,
+  openstax_enrichment_artifact_storage:
+    Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media,
+  openstax_generated_simulation_csp_header_enforced:
+    get_env_as_boolean.("GENERATED_SIMULATION_CSP_HEADER_ENFORCED", "false"),
   problematic_query_detection:
     get_env_as_boolean.("DEV_PROBLEMATIC_QUERY_DETECTION_ENABLED", "false"),
   load_testing_mode: get_env_as_boolean.("LOAD_TESTING_MODE", "false"),

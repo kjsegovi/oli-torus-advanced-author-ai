@@ -49,7 +49,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.OutlineWorker do
            Source.ingest(run.preflight_snapshot || %{}, selected_ids, source_options(run)),
          {:ok, _run} <- CourseImport.persist_ingested_snapshot(run.id, snapshot),
          {:ok, _run} <- CourseImport.transition_run(run.id, :planning_outline),
-         :ok <- persist_outline(run.id, snapshot) do
+         :ok <- persist_outline(run, snapshot) do
       :ok
     else
       {:error, reason} -> retry_or_fail(run.id, attempt, max_attempts, reason)
@@ -64,7 +64,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.OutlineWorker do
              :planning_outline
            ),
          {:ok, snapshot} <- planning_snapshot(run),
-         :ok <- persist_outline(run.id, snapshot) do
+         :ok <- persist_outline(run, snapshot) do
       :ok
     else
       {:error, reason} -> retry_or_fail(run.id, attempt, max_attempts, reason)
@@ -88,10 +88,11 @@ defmodule Oli.OpenStax.CourseImport.Worker.OutlineWorker do
   defp perform_run(%Run{status: status}, _attempt, _max_attempts),
     do: {:discard, {:invalid_run_status, status}}
 
-  defp persist_outline(run_id, snapshot) do
-    with {:ok, outline} <- Parser.build_outline(snapshot),
-         {:ok, _units} <- CourseImport.upsert_units_and_lessons(run_id, outline),
-         {:ok, _run} <- CourseImport.transition_run(run_id, :awaiting_outline_approval) do
+  defp persist_outline(%Run{} = run, snapshot) do
+    with {:ok, outline} <-
+           Parser.build_outline(snapshot, plan_schema_version: run.plan_schema_version),
+         {:ok, _units} <- CourseImport.upsert_units_and_lessons(run.id, outline),
+         {:ok, _run} <- CourseImport.transition_run(run.id, :awaiting_outline_approval) do
       :ok
     end
   end

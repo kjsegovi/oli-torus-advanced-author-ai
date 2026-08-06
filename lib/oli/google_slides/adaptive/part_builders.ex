@@ -82,28 +82,95 @@ defmodule Oli.GoogleSlides.Adaptive.PartBuilders do
 
   @spec iframe_part(map(), keyword()) :: map()
   def iframe_part(spec, opts \\ []) do
+    if Map.get(spec, "securityProfile") == "generated_simulation" do
+      raise ArgumentError,
+            "generated simulations must be built with generated_simulation_part/2 after trusted artifact resolution"
+    end
+
+    build_iframe_part(spec, opts)
+  end
+
+  @doc """
+  Builds the restricted iframe model for a compiler-resolved simulation
+  artifact. This entry point intentionally requires approved artifact identity
+  metadata; ordinary third-party iframes continue to use `iframe_part/2`.
+  """
+  @spec generated_simulation_part(map(), keyword()) :: map()
+  def generated_simulation_part(spec, opts \\ [])
+
+  def generated_simulation_part(
+        %{
+          "securityProfile" => "generated_simulation",
+          "artifactIdentity" => %{
+            "proposalId" => proposal_id,
+            "artifactId" => artifact_id,
+            "version" => version,
+            "contentHash" => content_hash
+          },
+          "src" => src,
+          "title" => title,
+          "description" => description
+        } = spec,
+        opts
+      )
+      when is_binary(proposal_id) and proposal_id != "" and is_binary(artifact_id) and
+             artifact_id != "" and is_integer(version) and version > 0 and
+             is_binary(content_hash) and content_hash != "" and is_binary(src) and src != "" and
+             is_binary(title) and title != "" and is_binary(description) and description != "" do
+    build_iframe_part(spec, opts)
+  end
+
+  def generated_simulation_part(_spec, _opts) do
+    raise ArgumentError, "generated simulation artifact metadata is incomplete"
+  end
+
+  defp build_iframe_part(spec, opts) do
     y = Keyword.get(opts, :y, 0)
     height = Keyword.get(opts, :height, 320)
+
+    custom = %{
+      "allowScrolling" => Map.get(spec, "allowScrolling", false),
+      "configData" => Map.get(spec, "configData", []),
+      "customCssClass" => "",
+      "description" => Map.get(spec, "description", ""),
+      "height" => height,
+      "maxScore" => 1,
+      "requiresManualGrading" => false,
+      "responsiveLayoutWidth" => 960,
+      "src" => Map.get(spec, "src", ""),
+      "title" => accessible_iframe_title(Map.get(spec, "title")),
+      "width" => 100,
+      "x" => 0,
+      "y" => y,
+      "z" => 0
+    }
+
+    custom =
+      if Map.get(spec, "securityProfile") == "generated_simulation" do
+        custom
+        |> Map.put("securityProfile", "generated_simulation")
+        |> Map.put("artifactIdentity", Map.fetch!(spec, "artifactIdentity"))
+        |> Map.put("capiInputs", Map.get(spec, "capiInputs", []))
+        |> Map.put("capiOutputs", Map.get(spec, "capiOutputs", []))
+      else
+        custom
+      end
 
     %{
       "id" => Util.new_id("iframe"),
       "type" => "janus-capi-iframe",
-      "custom" => %{
-        "allowScrolling" => Map.get(spec, "allowScrolling", false),
-        "configData" => [],
-        "customCssClass" => "",
-        "height" => height,
-        "maxScore" => 1,
-        "requiresManualGrading" => false,
-        "responsiveLayoutWidth" => 960,
-        "src" => Map.get(spec, "src", ""),
-        "width" => 100,
-        "x" => 0,
-        "y" => y,
-        "z" => 0
-      }
+      "custom" => custom
     }
   end
+
+  defp accessible_iframe_title(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> "Embedded content"
+      title -> title
+    end
+  end
+
+  defp accessible_iframe_title(_), do: "Embedded content"
 
   @spec video_part(String.t(), keyword()) :: map()
   def video_part(src, opts \\ []) do

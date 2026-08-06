@@ -1,0 +1,327 @@
+# Browser seed for the generated-simulation delivery contract.
+# Workflow/persistence tests create and approve real proposal/artifact rows; this
+# seed represents the trusted compiler output at the browser boundary.
+
+- user:
+    name: "generated_simulation_student${RUN_ID}"
+    type: "student"
+    email: "generated-simulation-student${RUN_ID}@example.com"
+    given_name: "Generated"
+    family_name: "Simulation Student"
+    password: "changeme123456"
+
+- project:
+    name: "generated_simulation_project${RUN_ID}"
+    title: "Generated Simulation Course${RUN_ID}"
+    root:
+      children:
+        - page: "Observe Gas Pressure"
+
+- create_activity:
+    project: "generated_simulation_project${RUN_ID}"
+    title: "Approved Gas Pressure Simulation"
+    virtual_id: "approved_gas_pressure_simulation${RUN_ID}"
+    scope: "embedded"
+    type: "oli_adaptive"
+    content_format: "json"
+    content:
+      custom:
+        applyBtnFlag: false
+        checkButtonLabel: "Interpret state"
+        height: 520
+        maxAttempt: 0
+        maxScore: 0
+        showCheckBtn: true
+        width: 1200
+      authoring:
+        parts:
+          - id: "generated_simulation_iframe"
+            type: "janus-capi-iframe"
+            owner: "aa_import_layout"
+            inherited: false
+        rules:
+          - id: "generated_capi_pressure_branch"
+            name: "generated-capi-branch-1"
+            disabled: false
+            additionalScore: 0.0
+            forceProgress: false
+            default: false
+            correct: false
+            conditions:
+              all:
+                - fact: "stage.generated_simulation_iframe.pressure"
+                  operator: "greaterThanInclusive"
+                  value: 80
+            event:
+              type: "generated_capi_pressure_event"
+              params:
+                actions:
+                  - type: "navigation"
+                    params:
+                      target: "gas-model-explanation-sequence"
+        variablesRequiredForEvaluation:
+          - "stage.generated_simulation_iframe.pressure"
+        activitiesRequiredForEvaluation: []
+      partsLayout:
+        - id: "generated_simulation_iframe"
+          type: "janus-capi-iframe"
+          custom:
+            src: "http://generated-simulations.localhost:9000/torus-media-dev/generated-simulations/artifacts/artifact-gas-pressure-v1/v1/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/index.html"
+            title: "Gas pressure model"
+            description: "Change volume and observe the resulting pressure."
+            allowScrolling: false
+            customCssClass: ""
+            height: 360
+            maxScore: 1
+            requiresManualGrading: false
+            responsiveLayoutWidth: 960
+            width: 100
+            x: 0
+            y: 80
+            z: 0
+            securityProfile: "generated_simulation"
+            artifactIdentity:
+              proposalId: "proposal-gas-pressure"
+              artifactId: "artifact-gas-pressure-v1"
+              version: 1
+              contentHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+              storageOrigin: "http://generated-simulations.localhost:9000"
+            capiInputs:
+              - key: "volume"
+                type: "number"
+                defaultValue: 50
+            capiOutputs:
+              - key: "pressure"
+                type: "number"
+                defaultValue: 50
+                branching:
+                  operator: "greaterThanInclusive"
+                  value: 80
+                  remediation_section_id: "gas-model-explanation"
+                  feedback: "Review the gas-model explanation before interpreting this state."
+            configData:
+              - key: "volume"
+                type: 1
+                value: 50
+                readonly: false
+                writeonly: false
+              - key: "pressure"
+                type: 1
+                value: 50
+                readonly: true
+                writeonly: false
+
+- create_activity:
+    project: "generated_simulation_project${RUN_ID}"
+    title: "Gas-model Explanation"
+    virtual_id: "gas_model_remediation${RUN_ID}"
+    scope: "embedded"
+    type: "oli_adaptive"
+    content_format: "json"
+    content:
+      custom:
+        applyBtnFlag: false
+        checkButtonLabel: "Continue"
+        height: 540
+        maxAttempt: 0
+        maxScore: 0
+        showCheckBtn: true
+        width: 1200
+      authoring:
+        parts:
+          - id: "gas_model_explanation_text"
+            type: "janus-text-flow"
+            owner: "aa_import_layout"
+            inherited: false
+        rules:
+          - id: "gas_model_continue_rule"
+            name: "correct"
+            disabled: false
+            additionalScore: 0.0
+            forceProgress: false
+            default: true
+            correct: true
+            conditions:
+              all: []
+            event:
+              type: "gas_model_continue_event"
+              params:
+                actions:
+                  - type: "navigation"
+                    params:
+                      target: "next"
+        variablesRequiredForEvaluation: []
+        activitiesRequiredForEvaluation: []
+      partsLayout:
+        - id: "gas_model_explanation_text"
+          type: "janus-text-flow"
+          custom:
+            customCssClass: ""
+            height: 160
+            maxScore: 1
+            nodes:
+              - tag: "h2"
+                style: {}
+                children:
+                  - tag: "span"
+                    style: {}
+                    children:
+                      - tag: "text"
+                        text: "Gas-model explanation"
+                        children: []
+              - tag: "p"
+                style: {}
+                children:
+                  - tag: "span"
+                    style: {}
+                    children:
+                      - tag: "text"
+                        text: "Review how controlled volume changes affect pressure, then continue to the native formative check."
+                        children: []
+            overrideHeight: false
+            overrideWidth: true
+            palette:
+              backgroundColor: "rgba(255,255,255,0)"
+              borderColor: "rgba(255,255,255,0)"
+              borderRadius: 0
+              borderStyle: "solid"
+              borderWidth: "0.1px"
+              useHtmlProps: true
+            requiresManualGrading: false
+            visible: true
+            width: 100
+            responsiveLayoutWidth: 960
+            x: 0
+            y: 40
+            z: 0
+
+- create_activity:
+    project: "generated_simulation_project${RUN_ID}"
+    title: "Gas Pressure Follow-up"
+    virtual_id: "gas_pressure_follow_up${RUN_ID}"
+    scope: "embedded"
+    type: "oli_adaptive"
+    content_format: "json"
+    content:
+      custom:
+        applyBtnFlag: false
+        checkButtonLabel: "Check response"
+        height: 540
+        maxAttempt: 2
+        maxScore: 0
+        showCheckBtn: true
+        width: 1200
+      authoring:
+        parts:
+          - id: "gas_pressure_follow_up_prompt"
+            type: "janus-text-flow"
+            owner: "aa_import_layout"
+            inherited: false
+          - id: "gas_pressure_follow_up_mcq"
+            type: "janus-mcq"
+            owner: "aa_import_layout"
+            inherited: false
+            gradingApproach: "automatic"
+            outOf: 1
+        rules: []
+        variablesRequiredForEvaluation: []
+        activitiesRequiredForEvaluation: []
+      partsLayout:
+        - id: "gas_pressure_follow_up_prompt"
+          type: "janus-text-flow"
+          custom:
+            customCssClass: ""
+            height: 72
+            maxScore: 1
+            nodes:
+              - tag: "h2"
+                style: {}
+                children:
+                  - tag: "span"
+                    style: {}
+                    children:
+                      - tag: "text"
+                        text: "Use the simulation evidence"
+                        children: []
+            overrideHeight: false
+            overrideWidth: true
+            palette:
+              backgroundColor: "rgba(255,255,255,0)"
+              borderColor: "rgba(255,255,255,0)"
+              borderRadius: 0
+              borderStyle: "solid"
+              borderWidth: "0.1px"
+              useHtmlProps: true
+            requiresManualGrading: false
+            visible: true
+            width: 100
+            responsiveLayoutWidth: 960
+            x: 0
+            y: 24
+            z: 0
+        - id: "gas_pressure_follow_up_mcq"
+          type: "janus-mcq"
+          custom:
+            customCssClass: ""
+            height: 140
+            maxScore: 1
+            requiresManualGrading: false
+            width: 100
+            responsiveLayoutWidth: 960
+            x: 0
+            y: 120
+            z: 0
+            overrideHeight: false
+            layoutType: "verticalLayout"
+            verticalGap: 0
+            showLabel: true
+            label: "Which observation should you use to explain the pressure change?"
+            multipleSelection: false
+            randomize: false
+            showNumbering: false
+            enabled: true
+            mcqItems:
+              - scoreValue: 0
+                nodes:
+                  - tag: "p"
+                    style: {}
+                    children:
+                      - tag: "span"
+                        style: {}
+                        children:
+                          - tag: "text"
+                            text: "Only the initial state"
+                            children: []
+              - scoreValue: 1
+                nodes:
+                  - tag: "p"
+                    style: {}
+                    children:
+                      - tag: "span"
+                        style: {}
+                        children:
+                          - tag: "text"
+                            text: "A comparison of two controlled states"
+                            children: []
+            correctAnswer: 1
+            correctFeedback: "Correct. Compare controlled states before explaining the pattern."
+            incorrectFeedback: "Use evidence from more than one controlled state."
+
+- hook:
+    function: "Oli.Scenarios.Delivery.GeneratedSimulationBrowserHooks.build_advanced_lesson/1"
+
+- publish:
+    to: "generated_simulation_project${RUN_ID}"
+    description: "Publish approved generated simulation browser seed"
+
+- section:
+    name: "generated_simulation_section${RUN_ID}"
+    title: "Generated Simulation Course${RUN_ID}"
+    from: "generated_simulation_project${RUN_ID}"
+    open_and_free: true
+    end_date: "2027-12-31T23:59:59Z"
+
+- enroll:
+    user: "generated_simulation_student${RUN_ID}"
+    section: "generated_simulation_section${RUN_ID}"
+    role: "student"

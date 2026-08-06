@@ -71,6 +71,15 @@ config :oli,
   logger_truncation_enabled: get_env_as_boolean.("LOGGER_TRUNCATION_ENABLED", "true"),
   logger_truncation_length: get_env_as_integer.("LOGGER_TRUNCATION_LENGTH", "5000"),
   openstax_rich_content_v3_enabled: Mix.env() in [:dev, :test],
+  openstax_refined_planning_v4_enabled: false,
+  openstax_generated_enrichment_enabled: false,
+  openstax_enrichment_generator: Oli.OpenStax.CourseImport.Enrichment.Generator.Disabled,
+  openstax_enrichment_research: Oli.OpenStax.CourseImport.Enrichment.Research.Disabled,
+  openstax_enrichment_sandbox: Oli.OpenStax.CourseImport.Enrichment.Sandbox.Disabled,
+  openstax_enrichment_artifact_storage:
+    Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.Disabled,
+  openstax_generated_simulation_csp_header_enforced: false,
+  generated_simulation_origins: [],
   openstax_course_import_max_parallel_lessons: 3,
   openstax_course_import_lesson_planning_strategy: :parallel_v1,
   instructor_dashboard_details: get_env_as_boolean.("INSTRUCTOR_DASHBOARD_DETAILS", "true"),
@@ -247,7 +256,11 @@ config :oli, Oban,
         {"*/2 * * * *", OliWeb.DatasetStatusPoller, queue: :default},
         {"*/5 * * * *", Oli.OpenStax.CourseImport.Worker.NotificationDispatchWorker,
          queue: :course_import},
-        {"*/5 * * * *", Oli.OpenStax.CourseImport.Worker.RunHealthWorker, queue: :course_import}
+        {"*/5 * * * *", Oli.OpenStax.CourseImport.Worker.RunHealthWorker, queue: :course_import},
+        {"*/15 * * * *", Oli.OpenStax.CourseImport.Worker.EnrichmentRecoveryWorker,
+         queue: :course_import_enrichment},
+        {"17 3 * * *", Oli.OpenStax.CourseImport.Worker.EnrichmentOrphanCleanupWorker,
+         queue: :course_import_enrichment}
       ]
     }
   ],
@@ -272,7 +285,8 @@ config :oli, Oban,
     certificate_eligibility: 10,
     course_import: 2,
     course_import_ai: 6,
-    course_import_media: 1
+    course_import_media: 1,
+    course_import_enrichment: 1
   ]
 
 config :ex_money,

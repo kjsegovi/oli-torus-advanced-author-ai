@@ -11,6 +11,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
   alias Oli.Activities.Model
   alias Oli.GoogleSlides.Adaptive.{PartBuilders, TrapStateRulesBuilder}
+  alias Oli.OpenStax.CourseImport.GeneratedSimulation
   alias Oli.TorusDoc.{ActivityConverter, ActivityParser}
   alias Oli.Utils.SchemaResolver
 
@@ -47,7 +48,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
              normalized_questions,
              stable_key,
              media_assets,
-             attribution
+             attribution,
+             opts
            ),
          :ok <- validate_realized_page(artifact) do
       {:ok, artifact}
@@ -63,7 +65,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
          questions,
          stable_key,
          media_assets,
-         attribution
+         attribution,
+         opts
        ),
        do:
          compile_advanced(
@@ -72,7 +75,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
            questions,
            stable_key,
            media_assets,
-           attribution
+           attribution,
+           opts
          )
 
   defp compile_mode(
@@ -82,7 +86,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
          questions,
          stable_key,
          media_assets,
-         attribution
+         attribution,
+         _opts
        ),
        do:
          compile_basic(
@@ -139,7 +144,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   end
 
   defp compile_basic(title, content, questions, stable_key, media_assets, attribution) do
-    with {:ok, activity_specs} <- compile_basic_questions(title, questions, stable_key) do
+    with {:ok, activity_specs} <-
+           compile_basic_questions(title, questions, stable_key, media_assets) do
       references =
         Enum.map(activity_specs, fn spec ->
           {spec["placement_after_section_id"], activity_reference(spec)}
@@ -202,6 +208,14 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
        ) do
     objectives = learning_objectives(content)
     sections = instructional_sections(content)
+    curated = normalize_curated_enrichments(content["curated_enrichments"])
+    section_ids = MapSet.new(sections, & &1["id"])
+
+    unplaced_curated =
+      Enum.reject(curated, fn enrichment ->
+        placement = enrichment["placement_after_section_id"]
+        is_binary(placement) and MapSet.member?(section_ids, placement)
+      end)
 
     [
       lesson_overview_block(content, objectives, sections, stable_key)
@@ -219,11 +233,13 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
            index,
            stable_key,
            media_assets,
-           Map.get(references_by_section, section["id"], [])
+           Map.get(references_by_section, section["id"], []),
+           curated_for_placement(curated, section["id"])
          )
        end)) ++
       worked_example_blocks(content["worked_examples"], stable_key) ++
       application_problem_blocks(content["application_problems"], stable_key) ++
+      curated_enrichment_blocks(unplaced_curated, "#{stable_key}:curated") ++
       key_takeaways_block(content, stable_key) ++
       source_evidence_block(content["source_evidence_links"], stable_key) ++
       attribution_blocks(attribution, stable_key)
@@ -306,7 +322,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
          index,
          stable_key,
          media_assets,
-         references
+         references,
+         curated
        ) do
     section_key = "#{stable_key}:section:#{section["id"] || index}"
 
@@ -321,7 +338,37 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       media_blocks(media_assets, section["id"], "#{section_key}:media") ++
       curiosity_blocks(section["curiosity_prompts"], "#{section_key}:curiosity") ++
       worked_example_blocks(section["examples"], "#{section_key}:examples") ++
+      curated_enrichment_blocks(curated, "#{section_key}:curated") ++
       practice_group(references, "#{section_key}:practice")
+  end
+
+  defp curated_enrichment_blocks(enrichments, stable_key) do
+    enrichments
+    |> Enum.with_index(1)
+    |> Enum.map(fn {enrichment, index} ->
+      key = "#{stable_key}:#{index}"
+      title = enrichment["title"]
+
+      children =
+        [text_element("h3", title, "#{key}:heading")] ++
+          paragraph_elements(enrichment["annotation"], "#{key}:annotation") ++
+          [text_element("h4", "Try this resource", "#{key}:task-heading")] ++
+          paragraph_elements(enrichment["learner_task"], "#{key}:task") ++
+          [
+            source_link_list(
+              [%{url: enrichment["url"], label: "Open #{title}"}],
+              "#{key}:link"
+            )
+          ]
+
+      %{
+        "id" => stable_id("curated-group", key),
+        "type" => "group",
+        "layout" => "vertical",
+        "purpose" => "learnmore",
+        "children" => [content_block(children, "#{key}:content")]
+      }
+    end)
   end
 
   defp worked_example_blocks(examples, stable_key) do
@@ -629,14 +676,15 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     ]
   end
 
-  defp compile_basic_questions(title, questions, stable_key) do
+  defp compile_basic_questions(title, questions, stable_key, media_assets) do
     questions
     |> Enum.with_index(1)
     |> Enum.reduce_while({:ok, []}, fn {question, index}, {:ok, specs} ->
       key = "#{stable_key}:question:#{index}"
       activity_title = "#{title} – Question #{index}"
 
-      with {:ok, source} <- basic_question_source(question, activity_title, key),
+      with {:ok, question} <- attach_question_media(question, media_assets),
+           {:ok, source} <- basic_question_source(question, activity_title, key),
            {:ok, parsed} <- ActivityParser.parse_activity(source),
            {:ok, converted_model} <- ActivityConverter.to_torus_json(parsed),
            model <- stabilize_model_ids(converted_model, key),
@@ -665,7 +713,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
        "type" => "oli_short_answer",
        "title" => title,
        "stem_md" => question["prompt"],
-       "input_type" => "text"
+       "input_type" => "text",
+       "hints" => question_hints(question)
      }}
   end
 
@@ -687,21 +736,85 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
         }
       end)
 
+    choices =
+      if question["allow_not_sure"] == true do
+        choices ++
+          [
+            %{
+              "id" => stable_id("choice", "#{stable_key}:not-sure"),
+              "score" => 0,
+              "body_md" => "Not sure",
+              "feedback_md" =>
+                first_present([
+                  question["hint"],
+                  question["remediation"],
+                  "That is okay. Review the preceding explanation and use the hint before trying again."
+                ])
+            }
+          ]
+      else
+        choices
+      end
+
     {:ok,
      %{
        "type" => "oli_multiple_choice",
        "title" => title,
        "stem_md" => question["prompt"],
        "choices" => choices,
-       "shuffle" => question["shuffle"] == true,
+       "shuffle" => question["shuffle"] == true and question["allow_not_sure"] != true,
        "incorrect_feedback_md" =>
          question_feedback(question, "incorrect", "Review the lesson and try again."),
-       "explanation_md" => present_string(question["explanation"])
+       "explanation_md" => present_string(question["explanation"]),
+       "hints" => question_hints(question)
      }}
   end
 
   defp basic_question_source(_, _title, _stable_key),
     do: {:error, :unsupported_question_type}
+
+  defp attach_question_media(question, media_assets) do
+    media_ids = normalize_identifier_list(question["media_ids"])
+    assets_by_id = Map.new(media_assets, &{&1.id, &1})
+    missing = Enum.reject(media_ids, &Map.has_key?(assets_by_id, &1))
+
+    if missing == [] do
+      media_markdown =
+        media_ids
+        |> Enum.map(&Map.fetch!(assets_by_id, &1))
+        |> Enum.map_join("\n\n", fn asset ->
+          caption = if present_text?(asset.caption), do: "\n\n_#{asset.caption}_", else: ""
+          "![#{markdown_alt(asset.alt)}](#{asset.url})#{caption}"
+        end)
+
+      prompt =
+        [media_markdown, question["prompt"]]
+        |> Enum.filter(&present_text?/1)
+        |> Enum.join("\n\n")
+
+      {:ok, Map.put(question, "prompt", prompt)}
+    else
+      {:error, {:unknown_question_media_ids, missing}}
+    end
+  end
+
+  defp question_hints(question) do
+    question["hint"]
+    |> List.wrap()
+    |> Enum.flat_map(fn hint ->
+      case present_string(hint) do
+        nil -> []
+        value -> [%{"body_md" => value}]
+      end
+    end)
+  end
+
+  defp markdown_alt(value) do
+    value
+    |> to_string()
+    |> String.replace(["[", "]", "\n", "\r"], " ")
+    |> String.trim()
+  end
 
   defp compile_advanced(
          title,
@@ -709,7 +822,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
          questions,
          stable_key,
          media_assets,
-         attribution
+         attribution,
+         opts
        ) do
     with {:ok, screens} <-
            advanced_screens(
@@ -718,7 +832,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
              questions,
              stable_key,
              media_assets,
-             attribution
+             attribution,
+             opts
            ),
          :ok <- validate_unique_advanced_activity_keys(screens),
          {:ok, activity_specs} <- compile_advanced_screens(screens) do
@@ -766,7 +881,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
          questions,
          stable_key,
          media_assets,
-         attribution
+         attribution,
+         opts
        ) do
     objective =
       content["objective"] ||
@@ -784,7 +900,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       )
 
     with {:ok, blueprint_screens} <-
-           advanced_blueprint_screens(content, stable_key, base_content_screens) do
+           advanced_blueprint_screens(content, stable_key, base_content_screens, opts) do
       content_screens =
         interleave_blueprint_screens(base_content_screens, blueprint_screens)
 
@@ -907,12 +1023,12 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     |> Kernel.++(unplaced)
   end
 
-  defp advanced_blueprint_screens(content, stable_key, content_screens) do
+  defp advanced_blueprint_screens(content, stable_key, content_screens, opts) do
     blueprint = content["advanced_blueprint"] || %{}
     screens = List.wrap(blueprint["screens"])
 
     cond do
-      content["schema_version"] == 3 and screens == [] ->
+      content["schema_version"] in [3, 4] and screens == [] ->
         {:error, :missing_advanced_blueprint}
 
       true ->
@@ -933,7 +1049,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
                    index,
                    stable_key,
                    remediation_paths,
-                   content_screens
+                   content_screens,
+                   opts
                  ) do
               {:ok, built} -> {:cont, {:ok, compiled ++ [built]}}
               {:error, reason} -> {:halt, {:error, {:invalid_advanced_blueprint, index, reason}}}
@@ -944,11 +1061,12 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   end
 
   defp validate_advanced_remediation_integrity(
-         %{"schema_version" => 3},
+         %{"schema_version" => schema_version},
          screens,
          remediation_paths,
          content_screens
-       ) do
+       )
+       when schema_version in [3, 4] do
     section_ids =
       content_screens
       |> Enum.map(& &1[:section_id])
@@ -1073,7 +1191,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
          index,
          stable_key,
          _remediation_paths,
-         _content_screens
+         content_screens,
+         opts
        ) do
     screen_id = present_string(screen["id"]) || "content-#{index}"
     title = present_string(screen["title"]) || blueprint_title("content", index)
@@ -1081,16 +1200,26 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     placement = present_string(screen["placement_after_section_id"])
     key = "#{stable_key}:blueprint:#{screen_id}"
 
-    case body do
-      nil ->
-        {:error, :missing_content_screen_body}
-
-      body ->
-        {:ok,
-         key
-         |> content_screen(title, titled_content_parts(title, body, key))
-         |> Map.put(:placement, placement)
-         |> Map.put(:section_id, placement)}
+    with true <- not is_nil(body),
+         {:ok, parts} <-
+           maybe_inject_generated_simulation(
+             titled_content_parts(title, body, key),
+             screen,
+             key,
+             :content,
+             opts
+           ),
+         adaptive_screen <- content_screen(key, title, parts),
+         {:ok, rules} <-
+           generated_capi_branch_rules(adaptive_screen.rules, parts, content_screens, key) do
+      {:ok,
+       adaptive_screen
+       |> Map.put(:rules, rules)
+       |> Map.put(:placement, placement)
+       |> Map.put(:section_id, placement)}
+    else
+      false -> {:error, :missing_content_screen_body}
+      {:error, _} = error -> error
     end
   end
 
@@ -1099,7 +1228,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
          index,
          stable_key,
          remediation_paths,
-         content_screens
+         content_screens,
+         opts
        ) do
     kind = present_string(screen["kind"])
     interaction_type = present_string(screen["interaction_type"])
@@ -1111,7 +1241,15 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     with true <- kind in ["exploration", "decision", "check", "reflection"],
          {:ok, interaction, common_errors} <-
            blueprint_interaction(screen, interaction_type, prompt, key),
-         parts <- blueprint_screen_parts(title, prompt, interaction, key),
+         {:ok, parts} <-
+           maybe_inject_generated_simulation(
+             blueprint_screen_parts(title, prompt, interaction, key),
+             screen,
+             key,
+             :question,
+             opts
+           ),
+         realized_interaction <- List.last(parts),
          remediation_target <-
            blueprint_remediation_target(
              screen,
@@ -1119,12 +1257,17 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
              remediation_paths,
              content_screens
            ),
-         rules <-
+         base_rules <-
            screen
            |> blueprint_adaptivity(common_errors)
-           |> TrapStateRulesBuilder.build_rules(interaction, parts, [interaction])
+           |> TrapStateRulesBuilder.build_rules(
+             realized_interaction,
+             parts,
+             [realized_interaction]
+           )
            |> add_remediation_navigation(remediation_target, not is_nil(remediation_target))
-           |> stabilize_rules(key) do
+           |> stabilize_rules(key),
+         {:ok, rules} <- generated_capi_branch_rules(base_rules, parts, content_screens, key) do
       {:ok,
        %{
          key: key,
@@ -1141,8 +1284,191 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end
   end
 
-  defp advanced_blueprint_screen(_, _index, _stable_key, _paths, _content_screens),
+  defp advanced_blueprint_screen(_, _index, _stable_key, _paths, _content_screens, _opts),
     do: {:error, :invalid_screen}
+
+  defp maybe_inject_generated_simulation(parts, screen, stable_key, screen_kind, opts) do
+    case present_string(screen["enrichment_proposal_id"]) do
+      nil ->
+        {:ok, parts}
+
+      proposal_id ->
+        with :ok <- reject_model_authored_simulation_url(screen),
+             {:ok, resolved_spec} <- GeneratedSimulation.resolve(proposal_id, opts) do
+          inject_generated_simulation_part(parts, resolved_spec, stable_key, screen_kind)
+        end
+    end
+  end
+
+  defp reject_model_authored_simulation_url(screen) do
+    raw_urls = [
+      screen["src"],
+      screen["url"],
+      screen["artifact_url"],
+      get_in(screen, ["configuration", "src"]),
+      get_in(screen, ["configuration", "url"])
+    ]
+
+    if Enum.any?(raw_urls, &present_text?/1),
+      do: {:error, :generated_simulation_raw_url_forbidden},
+      else: :ok
+  end
+
+  defp inject_generated_simulation_part(parts, resolved_spec, stable_key, :question) do
+    case Enum.split(parts, -1) do
+      {leading_parts, [interaction]} ->
+        simulation_y = next_part_y(leading_parts)
+        simulation_height = 360
+
+        simulation =
+          resolved_spec
+          |> PartBuilders.generated_simulation_part(y: simulation_y, height: simulation_height)
+          |> Map.put("id", stable_id("generated-simulation", stable_key))
+
+        shifted_interaction =
+          put_in(interaction, ["custom", "y"], simulation_y + simulation_height + 16)
+
+        {:ok, leading_parts ++ [simulation, shifted_interaction]}
+
+      _ ->
+        {:error, :generated_simulation_placement_invalid}
+    end
+  end
+
+  defp inject_generated_simulation_part(parts, resolved_spec, stable_key, :content) do
+    simulation =
+      resolved_spec
+      |> PartBuilders.generated_simulation_part(y: next_part_y(parts), height: 360)
+      |> Map.put("id", stable_id("generated-simulation", stable_key))
+
+    {:ok, parts ++ [simulation]}
+  end
+
+  defp generated_capi_branch_rules(base_rules, parts, content_screens, stable_key) do
+    iframe = Enum.find(parts, &(&1["type"] == "janus-capi-iframe"))
+
+    branches =
+      case iframe do
+        %{"custom" => %{"securityProfile" => "generated_simulation"} = custom} ->
+          custom
+          |> Map.get("capiOutputs", [])
+          |> Enum.filter(&(is_map(&1) and is_map(&1["branching"])))
+
+        _ ->
+          []
+      end
+
+    branches
+    |> Enum.with_index(1)
+    |> Enum.reduce_while({:ok, []}, fn {declaration, index}, {:ok, rules} ->
+      branch = declaration["branching"]
+      target_section_id = branch["remediation_section_id"]
+
+      target_screen =
+        content_screens
+        |> Enum.filter(&(&1[:section_id] == target_section_id))
+        |> List.last()
+
+      case target_screen do
+        %{key: target_key} ->
+          rule_key = "#{stable_key}:capi-branch:#{index}"
+
+          actions =
+            [
+              %{
+                "type" => "navigation",
+                "params" => %{"target" => stable_id("sequence", target_key)}
+              }
+            ] ++ generated_capi_feedback_actions(branch["feedback"], rule_key)
+
+          rule = %{
+            "id" => stable_id("rule", rule_key),
+            "name" => "generated-capi-branch-#{index}",
+            "disabled" => false,
+            "additionalScore" => 0.0,
+            "forceProgress" => false,
+            "default" => false,
+            "correct" => false,
+            "conditions" => %{
+              "all" => [
+                %{
+                  "fact" => "stage.#{iframe["id"]}.#{declaration["key"]}",
+                  "operator" => branch["operator"],
+                  "value" => branch["value"]
+                }
+              ]
+            },
+            "event" => %{
+              "type" => stable_id("event", rule_key),
+              "params" => %{"actions" => actions}
+            }
+          }
+
+          {:cont, {:ok, rules ++ [rule]}}
+
+        nil ->
+          {:halt, {:error, {:generated_capi_remediation_target_missing, target_section_id}}}
+      end
+    end)
+    |> case do
+      {:ok, []} -> {:ok, base_rules}
+      {:ok, branch_rules} -> {:ok, branch_rules ++ base_rules}
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp generated_capi_feedback_actions(feedback, stable_key) when is_binary(feedback) do
+    feedback_part =
+      feedback
+      |> PartBuilders.feedback_text_part()
+      |> Map.put("id", stable_id("feedback-part", stable_key))
+
+    [
+      %{
+        "type" => "feedback",
+        "params" => %{
+          "id" => stable_id("feedback", stable_key),
+          "feedback" => %{
+            "custom" => %{
+              "applyBtnFlag" => false,
+              "applyBtnLabel" => "Show Solution",
+              "mainBtnLabel" => "Next",
+              "panelTitleColor" => 16_777_215,
+              "panelHeaderColor" => 10_027_008,
+              "lockCanvasSize" => true,
+              "width" => 350.0,
+              "height" => 100.0,
+              "palette" => %{
+                "fillColor" => 1.6777215e7,
+                "fillAlpha" => 0.0,
+                "lineColor" => 1.6777215e7,
+                "lineAlpha" => 0.0,
+                "lineThickness" => 0.1,
+                "lineStyle" => 0.0
+              },
+              "rules" => [],
+              "facts" => []
+            },
+            "partsLayout" => [feedback_part]
+          }
+        }
+      }
+    ]
+  end
+
+  defp generated_capi_feedback_actions(_feedback, _stable_key), do: []
+
+  defp next_part_y(parts) do
+    parts
+    |> Enum.map(fn part ->
+      y = get_in(part, ["custom", "y"])
+      height = get_in(part, ["custom", "height"])
+
+      if is_number(y) and is_number(height), do: y + height, else: 0
+    end)
+    |> Enum.max(fn -> 0 end)
+    |> Kernel.+(16)
+  end
 
   defp blueprint_title("exploration", index), do: "Explore the idea #{index}"
   defp blueprint_title("decision", index), do: "Make a decision #{index}"
@@ -1406,6 +1732,10 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
          media_assets,
          attribution
        ) do
+    sections = instructional_sections(content)
+    curated = normalize_curated_enrichments(content["curated_enrichments"])
+    section_ids = MapSet.new(sections, & &1["id"])
+
     overview_screens =
       content
       |> Map.get(
@@ -1459,8 +1789,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
         advanced_media_screens(media_assets, nil, "#{stable_key}:opening-media")
 
     instruction_screens =
-      content
-      |> instructional_sections()
+      sections
       |> Enum.with_index(1)
       |> Enum.flat_map(fn {section, index} ->
         explanation_screens =
@@ -1516,9 +1845,25 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
             |> Map.put(:section_id, section["id"])
           end)
 
+        curated_screens =
+          curated
+          |> curated_for_placement(section["id"])
+          |> advanced_curated_screens(
+            "#{stable_key}:instruction:#{index}:curated",
+            section["id"]
+          )
+
         explanation_screens ++
-          callout_screens ++ section_media_screens ++ example_screens
+          callout_screens ++ section_media_screens ++ example_screens ++ curated_screens
       end)
+
+    unplaced_curated_screens =
+      curated
+      |> Enum.reject(fn enrichment ->
+        placement = enrichment["placement_after_section_id"]
+        is_binary(placement) and MapSet.member?(section_ids, placement)
+      end)
+      |> advanced_curated_screens("#{stable_key}:curated", nil)
 
     example_screens =
       content
@@ -1557,6 +1902,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       overview_screens ++
         opening_screens ++
         instruction_screens ++
+        unplaced_curated_screens ++
         example_screens ++
         application_screens ++ takeaway_screens ++ attribution_screens
 
@@ -1577,6 +1923,57 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       screens ->
         screens
     end
+  end
+
+  defp advanced_curated_screens(enrichments, stable_key, section_id) do
+    enrichments
+    |> Enum.with_index(1)
+    |> Enum.map(fn {enrichment, index} ->
+      key = "#{stable_key}:#{index}"
+      title = enrichment["title"]
+
+      parts =
+        [
+          title
+          |> PartBuilders.text_flow(:h3, y: 0)
+          |> Map.put("id", stable_id("heading", key)),
+          enrichment["annotation"]
+          |> PartBuilders.text_flow(:p, y: 52)
+          |> Map.put("id", stable_id("annotation", key)),
+          "Try this resource"
+          |> PartBuilders.text_flow(:h4, y: 156)
+          |> Map.put("id", stable_id("task-heading", key)),
+          enrichment["learner_task"]
+          |> PartBuilders.text_flow(:p, y: 196)
+          |> Map.put("id", stable_id("task", key)),
+          advanced_external_link_part(
+            "Open #{title}",
+            enrichment["url"],
+            "#{key}:link",
+            300
+          )
+        ]
+
+      content_screen(key, title, parts)
+      |> Map.put(:section_id, section_id)
+    end)
+  end
+
+  defp advanced_external_link_part(label, url, stable_key, y) do
+    label
+    |> PartBuilders.text_flow(:p, y: y)
+    |> Map.put("id", stable_id("link", stable_key))
+    |> put_in(
+      ["custom", "nodes"],
+      [
+        %{
+          "tag" => "a",
+          "href" => url,
+          "target" => "_blank",
+          "children" => [%{"tag" => "text", "text" => label, "children" => []}]
+        }
+      ]
+    )
   end
 
   defp advanced_callout_screens(value, default_title, stable_key, section_id \\ nil) do
@@ -2073,12 +2470,17 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
        ) do
     %{
       "label" => question_prompt(question),
-      "choices" => Enum.map(question["normalized_choices"], & &1["text"]),
+      "choices" =>
+        Enum.map(question["normalized_choices"], & &1["text"]) ++
+          if(question["allow_not_sure"] == true, do: ["Not sure"], else: []),
       "correct" => question["correct_index"],
       "correctFeedback" =>
         question_feedback(question, "correct", "Correct. Continue when you are ready."),
       "incorrectFeedback" =>
-        question_feedback(question, "incorrect", "Revisit this idea: #{reminder}")
+        first_present([
+          question["hint"],
+          question_feedback(question, "incorrect", "Revisit this idea: #{reminder}")
+        ])
     }
     |> PartBuilders.mcq_part(y: 164)
     |> Map.put("id", stable_id("question", "#{stable_key}:#{index}"))
@@ -2115,18 +2517,37 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     }
   end
 
-  defp question_common_errors(%{
-         "type" => "multiple_choice",
-         "normalized_choices" => choices,
-         "correct_index" => correct_index
-       }) do
-    choices
-    |> Enum.with_index(1)
-    |> Enum.flat_map(fn {choice, option} ->
-      if option - 1 != correct_index and present_text?(choice["feedback"]),
-        do: [%{"option" => option, "feedback" => choice["feedback"]}],
-        else: []
-    end)
+  defp question_common_errors(
+         %{
+           "type" => "multiple_choice",
+           "normalized_choices" => choices,
+           "correct_index" => correct_index
+         } = question
+       ) do
+    errors =
+      choices
+      |> Enum.with_index(1)
+      |> Enum.flat_map(fn {choice, option} ->
+        if option - 1 != correct_index and present_text?(choice["feedback"]),
+          do: [%{"option" => option, "feedback" => choice["feedback"]}],
+          else: []
+      end)
+
+    if question["allow_not_sure"] == true do
+      errors ++
+        [
+          %{
+            "option" => length(choices) + 1,
+            "feedback" =>
+              first_present([
+                question["hint"],
+                "Review the preceding explanation, then try again."
+              ])
+          }
+        ]
+    else
+      errors
+    end
   end
 
   defp question_common_errors(_question), do: []
@@ -2570,6 +2991,54 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
         []
     end)
     |> Enum.uniq_by(& &1.url)
+  end
+
+  defp normalize_curated_enrichments(enrichments) do
+    enrichments
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      %{} = enrichment ->
+        with "annotated_link" <- enrichment["delivery_mode"],
+             url when is_binary(url) <- safe_curated_url(enrichment["url"]),
+             title when is_binary(title) <- present_string(enrichment["title"]),
+             annotation when is_binary(annotation) <-
+               present_string(enrichment["annotation"]),
+             learner_task when is_binary(learner_task) <-
+               present_string(enrichment["learner_task"]) do
+          [
+            %{
+              "proposal_id" => enrichment["proposal_id"],
+              "title" => title,
+              "url" => url,
+              "annotation" => annotation,
+              "learner_task" => learner_task,
+              "placement_after_section_id" =>
+                get_in(enrichment, ["placement", "after_section_id"])
+            }
+          ]
+        else
+          _ -> []
+        end
+
+      _ ->
+        []
+    end)
+    |> Enum.uniq_by(& &1["proposal_id"])
+  end
+
+  defp curated_for_placement(enrichments, section_id) do
+    Enum.filter(enrichments, &(&1["placement_after_section_id"] == section_id))
+  end
+
+  defp safe_curated_url(url) do
+    with trimmed when is_binary(trimmed) <- present_string(url),
+         %URI{scheme: "https", host: host, userinfo: nil} = uri <- URI.parse(trimmed),
+         true <- is_binary(host) and host != "",
+         true <- is_nil(uri.port) or uri.port == 443 do
+      URI.to_string(uri)
+    else
+      _ -> nil
+    end
   end
 
   defp safe_source_url(url) do

@@ -16,6 +16,10 @@ defmodule Oli.OpenStax.CourseImport.Parser do
   @max_pedagogical_chunks_per_lesson 4
   @compatibility_excerpt_block_limit 24
   @compatibility_excerpt_char_limit 10_000
+  @full_source_plan_schema_version 4
+  @deterministically_omittable_block_kinds ~w(
+    navigation duplicated_boilerplate boilerplate unsafe_media
+  )
 
   @type outline :: %{required(String.t()) => term()}
   @type parse_error :: :invalid_openstax_url
@@ -41,12 +45,18 @@ defmodule Oli.OpenStax.CourseImport.Parser do
   def verify_book_url(url), do: parse_openstax_url(url)
 
   @doc """
-  Groups each selected OpenStax chapter into lessons containing one to three
-  source sections. Two sections is the default bundle size.
+  Builds the legacy adaptive outline used by plan schemas v1-v3.
+
+  Use `build_outline/2` with `plan_schema_version: 4` for the refined import
+  contract, where source sections are never merged and only an exceptional
+  section may be split at an existing pedagogical boundary.
   """
   @spec build_outline(map()) :: {:ok, outline()} | {:error, term()}
-  def build_outline(%{"book_slug" => book_slug, "chapters" => chapters} = snapshot)
-      when is_binary(book_slug) and is_list(chapters) do
+  def build_outline(snapshot), do: build_outline(snapshot, [])
+
+  @spec build_outline(map(), keyword()) :: {:ok, outline()} | {:error, term()}
+  def build_outline(%{"book_slug" => book_slug, "chapters" => chapters} = snapshot, opts)
+      when is_list(opts) and is_binary(book_slug) and is_list(chapters) do
     selected_chapters = Enum.filter(chapters, &Map.get(&1, "selected", true))
 
     case selected_chapters do
@@ -67,10 +77,10 @@ defmodule Oli.OpenStax.CourseImport.Parser do
 
             lessons =
               sections
-              |> adaptive_section_groups()
+              |> section_groups(opts)
               |> Enum.with_index(1)
               |> Enum.map(fn {lesson_sections, lesson_order} ->
-                build_lesson(lesson_sections, lesson_order)
+                build_lesson(lesson_sections, lesson_order, opts)
               end)
 
             %{
@@ -100,7 +110,7 @@ defmodule Oli.OpenStax.CourseImport.Parser do
     end
   end
 
-  def build_outline(_), do: {:error, :invalid_source_snapshot}
+  def build_outline(_, _), do: {:error, :invalid_source_snapshot}
 
   defp valid_section?(%{"url" => url}) when is_binary(url), do: url != ""
   defp valid_section?(_), do: false
@@ -214,6 +224,16 @@ defmodule Oli.OpenStax.CourseImport.Parser do
       block["text"] ||
         block["normalized_text"] ||
         get_in(block, ["metadata", "semantic_payload", "text"])
+
+  defp section_groups(sections, opts) do
+    if plan_schema_version(opts) >= @full_source_plan_schema_version do
+      sections
+      |> Enum.flat_map(&split_exceptional_section/1)
+      |> Enum.map(&[&1])
+    else
+      adaptive_section_groups(sections)
+    end
+  end
 
   defp adaptive_section_groups(sections) do
     {opening_hook, numbered_sections} = chapter_opening(sections)
@@ -557,10 +577,21 @@ defmodule Oli.OpenStax.CourseImport.Parser do
       end
   end
 
-  defp build_lesson(sections, lesson_order) do
+  defp build_lesson(sections, lesson_order, opts) do
     source_blocks = lesson_source_blocks(sections)
     source_media = lesson_source_media(sections)
     source_block_ids = recursive_source_block_ids(source_blocks)
+
+    {substantive_block_ids, deterministically_omittable_block_ids} =
+      source_blocks
+      |> recursive_source_blocks()
+      |> Enum.split_with(&substantive_source_block?/1)
+
+    substantive_block_ids = Enum.map(substantive_block_ids, & &1["id"]) |> Enum.uniq()
+
+    deterministically_omittable_block_ids =
+      Enum.map(deterministically_omittable_block_ids, & &1["id"]) |> Enum.uniq()
+
     source_media_ids = source_media_ids(source_media)
     source_word_count = Enum.reduce(sections, 0, &(&2 + section_word_count(&1)))
     {source_excerpt, excerpt_coverage} = lesson_excerpt(source_blocks)
@@ -580,27 +611,92 @@ defmodule Oli.OpenStax.CourseImport.Parser do
       "source_blocks" => source_blocks,
       "source_media" => source_media,
       "source_word_count" => source_word_count,
-      "source_coverage" => %{
-        "complete" => Enum.all?(sections, &complete_semantic_source?/1),
-        "section_count" => length(sections),
-        "section_urls" => Enum.map(sections, & &1["url"]),
-        "source_block_ids" => source_block_ids,
-        "source_media_ids" => source_media_ids,
-        "source_fragments" =>
-          sections
-          |> Enum.map(& &1["source_fragment"])
-          |> Enum.filter(&is_map/1),
-        "block_count" => length(source_blocks),
-        "semantic_block_count" => recursive_block_count(source_blocks),
-        "block_kind_counts" => block_kind_counts(source_blocks),
-        "objective_count" => length(source_objectives),
-        "media_count" => length(source_media),
-        "word_count" => source_word_count,
-        "excerpt_block_count" => excerpt_coverage.block_count,
-        "excerpt_block_ids" => excerpt_coverage.block_ids,
-        "excerpt_truncated" => excerpt_coverage.truncated
-      }
+      "source_coverage" =>
+        %{
+          "complete" => Enum.all?(sections, &complete_semantic_source?/1),
+          "section_count" => length(sections),
+          "section_urls" => Enum.map(sections, & &1["url"]),
+          "source_block_ids" => source_block_ids,
+          "source_media_ids" => source_media_ids,
+          "source_fragments" =>
+            sections
+            |> Enum.map(& &1["source_fragment"])
+            |> Enum.filter(&is_map/1),
+          "block_count" => length(source_blocks),
+          "semantic_block_count" => recursive_block_count(source_blocks),
+          "block_kind_counts" => block_kind_counts(source_blocks),
+          "objective_count" => length(source_objectives),
+          "media_count" => length(source_media),
+          "word_count" => source_word_count,
+          "excerpt_block_count" => excerpt_coverage.block_count,
+          "excerpt_block_ids" => excerpt_coverage.block_ids,
+          "excerpt_truncated" => excerpt_coverage.truncated
+        }
+        |> maybe_add_full_source_coverage(
+          opts,
+          substantive_block_ids,
+          deterministically_omittable_block_ids
+        )
     }
+  end
+
+  defp maybe_add_full_source_coverage(
+         coverage,
+         opts,
+         substantive_block_ids,
+         deterministically_omittable_block_ids
+       ) do
+    if plan_schema_version(opts) >= @full_source_plan_schema_version do
+      coverage
+      |> Map.put("policy", "full_substantive_source")
+      |> Map.put("policy_schema_version", @full_source_plan_schema_version)
+      |> Map.put("substantive_block_ids", substantive_block_ids)
+      |> Map.put(
+        "deterministically_omittable_block_ids",
+        deterministically_omittable_block_ids
+      )
+      |> Map.put(
+        "deterministically_omittable_kinds",
+        @deterministically_omittable_block_kinds
+      )
+    else
+      coverage
+    end
+  end
+
+  defp recursive_source_blocks(blocks) do
+    blocks
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      %{} = block ->
+        [block] ++
+          recursive_source_blocks(block["blocks"]) ++
+          recursive_list_source_blocks(block["items"])
+
+      _ ->
+        []
+    end)
+    |> Enum.uniq_by(& &1["id"])
+  end
+
+  defp recursive_list_source_blocks(items) do
+    items
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      %{} = item -> recursive_source_blocks(item["children"])
+      _ -> []
+    end)
+  end
+
+  defp substantive_source_block?(block) do
+    block_kind(block) not in @deterministically_omittable_block_kinds
+  end
+
+  defp plan_schema_version(opts) do
+    case Keyword.get(opts, :plan_schema_version, 3) do
+      version when is_integer(version) -> version
+      _ -> 3
+    end
   end
 
   defp recursive_source_block_ids(blocks) do

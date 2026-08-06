@@ -9,7 +9,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   use OliWeb, :live_view
 
   alias Oli.OpenStax.CourseImport
-  alias Oli.OpenStax.CourseImport.{Estimator, PubSub}
+  alias Oli.OpenStax.CourseImport.{Enrichment, Estimator, PubSub}
   alias Oli.Publishing.AuthoringResolver
   alias Phoenix.Component
 
@@ -53,6 +53,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
        target_container: target_container,
        return_path: ~p"/workspaces/course_author/#{project.slug}/curriculum",
        available?: CourseImport.available?(project, author),
+       enrichment_capabilities: CourseImport.enrichment_capabilities(project),
        form: import_form(),
        run: nil,
        run_estimate: nil,
@@ -267,6 +268,109 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     end
   end
 
+  def handle_event("research_enrichment", %{"proposal_id" => proposal_id}, socket) do
+    with %{} = run <- socket.assigns.run,
+         {:ok, _proposal} <-
+           CourseImport.request_enrichment_research(
+             run.id,
+             proposal_id,
+             socket.assigns.author
+           ),
+         {:ok, refreshed} <-
+           CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
+      {:noreply, socket |> assign(error_message: nil) |> assign_run(refreshed)}
+    else
+      {:error, reason} -> {:noreply, assign(socket, error_message: course_import_error(reason))}
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("approve_enrichment", %{"proposal_id" => proposal_id}, socket) do
+    with %{} = run <- socket.assigns.run,
+         {:ok, _proposal} <-
+           CourseImport.approve_enrichment_proposal(
+             run.id,
+             proposal_id,
+             socket.assigns.author
+           ),
+         {:ok, refreshed} <-
+           CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
+      {:noreply, socket |> assign(error_message: nil) |> assign_run(refreshed)}
+    else
+      {:error, reason} -> {:noreply, assign(socket, error_message: course_import_error(reason))}
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("omit_enrichment", %{"proposal_id" => proposal_id}, socket) do
+    with %{} = run <- socket.assigns.run,
+         {:ok, _proposal} <-
+           CourseImport.omit_enrichment_proposal(
+             run.id,
+             proposal_id,
+             socket.assigns.author
+           ),
+         {:ok, refreshed} <-
+           CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
+      {:noreply, socket |> assign(error_message: nil) |> assign_run(refreshed)}
+    else
+      {:error, reason} -> {:noreply, assign(socket, error_message: course_import_error(reason))}
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("generate_simulation", %{"proposal_id" => proposal_id}, socket) do
+    with %{} = run <- socket.assigns.run,
+         {:ok, _artifact} <-
+           CourseImport.request_simulation_generation(
+             run.id,
+             proposal_id,
+             socket.assigns.author
+           ),
+         {:ok, refreshed} <-
+           CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
+      {:noreply, socket |> assign(error_message: nil) |> assign_run(refreshed)}
+    else
+      {:error, reason} -> {:noreply, assign(socket, error_message: course_import_error(reason))}
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("approve_simulation", %{"artifact_id" => artifact_id}, socket) do
+    with %{} = run <- socket.assigns.run,
+         {:ok, _artifact} <-
+           CourseImport.approve_simulation_artifact(
+             run.id,
+             artifact_id,
+             socket.assigns.author
+           ),
+         {:ok, refreshed} <-
+           CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
+      {:noreply, socket |> assign(error_message: nil) |> assign_run(refreshed)}
+    else
+      {:error, reason} -> {:noreply, assign(socket, error_message: course_import_error(reason))}
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("reject_simulation", %{"artifact_id" => artifact_id}, socket) do
+    with %{} = run <- socket.assigns.run,
+         {:ok, _artifact} <-
+           CourseImport.reject_simulation_artifact(
+             run.id,
+             artifact_id,
+             socket.assigns.author,
+             "Rejected during simulation preview review"
+           ),
+         {:ok, refreshed} <-
+           CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
+      {:noreply, socket |> assign(error_message: nil) |> assign_run(refreshed)}
+    else
+      {:error, reason} -> {:noreply, assign(socket, error_message: course_import_error(reason))}
+      _ -> {:noreply, socket}
+    end
+  end
+
   def handle_event("apply", _params, socket) do
     with %{} = run <- socket.assigns.run,
          {:ok, updated} <-
@@ -380,11 +484,25 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   end
 
   defp schedule_poll(socket, %{status: status} = run) do
-    if status in @polling_statuses or lesson_planning_summary(run).active_items != [] do
+    if status in @polling_statuses or lesson_planning_summary(run).active_items != [] or
+         enrichment_work_active?(run) do
       assign(socket, poll_timer: Process.send_after(self(), :poll_run, @poll_interval_ms))
     else
       socket
     end
+  end
+
+  defp enrichment_work_active?(run) do
+    run
+    |> Map.get(:enrichment_proposals, [])
+    |> List.wrap()
+    |> Enum.any?(fn proposal ->
+      proposal.research_status == "running" or
+        Enum.any?(
+          Map.get(proposal, :simulation_artifacts, []),
+          &(&1.status == "generating")
+        )
+    end)
   end
 
   defp cancel_poll(%{assigns: %{poll_timer: nil}} = socket), do: socket
@@ -1260,6 +1378,238 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     |> normalize_plan_maps()
   end
 
+  defp lesson_coverage_rows(lesson) do
+    coverage = plan_content(lesson, "coverage_manifest", %{})
+    available = map_string_key(coverage, "available_block_ids", []) |> normalize_plan_strings()
+    included = map_string_key(coverage, "included_block_ids", []) |> normalize_plan_strings()
+
+    excluded =
+      coverage
+      |> map_string_key("excluded_blocks", [])
+      |> normalize_plan_maps()
+      |> Map.new(fn entry ->
+        {plan_item_value(entry, "id"), plan_item_value(entry, "reason")}
+      end)
+
+    Enum.map(available, fn block_id ->
+      cond do
+        block_id in included ->
+          %{"id" => block_id, "status" => gettext("Included"), "reason" => ""}
+
+        Map.has_key?(excluded, block_id) ->
+          %{
+            "id" => block_id,
+            "status" => gettext("Excluded"),
+            "reason" => Map.get(excluded, block_id, "")
+          }
+
+        true ->
+          %{
+            "id" => block_id,
+            "status" => gettext("Unaccounted for"),
+            "reason" => gettext("This source block must be included or explicitly excluded.")
+          }
+      end
+    end)
+  end
+
+  defp lesson_enrichment_proposals(run, lesson) do
+    run
+    |> Map.get(:enrichment_proposals, [])
+    |> List.wrap()
+    |> Enum.filter(&(&1.lesson_id == lesson.id))
+    |> Enum.sort_by(& &1.rank)
+  end
+
+  defp proposal_artifacts(proposal) do
+    proposal
+    |> Map.get(:simulation_artifacts, [])
+    |> List.wrap()
+    |> Enum.sort_by(& &1.version, :desc)
+  end
+
+  defp approved_proposal_artifact(proposal),
+    do: Enum.find(proposal_artifacts(proposal), &(&1.status == "approved"))
+
+  defp active_proposal_artifact(proposal),
+    do: Enum.find(proposal_artifacts(proposal), &(&1.status == "generating"))
+
+  defp reviewable_proposal_artifact(proposal),
+    do: Enum.find(proposal_artifacts(proposal), &(&1.status == "ready_for_review"))
+
+  defp latest_proposal_artifact(proposal), do: List.first(proposal_artifacts(proposal))
+
+  defp simulation_preview_url(%{status: status, validation_status: validation_status} = artifact) do
+    if status in ["ready_for_review", "approved"] and validation_status == "passed" do
+      case Enrichment.artifact_url(artifact, allow_preview: true) do
+        {:ok, url} -> url
+        {:error, _reason} -> nil
+      end
+    end
+  end
+
+  defp simulation_preview_url(_artifact), do: nil
+
+  defp proposal_kind_label("generated_simulation"), do: gettext("Generated simulation")
+  defp proposal_kind_label("existing_simulation"), do: gettext("Existing simulation")
+  defp proposal_kind_label("external_resource"), do: gettext("Curated resource")
+  defp proposal_kind_label("article"), do: gettext("Article")
+  defp proposal_kind_label("video"), do: gettext("Video")
+  defp proposal_kind_label(kind), do: humanize_check_key(kind)
+
+  defp proposal_state_label(state), do: humanize_check_key(state)
+
+  defp proposal_can_approve?(proposal, lesson, capabilities) do
+    proposal.state == "proposed" and
+      case proposal.kind do
+        "generated_simulation" ->
+          lesson.plan_mode == "advanced" and capabilities.generated_available
+
+        _ ->
+          proposal.research_status == "completed" and
+            is_map(proposal.research_evidence) and
+            map_size(proposal.research_evidence) > 0 and
+            is_binary(curated_resource_url(proposal))
+      end
+  end
+
+  defp curated_resource_url(%{resource_url: url}) when is_binary(url) do
+    case URI.parse(String.trim(url)) do
+      %URI{scheme: "https", host: host, userinfo: nil, port: port} = uri
+      when is_binary(host) and host != "" and (is_nil(port) or port == 443) ->
+        URI.to_string(uri)
+
+      _ ->
+        nil
+    end
+  end
+
+  defp curated_resource_url(_proposal), do: nil
+
+  defp proposal_can_generate?(proposal, capabilities) do
+    proposal.kind == "generated_simulation" and proposal.state == "approved" and
+      capabilities.generated_available and is_nil(active_proposal_artifact(proposal)) and
+      is_nil(reviewable_proposal_artifact(proposal)) and
+      is_nil(approved_proposal_artifact(proposal))
+  end
+
+  defp enrichment_evidence_rows(value) when is_map(value) do
+    value
+    |> Enum.sort_by(fn {key, _value} -> to_string(key) end)
+    |> Enum.map(fn {key, item} ->
+      %{label: humanize_check_key(to_string(key)), value: enrichment_evidence_value(item)}
+    end)
+  end
+
+  defp enrichment_evidence_rows(_), do: []
+
+  defp enrichment_evidence_value(value) when is_binary(value), do: value
+  defp enrichment_evidence_value(value) when is_number(value), do: to_string(value)
+  defp enrichment_evidence_value(value) when is_boolean(value), do: to_string(value)
+
+  defp enrichment_evidence_value(values) when is_list(values),
+    do: Enum.map_join(values, ", ", &enrichment_evidence_value/1)
+
+  defp enrichment_evidence_value(value) when is_map(value) do
+    case Jason.encode(value) do
+      {:ok, encoded} -> encoded
+      {:error, _reason} -> gettext("Recorded")
+    end
+  end
+
+  defp enrichment_evidence_value(_), do: gettext("Recorded")
+
+  defp lesson_flow_steps(lesson) do
+    base =
+      [
+        if(lesson_learning_objectives(lesson) != [],
+          do: %{"role" => "orientation", "label" => gettext("Objectives")}
+        ),
+        if(plan_content(lesson, "opening_hook") != "",
+          do: %{"role" => "orientation", "label" => gettext("Curiosity hook")}
+        ),
+        if(plan_content(lesson, "why_this_matters") != "",
+          do: %{"role" => "orientation", "label" => gettext("Relevance")}
+        )
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    middle =
+      if lesson.plan_mode == "advanced" do
+        lesson
+        |> plan_advanced_screens()
+        |> Enum.map(fn screen ->
+          role = plan_item_value(screen, "role", plan_item_value(screen, "kind", "exploration"))
+
+          %{
+            "role" => role,
+            "label" => plan_item_value(screen, "title", humanize_check_key(role))
+          }
+        end)
+      else
+        questions = plan_questions(lesson)
+
+        sections = plan_instructional_sections(lesson)
+
+        section_ids =
+          sections
+          |> Enum.map(&plan_item_value(&1, "id"))
+          |> Enum.reject(&(&1 == ""))
+          |> MapSet.new()
+
+        interleaved =
+          sections
+          |> Enum.flat_map(fn section ->
+            section_id = plan_item_value(section, "id")
+
+            instruction = %{
+              "role" => "instruction",
+              "label" => plan_item_value(section, "heading", gettext("Instruction"))
+            }
+
+            nearby_practice =
+              questions
+              |> Enum.filter(&(plan_item_value(&1, "placement_after_section_id") == section_id))
+              |> Enum.map(fn _question ->
+                %{
+                  "role" => "practice",
+                  "label" => gettext("Learn by doing")
+                }
+              end)
+
+            [instruction | nearby_practice]
+          end)
+
+        unplaced_practice =
+          questions
+          |> Enum.reject(fn question ->
+            MapSet.member?(
+              section_ids,
+              plan_item_value(question, "placement_after_section_id")
+            )
+          end)
+          |> Enum.map(fn _question ->
+            %{"role" => "practice", "label" => gettext("Learn by doing")}
+          end)
+
+        interleaved ++ unplaced_practice
+      end
+
+    ending =
+      [
+        if(plan_worked_examples(lesson) != [],
+          do: %{"role" => "evidence", "label" => gettext("Worked examples")}
+        ),
+        if(plan_key_takeaways(lesson) != [],
+          do: %{"role" => "synthesis", "label" => gettext("Takeaways")}
+        ),
+        %{"role" => "attribution", "label" => gettext("Attribution")}
+      ]
+      |> Enum.reject(&is_nil/1)
+
+    base ++ middle ++ ending
+  end
+
   defp plan_item_evidence_ids(item) do
     item
     |> plan_item_value("evidence_block_ids", [])
@@ -1765,6 +2115,36 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
 
   defp course_import_error(:lessons_pending_approval),
     do: gettext("Approve every lesson before creating the course.")
+
+  defp course_import_error({:approved_enrichment_incomplete, _proposal_ids}),
+    do:
+      gettext(
+        "Complete, reject, or omit every approved simulation proposal before creating the course."
+      )
+
+  defp course_import_error(:simulation_generation_unavailable),
+    do:
+      gettext(
+        "Simulation generation is not available. Enable the project flag and configure the generator, isolated container runtime, and artifact storage, or omit this proposal."
+      )
+
+  defp course_import_error(:simulation_generation_in_progress),
+    do: gettext("This proposal already has a simulation preview in progress or awaiting review.")
+
+  defp course_import_error(:generated_enrichment_requires_advanced_authoring),
+    do: gettext("Generated simulations can be approved only for Advanced Author lessons.")
+
+  defp course_import_error(:research_unavailable),
+    do: gettext("Curated-resource research is not configured for this project.")
+
+  defp course_import_error(:curated_enrichment_not_ready),
+    do:
+      gettext(
+        "Complete curated-resource research and review its HTTPS link and evidence before approving this proposal."
+      )
+
+  defp course_import_error(:artifact_invalid),
+    do: gettext("This simulation artifact has not passed all required validation checks.")
 
   defp course_import_error(:no_lessons_to_approve),
     do: gettext("There are no lesson plans available to approve yet.")

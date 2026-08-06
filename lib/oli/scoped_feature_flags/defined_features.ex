@@ -73,6 +73,20 @@ defmodule Oli.ScopedFeatureFlags.DefinedFeatures do
     rollout_mode: :canary
   )
 
+  deffeature(
+    :openstax_refined_planning_v4,
+    [:authoring],
+    "Enable full-source OpenStax planning and refined Basic and Advanced lesson flows",
+    rollout_mode: :canary
+  )
+
+  deffeature(
+    :openstax_generated_enrichment,
+    [:authoring],
+    "Enable author-governed generated enrichment proposals and simulation artifacts",
+    rollout_mode: :canary
+  )
+
   # Test-only features for comprehensive testing
   if Mix.env() in [:test] do
     deffeature(:feature1, [:both], "Test feature for both scopes")

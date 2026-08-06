@@ -10,7 +10,7 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   alias Oli.GenAI.Completions.{Message, RegisteredModel, ServiceConfig}
   alias Oli.GenAI.Execution
   alias Oli.GenAI.FeatureConfig
-  alias Oli.OpenStax.CourseImport.Planner
+  alias Oli.OpenStax.CourseImport.{FullSource, Planner}
 
   @feature :openstax_course_import
   @default_openai_url "https://api.openai.com"
@@ -18,6 +18,7 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   @default_openai_timeout 8_000
   @default_openai_receive_timeout 120_000
   @max_instructional_sections 7
+  @max_refined_instructional_sections 40
   @source_chunk_words 650
   @max_source_chunks 240
   @max_source_prompt_characters 80_000
@@ -31,6 +32,13 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   def plan(lesson, index, opts \\ [])
 
   def plan(lesson, index, opts) when is_map(lesson) and is_integer(index) and index > 0 do
+    lesson =
+      Map.put(
+        lesson,
+        "__plan_schema_version",
+        normalized_plan_schema_version(Keyword.get(opts, :plan_schema_version, 3))
+      )
+
     case service_config(opts) do
       {:error, {:missing_feature_config, _message}} ->
         {:ok, deterministic_result(lesson, index, opts)}
@@ -44,7 +52,7 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
              {:ok, plan_mode, payload} <- parse_response(content, lesson, index, opts) do
           {:ok,
            maybe_downgrade_plan_schema(
-             %{plan_mode: plan_mode, payload: payload, created_by: "ai", metadata: metadata},
+             planning_result(plan_mode, payload, "ai", metadata, opts),
              opts
            )}
         else
@@ -60,29 +68,50 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   def plan(_, _, _), do: {:error, :invalid_lesson}
 
   defp deterministic_result(lesson, index, opts) do
-    {plan_mode, payload} = Planner.build_lesson_plan(lesson, index)
+    {plan_mode, payload} = Planner.build_lesson_plan(lesson, index, opts)
 
     maybe_downgrade_plan_schema(
-      %{
-        plan_mode: plan_mode,
-        payload: payload,
-        created_by: "system",
-        metadata: %{strategy: :deterministic}
-      },
+      planning_result(plan_mode, payload, "system", %{strategy: :deterministic}, opts),
       opts
     )
   end
 
-  defp maybe_downgrade_plan_schema(result, opts) do
-    if Keyword.get(opts, :plan_schema_version, 3) >= 3 do
-      result
-    else
-      content =
-        result.payload
-        |> Map.get("content_payload", %{})
-        |> Map.put("schema_version", 2)
+  defp planning_result(plan_mode, payload, created_by, metadata, opts) do
+    if Keyword.get(opts, :plan_schema_version, 3) >= 4 do
+      {enrichment_proposals, lesson_payload} = Map.pop(payload, "enrichment_proposals", [])
 
-      put_in(result, [:payload, "content_payload"], content)
+      %{
+        plan_mode: plan_mode,
+        payload: lesson_payload,
+        enrichment_proposals: enrichment_proposals,
+        created_by: created_by,
+        metadata: metadata
+      }
+    else
+      %{
+        plan_mode: plan_mode,
+        payload: payload,
+        created_by: created_by,
+        metadata: metadata
+      }
+    end
+  end
+
+  defp maybe_downgrade_plan_schema(result, opts) do
+    case Keyword.get(opts, :plan_schema_version, 3) do
+      version when version >= 4 ->
+        put_in(result, [:payload, "content_payload", "schema_version"], 4)
+
+      version when version >= 3 ->
+        result
+
+      _ ->
+        content =
+          result.payload
+          |> Map.get("content_payload", %{})
+          |> Map.put("schema_version", 2)
+
+        put_in(result, [:payload, "content_payload"], content)
     end
   end
 
@@ -168,7 +197,7 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   defp call_execution(lesson, index, service_config, opts) do
     with {:ok, prompt} <- user_prompt(lesson, index) do
       messages = [
-        Message.new(:system, system_prompt()),
+        Message.new(:system, system_prompt(opts)),
         Message.new(:user, prompt)
       ]
 
@@ -197,8 +226,12 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
          {:ok, questions} <- questions(decoded, lesson),
          {:ok, advanced_blueprint} <-
            advanced_blueprint(decoded, plan_mode, lesson, instructional_sections, opts) do
+      schema_version = lesson["__plan_schema_version"] || 3
+
+      instructional_sections =
+        FullSource.preserve_sections(lesson, instructional_sections, schema_version)
+
       evidence_links = evidence_links(lesson)
-      source_blocks = source_blocks(lesson)
       media = selected_media(decoded, lesson)
       callouts = callouts(decoded, lesson)
       curiosity_prompts = curiosity_prompts(decoded, lesson)
@@ -208,34 +241,76 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
       why_this_matters =
         optional_nested_text(decoded, "content_payload", "why_this_matters", narrative)
 
-      {:ok, plan_mode,
-       %{
-         "content_payload" => %{
-           "schema_version" => 3,
-           "title" => lesson["title"] || "OpenStax lesson #{index}",
-           "objective" => List.first(objectives),
-           "learning_objectives" => objectives,
-           "opening_hook" => opening_hook,
-           "why_this_matters" => why_this_matters,
-           "narrative" => narrative,
-           "instructional_sections" => instructional_sections,
-           "callouts" => callouts,
-           "media" => media,
-           "worked_examples" => worked_examples,
-           "curiosity_prompts" => curiosity_prompts,
-           "application_problems" => application_problems,
-           "key_takeaways" => key_takeaways,
-           "estimated_minutes" => estimated_minutes(decoded, lesson),
-           "source_evidence_links" => evidence_links,
-           "source_block_ids" => Enum.map(source_blocks, & &1["id"]),
-           "coverage_manifest" =>
-             coverage_manifest(decoded, lesson, instructional_sections, callouts, media),
-           "attribution" => attribution(lesson),
-           "advanced_blueprint" => advanced_blueprint,
-           "authoring_mode" => plan_mode
-         },
-         "questions_payload" => %{"items" => questions}
-       }}
+      with {:ok, questions} <-
+             refine_v4_questions(
+               questions,
+               decoded,
+               instructional_sections,
+               media,
+               schema_version
+             ),
+           {:ok, advanced_blueprint} <-
+             refine_v4_advanced_blueprint(
+               advanced_blueprint,
+               plan_mode,
+               schema_version
+             ),
+           {:ok, enrichment_proposals} <-
+             enrichment_proposals(
+               decoded,
+               lesson,
+               objectives,
+               instructional_sections,
+               schema_version
+             ),
+           :ok <-
+             validate_enrichment_references(
+               advanced_blueprint,
+               enrichment_proposals,
+               schema_version
+             ) do
+        payload = %{
+          "content_payload" => %{
+            "schema_version" => schema_version,
+            "title" => lesson["title"] || "OpenStax lesson #{index}",
+            "objective" => List.first(objectives),
+            "learning_objectives" => objectives,
+            "opening_hook" => opening_hook,
+            "why_this_matters" => why_this_matters,
+            "narrative" => narrative,
+            "instructional_sections" => instructional_sections,
+            "callouts" => callouts,
+            "media" => media,
+            "worked_examples" => worked_examples,
+            "curiosity_prompts" => curiosity_prompts,
+            "application_problems" => application_problems,
+            "key_takeaways" => key_takeaways,
+            "estimated_minutes" => estimated_minutes(decoded, lesson),
+            "source_evidence_links" => evidence_links,
+            "source_block_ids" => source_block_ids(lesson) |> MapSet.to_list(),
+            "coverage_manifest" =>
+              coverage_manifest(
+                decoded,
+                lesson,
+                instructional_sections,
+                callouts,
+                media,
+                questions
+              ),
+            "attribution" => attribution(lesson),
+            "advanced_blueprint" => advanced_blueprint,
+            "authoring_mode" => plan_mode
+          },
+          "questions_payload" => %{"items" => questions}
+        }
+
+        payload =
+          if schema_version >= 4,
+            do: Map.put(payload, "enrichment_proposals", enrichment_proposals),
+            else: payload
+
+        {:ok, plan_mode, payload}
+      end
     end
   end
 
@@ -293,10 +368,15 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
     valid_block_ids = source_block_ids(lesson)
     rich_source? = MapSet.size(valid_block_ids) > 0
 
+    max_sections =
+      if lesson["__plan_schema_version"] >= 4,
+        do: @max_refined_instructional_sections,
+        else: @max_instructional_sections
+
     case nested_value(decoded, "content_payload", "instructional_sections") do
       sections
       when is_list(sections) and length(sections) >= 2 and
-             length(sections) <= @max_instructional_sections ->
+             length(sections) <= max_sections ->
         sections
         |> Enum.with_index(1)
         |> Enum.reduce_while({:ok, []}, fn {section, index}, {:ok, acc} ->
@@ -607,6 +687,282 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
     end
   end
 
+  defp refine_v4_questions(questions, _decoded, _sections, _media, schema_version)
+       when schema_version < 4,
+       do: {:ok, questions}
+
+  defp refine_v4_questions(questions, decoded, sections, media, _schema_version) do
+    raw_items = nested_value(decoded, "questions_payload", "items") |> List.wrap()
+    section_ids = MapSet.new(Enum.map(sections, & &1["id"]))
+    available_media_ids = MapSet.new(Enum.map(media, & &1["source_media_id"]))
+
+    questions
+    |> Enum.with_index()
+    |> Enum.reduce_while({:ok, []}, fn {question, index}, {:ok, acc} ->
+      raw = Enum.at(raw_items, index, %{})
+      placement_id = question["placement_after_section_id"]
+      evidence_ids = List.wrap(question["evidence_block_ids"]) |> Enum.uniq()
+      requested_media_ids = normalize_string_list(raw["media_ids"], 24)
+
+      media_ids =
+        case requested_media_ids do
+          [] ->
+            media
+            |> Enum.filter(fn item ->
+              item["placement_after_section_id"] == placement_id or
+                not MapSet.disjoint?(
+                  MapSet.new(List.wrap(item["evidence_block_ids"])),
+                  MapSet.new(evidence_ids)
+                )
+            end)
+            |> Enum.map(& &1["source_media_id"])
+            |> Enum.filter(&present?/1)
+            |> Enum.uniq()
+
+          ids ->
+            ids
+        end
+
+      allow_not_sure =
+        case raw["allow_not_sure"] do
+          value when is_boolean(value) -> value
+          _ -> question["type"] == "multiple_choice"
+        end
+
+      cond do
+        not present?(placement_id) or not MapSet.member?(section_ids, placement_id) ->
+          {:halt, {:error, :invalid_v4_question_placement}}
+
+        evidence_ids == [] ->
+          {:halt, {:error, :invalid_v4_question_evidence}}
+
+        Enum.any?(media_ids, &(not MapSet.member?(available_media_ids, &1))) ->
+          {:halt, {:error, :invalid_v4_question_media}}
+
+        allow_not_sure and question["type"] != "multiple_choice" ->
+          {:halt, {:error, :invalid_v4_not_sure_contract}}
+
+        true ->
+          section = Enum.find(sections, &(&1["id"] == placement_id)) || %{}
+
+          refined =
+            question
+            |> Map.put(
+              "hint",
+              optional_text(
+                raw["hint"],
+                "Review #{section["heading"] || "the preceding section"} and focus on the cited evidence."
+              )
+            )
+            |> Map.put("media_ids", media_ids)
+            |> Map.put("allow_not_sure", allow_not_sure)
+            |> Map.put("placement", %{
+              "after_section_id" => placement_id,
+              "sequence" => index + 1
+            })
+            |> Map.put(
+              "evidence_refs",
+              Enum.map(evidence_ids, &%{"kind" => "source_block", "id" => &1})
+            )
+
+          {:cont, {:ok, acc ++ [refined]}}
+      end
+    end)
+  end
+
+  defp refine_v4_advanced_blueprint(blueprint, _mode, schema_version)
+       when schema_version < 4,
+       do: {:ok, blueprint}
+
+  defp refine_v4_advanced_blueprint(_blueprint, "basic", _schema_version), do: {:ok, %{}}
+
+  defp refine_v4_advanced_blueprint(blueprint, "advanced", _schema_version) do
+    screens = List.wrap(blueprint["screens"])
+    meaningful = Enum.filter(screens, &meaningful_advanced_screen?/1)
+
+    allowed_roles =
+      ~w(orientation prediction decision evidence exploration interpretation transfer remediation)
+
+    roles = MapSet.new(Enum.map(screens, & &1["role"]))
+
+    invalid_screen? =
+      Enum.any?(screens, fn screen ->
+        screen["role"] not in allowed_roles or
+          invalid_enrichment_proposal_reference?(screen) or
+          model_authored_iframe_reference?(screen)
+      end)
+
+    complete_arc? =
+      Enum.any?(["prediction", "decision"], &MapSet.member?(roles, &1)) and
+        Enum.any?(["evidence", "exploration"], &MapSet.member?(roles, &1)) and
+        MapSet.member?(roles, "interpretation") and MapSet.member?(roles, "transfer")
+
+    if length(meaningful) in 2..4 and not invalid_screen? and complete_arc? do
+      {:ok, blueprint}
+    else
+      {:error, :invalid_v4_advanced_blueprint}
+    end
+  end
+
+  defp invalid_enrichment_proposal_reference?(screen) do
+    case Map.fetch(screen, "enrichment_proposal_id") do
+      :error -> false
+      {:ok, proposal_id} -> not present?(proposal_id)
+    end
+  end
+
+  defp model_authored_iframe_reference?(screen) do
+    forbidden = ~w(url src iframe_url artifact_url storage_url approved_artifact_ref)
+
+    Enum.any?(forbidden, &Map.has_key?(screen, &1)) or
+      case screen["configuration"] do
+        %{} = configuration -> Enum.any?(forbidden, &Map.has_key?(configuration, &1))
+        _ -> false
+      end
+  end
+
+  defp enrichment_proposals(_decoded, _lesson, _objectives, _sections, schema_version)
+       when schema_version < 4,
+       do: {:ok, []}
+
+  defp enrichment_proposals(decoded, lesson, objectives, sections, _schema_version) do
+    proposals = Map.get(decoded, "enrichment_proposals", [])
+
+    if is_list(proposals) and length(proposals) <= 3 do
+      valid_blocks = source_block_ids(lesson)
+      valid_urls = MapSet.new(evidence_links(lesson))
+      valid_sections = MapSet.new(Enum.map(sections, & &1["id"]))
+      valid_objectives = MapSet.new(objectives)
+
+      proposals
+      |> Enum.with_index(1)
+      |> Enum.reduce_while({:ok, []}, fn {proposal, index}, {:ok, acc} ->
+        case normalize_enrichment_proposal(
+               proposal,
+               index,
+               valid_blocks,
+               valid_urls,
+               valid_sections,
+               valid_objectives
+             ) do
+          {:ok, normalized} -> {:cont, {:ok, acc ++ [normalized]}}
+          {:error, reason} -> {:halt, {:error, reason}}
+        end
+      end)
+      |> case do
+        {:ok, normalized} ->
+          ids = Enum.map(normalized, & &1["id"])
+
+          if length(ids) == length(Enum.uniq(ids)),
+            do: {:ok, normalized},
+            else: {:error, :duplicate_enrichment_proposal_id}
+
+        error ->
+          error
+      end
+    else
+      {:error, :invalid_enrichment_proposals}
+    end
+  end
+
+  defp normalize_enrichment_proposal(
+         %{} = proposal,
+         index,
+         valid_blocks,
+         valid_urls,
+         valid_sections,
+         valid_objectives
+       ) do
+    id = proposal["id"] || "enrichment-proposal-#{index}"
+    kind = proposal["kind"]
+    rationale = proposal["instructional_rationale"]
+    objective_ids = normalize_string_list(proposal["objective_ids"], 24)
+    source_evidence = proposal["source_evidence"] || %{}
+    evidence_ids = normalize_string_list(source_evidence["block_ids"], 48)
+    evidence_urls = normalize_string_list(source_evidence["source_urls"], 12)
+    placement = proposal["placement"] || %{}
+    placement_id = placement["after_section_id"]
+    learner_task = proposal["learner_task"]
+    research_query = proposal["research_query"]
+
+    research_evidence =
+      case proposal["research_evidence"] do
+        %{} = evidence -> evidence
+        evidence when is_list(evidence) -> %{"candidates" => evidence}
+        _ -> %{}
+      end
+
+    valid? =
+      present?(id) and
+        kind in [
+          "generated_simulation",
+          "existing_simulation",
+          "external_resource",
+          "article",
+          "video"
+        ] and
+        present?(rationale) and objective_ids != [] and
+        Enum.all?(objective_ids, &MapSet.member?(valid_objectives, &1)) and
+        evidence_ids != [] and Enum.all?(evidence_ids, &MapSet.member?(valid_blocks, &1)) and
+        evidence_urls != [] and Enum.all?(evidence_urls, &MapSet.member?(valid_urls, &1)) and
+        MapSet.member?(valid_sections, placement_id) and present?(learner_task) and
+        present?(research_query) and is_map(research_evidence)
+
+    if valid? do
+      {:ok,
+       %{
+         "id" => id,
+         "kind" => kind,
+         "instructional_rationale" => String.trim(rationale),
+         "objective_ids" => objective_ids,
+         "source_evidence" => %{
+           "block_ids" => evidence_ids,
+           "source_urls" => evidence_urls
+         },
+         "placement" => %{"after_section_id" => placement_id},
+         "learner_task" => String.trim(learner_task),
+         "research_query" => String.trim(research_query),
+         "research_evidence" => research_evidence,
+         "metadata" => %{"research_query" => String.trim(research_query)},
+         "state" => "draft"
+       }}
+    else
+      {:error, :invalid_enrichment_proposal}
+    end
+  end
+
+  defp normalize_enrichment_proposal(
+         _proposal,
+         _index,
+         _valid_blocks,
+         _valid_urls,
+         _valid_sections,
+         _valid_objectives
+       ),
+       do: {:error, :invalid_enrichment_proposal}
+
+  defp validate_enrichment_references(_blueprint, _proposals, schema_version)
+       when schema_version < 4,
+       do: :ok
+
+  defp validate_enrichment_references(blueprint, proposals, _schema_version) do
+    proposal_ids = MapSet.new(Enum.map(proposals, & &1["id"]))
+
+    blueprint
+    |> Map.get("screens", [])
+    |> List.wrap()
+    |> Enum.all?(fn screen ->
+      case screen["enrichment_proposal_id"] do
+        nil -> true
+        proposal_id -> MapSet.member?(proposal_ids, proposal_id)
+      end
+    end)
+    |> case do
+      true -> :ok
+      false -> {:error, :unknown_enrichment_proposal_reference}
+    end
+  end
+
   defp callouts(decoded, lesson) do
     valid_block_ids = source_block_ids(lesson)
 
@@ -720,6 +1076,7 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
     available =
       lesson
       |> source_media()
+      |> maybe_filter_v4_media(lesson["__plan_schema_version"] || 3)
       |> Map.new(&{&1["id"], &1})
 
     requested =
@@ -764,6 +1121,11 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
       end
     end)
   end
+
+  defp maybe_filter_v4_media(media, schema_version) when schema_version >= 4,
+    do: Enum.filter(media, &(&1["rights_status"] == "approved"))
+
+  defp maybe_filter_v4_media(media, _schema_version), do: media
 
   defp source_media(lesson) do
     explicit =
@@ -813,13 +1175,18 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
 
   defp normalize_media_descriptor(_), do: []
 
-  defp coverage_manifest(decoded, lesson, sections, callouts, media) do
+  defp coverage_manifest(decoded, lesson, sections, callouts, media, questions) do
     available = source_block_ids(lesson)
+    schema_version = lesson["__plan_schema_version"] || 3
 
     included =
       (Enum.flat_map(sections, &List.wrap(&1["evidence_block_ids"])) ++
          Enum.flat_map(callouts, &List.wrap(&1["evidence_block_ids"])) ++
-         Enum.flat_map(media, &List.wrap(&1["evidence_block_ids"])))
+         Enum.flat_map(media, &List.wrap(&1["evidence_block_ids"])) ++
+         if(schema_version >= 4,
+           do: Enum.flat_map(questions, &List.wrap(&1["evidence_block_ids"])),
+           else: []
+         ))
       |> Enum.filter(&MapSet.member?(available, &1))
       |> Enum.uniq()
 
@@ -831,23 +1198,105 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
         _ -> []
       end
       |> Enum.flat_map(fn
-        %{"id" => id, "reason" => reason}
+        %{"id" => id, "reason" => reason} = exclusion
         when is_binary(id) and is_binary(reason) ->
           if MapSet.member?(available, id),
-            do: [%{"id" => id, "reason" => String.trim(reason)}],
+            do: [normalized_exclusion(exclusion, id, reason, schema_version)],
             else: []
 
         _ ->
           []
       end)
 
-    %{
+    base = %{
       "available_block_ids" => MapSet.to_list(available),
       "included_block_ids" => included,
       "excluded_blocks" => excluded,
       "source_word_count" => lesson["source_word_count"] || source_word_count(lesson)
     }
+
+    if schema_version >= 4 do
+      deterministic_ids =
+        get_in(lesson, ["source_coverage", "deterministically_omittable_block_ids"])
+        |> List.wrap()
+        |> Enum.filter(&MapSet.member?(available, &1))
+        |> Enum.uniq()
+
+      substantive_ids =
+        case get_in(lesson, ["source_coverage", "substantive_block_ids"]) do
+          ids when is_list(ids) and ids != [] ->
+            Enum.filter(ids, &MapSet.member?(available, &1)) |> Enum.uniq()
+
+          _ ->
+            MapSet.to_list(available) -- deterministic_ids
+        end
+
+      accounted =
+        MapSet.new(
+          included ++
+            Enum.flat_map(excluded, fn exclusion ->
+              if valid_v4_exclusion?(lesson, exclusion), do: [exclusion["id"]], else: []
+            end)
+        )
+
+      unaccounted =
+        substantive_ids
+        |> Enum.reject(&MapSet.member?(accounted, &1))
+        |> Enum.sort()
+
+      base
+      |> Map.put("policy", "full_substantive_source")
+      |> Map.put("policy_schema_version", 4)
+      |> Map.put("substantive_block_ids", substantive_ids)
+      |> Map.put("deterministically_omittable_block_ids", deterministic_ids)
+      |> Map.put("unaccounted_block_ids", unaccounted)
+      |> Map.put("exclusion_policy", %{
+        "deterministic_reason_codes" => [
+          "navigation",
+          "duplicated_boilerplate",
+          "unsafe_media"
+        ],
+        "other_exclusions_require_author_acknowledgement" => true
+      })
+      |> Map.put("placement_manifest", %{
+        "instructional_section_ids" => Enum.map(sections, & &1["id"]),
+        "callouts" => placement_entries(callouts),
+        "media" => placement_entries(media),
+        "questions" => placement_entries(questions)
+      })
+    else
+      base
+    end
   end
+
+  defp placement_entries(items) do
+    Enum.map(items, fn item ->
+      %{
+        "id" => item["id"] || item["source_media_id"],
+        "after_section_id" => item["placement_after_section_id"],
+        "evidence_block_ids" => List.wrap(item["evidence_block_ids"])
+      }
+    end)
+  end
+
+  defp valid_v4_exclusion?(lesson, exclusion),
+    do: FullSource.deterministic_exclusion?(lesson, exclusion)
+
+  defp normalized_exclusion(exclusion, id, reason, schema_version)
+       when schema_version >= 4 do
+    %{
+      "id" => id,
+      "reason" => String.trim(reason),
+      "reason_code" => exclusion["reason_code"],
+      # Model output can propose an exclusion but cannot impersonate an
+      # author's acknowledgement. The review workflow is the only place that
+      # may turn this flag on.
+      "author_acknowledged" => false
+    }
+  end
+
+  defp normalized_exclusion(_exclusion, id, reason, _schema_version),
+    do: %{"id" => id, "reason" => String.trim(reason)}
 
   defp advanced_blueprint(decoded, "advanced", lesson, instructional_sections, opts) do
     case nested_value(decoded, "content_payload", "advanced_blueprint") do
@@ -1111,10 +1560,43 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   end
 
   defp source_block_ids(lesson) do
-    lesson
-    |> source_blocks()
-    |> Enum.map(& &1["id"])
-    |> MapSet.new()
+    ids =
+      if lesson["__plan_schema_version"] >= 4 do
+        lesson
+        |> source_blocks()
+        |> recursive_source_block_ids()
+      else
+        lesson
+        |> source_blocks()
+        |> Enum.map(& &1["id"])
+      end
+
+    MapSet.new(ids)
+  end
+
+  defp recursive_source_block_ids(blocks) when is_list(blocks) do
+    blocks
+    |> Enum.flat_map(&recursive_source_block_ids/1)
+    |> Enum.uniq()
+  end
+
+  defp recursive_source_block_ids(%{} = block) do
+    direct = List.wrap(block["id"] || block[:id]) |> Enum.filter(&present?/1)
+
+    direct ++
+      recursive_source_block_ids(block["blocks"] || block[:blocks] || []) ++
+      recursive_list_source_block_ids(block["items"] || block[:items] || [])
+  end
+
+  defp recursive_source_block_ids(_), do: []
+
+  defp recursive_list_source_block_ids(items) do
+    items
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      %{} = item -> recursive_source_block_ids(item["children"] || item[:children] || [])
+      _ -> []
+    end)
   end
 
   defp evidence_block_ids(item, valid_block_ids) do
@@ -1171,6 +1653,56 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
     |> case do
       [] -> ["evidence"]
       keywords -> keywords
+    end
+  end
+
+  defp system_prompt(opts) do
+    base = system_prompt()
+
+    if Keyword.get(opts, :plan_schema_version, 3) >= 4 do
+      base <>
+        """
+
+        SCHEMA V4 OVERRIDES: Preserve every substantive source block. The earlier 4-to-7
+        section and 60-to-80-percent depth targets do not apply. Use as many short,
+        coherent instructional sections as the source requires, without dropping or
+        compressing substantive concepts. Navigation, duplicated boilerplate, and unsafe
+        media are the only deterministic exclusions. For any other proposed exclusion,
+        include a specific reason and author_acknowledged:false. Never claim that an author
+        approved model output; the review workflow records acknowledgement later.
+
+        Every questions_payload item must also include hint when useful, media_ids (an
+        empty list is valid), allow_not_sure, placement_after_section_id, and
+        evidence_block_ids. The server derives stable placement and evidence reference
+        objects from those identifiers. Use allow_not_sure only for low-stakes
+        multiple-choice practice.
+
+        Every Advanced screen must include role using orientation, prediction, decision,
+        evidence, exploration, interpretation, transfer, or remediation. Create two to
+        four meaningful decision/exploration interactions across an arc that includes a
+        prediction or decision, evidence or exploration, interpretation, transfer, and
+        exact-section remediation. A screen may optionally contain only
+        enrichment_proposal_id; never emit iframe, artifact, storage, src, or URL fields.
+
+        Add this sibling of content_payload and questions_payload:
+        "enrichment_proposals":[
+          {
+            "id":"enrichment-proposal-1",
+            "kind":"generated_simulation|existing_simulation|external_resource|article|video",
+            "instructional_rationale":"...",
+            "objective_ids":["exact lesson objective"],
+            "source_evidence":{"block_ids":["server-issued-block-id"],"source_urls":["selected OpenStax URL"]},
+            "placement":{"after_section_id":"section-1"},
+            "learner_task":"What the learner will do and explain",
+            "research_query":"A query for later governed research",
+            "research_evidence":{}
+          }
+        ]
+        Return zero to three strongly justified proposals. Do not invent research results
+        or external URLs.
+        """
+    else
+      base
     end
   end
 
@@ -1355,8 +1887,11 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
       encoded = Jason.encode!(payload)
 
       if byte_size(encoded) <= @max_source_prompt_characters do
+        contract = if lesson["__plan_schema_version"] >= 4, do: "V4", else: "V3"
+
         {:ok,
-         "Create one complete LessonPlanV3 from this structured source snapshot:\n" <> encoded}
+         "Create one complete LessonPlan#{contract} from this structured source snapshot:\n" <>
+           encoded}
       else
         {:error,
          {:source_prompt_limit_exceeded,
@@ -1373,6 +1908,13 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
     chunks =
       lesson
       |> source_blocks()
+      |> Enum.map(fn block ->
+        if lesson["__plan_schema_version"] >= 4 do
+          Map.put(block, "evidence_block_ids", recursive_source_block_ids(block))
+        else
+          block
+        end
+      end)
       |> Enum.flat_map(&prompt_chunks/1)
 
     if length(chunks) <= @max_source_chunks do
@@ -1406,7 +1948,8 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
         "exercise_type",
         "problem",
         "solution",
-        "source_locator"
+        "source_locator",
+        "evidence_block_ids"
       ])
       |> put_prompt_value(
         "callout_type",
@@ -1480,6 +2023,16 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   end
 
   defp normalize_string_list(_, _limit), do: []
+
+  defp normalized_plan_schema_version(version)
+       when is_integer(version) and version >= 4,
+       do: 4
+
+  defp normalized_plan_schema_version(version)
+       when is_integer(version) and version >= 1,
+       do: version
+
+  defp normalized_plan_schema_version(_), do: 3
 
   defp stringify_map(map) when is_map(map) do
     Map.new(map, fn

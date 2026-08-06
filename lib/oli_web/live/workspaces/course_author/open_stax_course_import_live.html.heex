@@ -630,6 +630,25 @@
                     </span>
                   </summary>
                   <div class="space-y-5 border-t border-slate-200 px-4 py-4">
+                    <section :if={lesson_flow_steps(lesson) != []}>
+                      <h5 class="text-sm font-semibold text-gray-900">
+                        {gettext("Lesson flow")}
+                      </h5>
+                      <ol
+                        class="mt-3 flex flex-wrap gap-2"
+                        aria-label={gettext("Planned learner experience")}
+                      >
+                        <li
+                          :for={{step, index} <- Enum.with_index(lesson_flow_steps(lesson), 1)}
+                          data-openstax-flow-role={plan_item_value(step, "role")}
+                          class="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-slate-800"
+                        >
+                          <span class="font-semibold text-slate-500">{index}</span>
+                          <span>{plan_item_value(step, "label")}</span>
+                        </li>
+                      </ol>
+                    </section>
+
                     <div class="grid gap-3 sm:grid-cols-2">
                       <div
                         :if={plan_content(lesson, "opening_hook") != ""}
@@ -793,7 +812,7 @@
                               {plan_item_value(screen, "title", gettext("Adaptive screen"))}
                             </h6>
                             <span class="rounded bg-white px-2 py-0.5 text-xs font-semibold text-purple-800">
-                              {plan_item_value(
+                              {plan_item_value(screen, "role", gettext("exploration"))} · {plan_item_value(
                                 screen,
                                 "interaction_type",
                                 plan_item_value(screen, "kind", gettext("content"))
@@ -842,6 +861,335 @@
                           {plan_item_value(path, "to_section_id", gettext("review section"))}
                         </li>
                       </ul>
+                    </section>
+
+                    <section :if={lesson_enrichment_proposals(@run, lesson) != []}>
+                      <div class="flex flex-wrap items-start justify-between gap-2">
+                        <div>
+                          <h5 class="text-sm font-semibold text-gray-900">
+                            {gettext("Optional lesson enrichments")}
+                          </h5>
+                          <p class="mt-1 text-xs text-gray-600">
+                            {gettext(
+                              "These proposals are stored separately from the lesson plan. Rejecting or omitting all of them does not block the core import."
+                            )}
+                          </p>
+                        </div>
+                        <span class="rounded bg-slate-100 px-2 py-1 text-xs font-semibold text-slate-700">
+                          {ngettext(
+                            "%{count} proposal",
+                            "%{count} proposals",
+                            length(lesson_enrichment_proposals(@run, lesson)),
+                            count: length(lesson_enrichment_proposals(@run, lesson))
+                          )}
+                        </span>
+                      </div>
+
+                      <div class="mt-3 space-y-4">
+                        <article
+                          :for={proposal <- lesson_enrichment_proposals(@run, lesson)}
+                          id={"openstax-enrichment-#{proposal.id}"}
+                          data-openstax-enrichment-state={proposal.state}
+                          class="rounded border border-sky-200 bg-sky-50 p-4 text-sky-950"
+                        >
+                          <div class="flex flex-wrap items-start justify-between gap-3">
+                            <div>
+                              <p class="text-xs font-semibold uppercase tracking-wide text-sky-700">
+                                {gettext("Rank %{rank}", rank: proposal.rank)} · {proposal_kind_label(
+                                  proposal.kind
+                                )}
+                              </p>
+                              <h6 class="mt-1 font-semibold">
+                                {proposal.resource_title || proposal_kind_label(proposal.kind)}
+                              </h6>
+                            </div>
+                            <span class="rounded bg-white px-2 py-1 text-xs font-semibold text-sky-800">
+                              {proposal_state_label(proposal.state)}
+                            </span>
+                          </div>
+
+                          <dl class="mt-3 grid gap-3 text-sm md:grid-cols-2">
+                            <div>
+                              <dt class="font-semibold">{gettext("Instructional rationale")}</dt>
+                              <dd class="mt-1 leading-6">{proposal.instructional_rationale}</dd>
+                            </div>
+                            <div>
+                              <dt class="font-semibold">{gettext("Learner task")}</dt>
+                              <dd class="mt-1 leading-6">{proposal.learner_task}</dd>
+                            </div>
+                            <div>
+                              <dt class="font-semibold">{gettext("Objective mapping")}</dt>
+                              <dd class="mt-1">
+                                {Enum.join(proposal.objective_ids || [], ", ")}
+                              </dd>
+                            </div>
+                            <div>
+                              <dt class="font-semibold">{gettext("Placement")}</dt>
+                              <dd class="mt-1">
+                                {map_string_key(
+                                  proposal.placement || %{},
+                                  "after_section_id",
+                                  gettext("Author choice")
+                                )}
+                              </dd>
+                            </div>
+                          </dl>
+
+                          <details class="mt-3 rounded border border-sky-100 bg-white/80">
+                            <summary class="cursor-pointer px-3 py-2 text-xs font-semibold">
+                              {gettext("Source and research evidence")}
+                            </summary>
+                            <div class="space-y-3 border-t border-sky-100 p-3 text-xs">
+                              <dl class="space-y-2">
+                                <div :for={
+                                  row <- enrichment_evidence_rows(proposal.source_evidence)
+                                }>
+                                  <dt class="font-semibold">{row.label}</dt>
+                                  <dd class="mt-0.5 break-words">{row.value}</dd>
+                                </div>
+                              </dl>
+                              <p>
+                                <span class="font-semibold">{gettext("Research status")}:</span>
+                                {proposal_state_label(proposal.research_status)}
+                              </p>
+                              <dl
+                                :if={enrichment_evidence_rows(proposal.research_evidence) != []}
+                                class="space-y-2"
+                              >
+                                <div :for={
+                                  row <- enrichment_evidence_rows(proposal.research_evidence)
+                                }>
+                                  <dt class="font-semibold">{row.label}</dt>
+                                  <dd class="mt-0.5 break-words">{row.value}</dd>
+                                </div>
+                              </dl>
+                              <p :if={proposal.research_failure} class="text-red-700">
+                                {gettext("Research did not complete")}: {map_string_key(
+                                  proposal.research_failure,
+                                  "code",
+                                  gettext("provider failure")
+                                )}
+                              </p>
+                              <a
+                                :if={curated_resource_url(proposal)}
+                                href={curated_resource_url(proposal)}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                class="inline-flex font-semibold text-blue-700 underline"
+                              >
+                                {gettext("Open the annotated resource")}
+                              </a>
+                            </div>
+                          </details>
+
+                          <div
+                            :if={latest_proposal_artifact(proposal)}
+                            class="mt-4 rounded border border-violet-200 bg-white p-3"
+                          >
+                            <% artifact = latest_proposal_artifact(proposal) %>
+                            <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+                              <p class="font-semibold text-violet-950">
+                                {gettext("Simulation artifact v%{version}",
+                                  version: artifact.version
+                                )}
+                              </p>
+                              <span class="rounded bg-violet-50 px-2 py-1 font-semibold text-violet-800">
+                                {proposal_state_label(artifact.status)}
+                              </span>
+                            </div>
+                            <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+                              <div>
+                                <dt class="font-semibold">{gettext("Validation")}</dt>
+                                <dd>{proposal_state_label(artifact.validation_status)}</dd>
+                              </div>
+                              <div>
+                                <dt class="font-semibold">{gettext("Content hash")}</dt>
+                                <dd class="break-all font-mono">
+                                  {artifact.content_hash || "—"}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt class="font-semibold">{gettext("Storage")}</dt>
+                                <dd>{proposal_state_label(artifact.storage_state)}</dd>
+                              </div>
+                              <div>
+                                <dt class="font-semibold">{gettext("CAPI outputs")}</dt>
+                                <dd>
+                                  {length(
+                                    map_string_key(artifact.capi_manifest || %{}, "outputs", [])
+                                  )}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt class="font-semibold">{gettext("Accessible title")}</dt>
+                                <dd>
+                                  {map_string_key(
+                                    artifact.accessibility_metadata || %{},
+                                    "title",
+                                    "—"
+                                  )}
+                                </dd>
+                              </div>
+                              <div>
+                                <dt class="font-semibold">{gettext("Accessible description")}</dt>
+                                <dd>
+                                  {map_string_key(
+                                    artifact.accessibility_metadata || %{},
+                                    "description",
+                                    "—"
+                                  )}
+                                </dd>
+                              </div>
+                            </dl>
+
+                            <iframe
+                              :if={simulation_preview_url(artifact)}
+                              src={simulation_preview_url(artifact)}
+                              title={
+                                map_string_key(
+                                  artifact.accessibility_metadata || %{},
+                                  "title",
+                                  gettext("Generated simulation preview")
+                                )
+                              }
+                              sandbox="allow-scripts"
+                              referrerpolicy="no-referrer"
+                              class="mt-3 h-96 w-full rounded border border-violet-200 bg-white"
+                            >
+                            </iframe>
+
+                            <p :if={artifact.failure} class="mt-3 text-xs text-red-700">
+                              {gettext("Validation finding")}: {map_string_key(
+                                artifact.failure,
+                                "code",
+                                gettext("generation failed")
+                              )}
+                            </p>
+
+                            <details
+                              :if={artifact.approval_history not in [nil, []]}
+                              class="mt-3 text-xs"
+                            >
+                              <summary class="cursor-pointer font-semibold">
+                                {gettext("Artifact approval history")}
+                              </summary>
+                              <ul class="mt-2 list-disc space-y-1 pl-5">
+                                <li :for={entry <- artifact.approval_history}>
+                                  {map_string_key(entry, "action", gettext("updated"))} · {map_string_key(
+                                    entry,
+                                    "at",
+                                    ""
+                                  )}
+                                </li>
+                              </ul>
+                            </details>
+                          </div>
+
+                          <p
+                            :if={
+                              proposal.kind == "generated_simulation" &&
+                                !@enrichment_capabilities.generated_available &&
+                                proposal.state == "proposed"
+                            }
+                            class="mt-3 rounded bg-yellow-50 p-2 text-xs text-yellow-900"
+                          >
+                            {gettext(
+                              "Simulation generation is disabled until the project flag, generator, isolated container runtime, and artifact storage are all available."
+                            )}
+                          </p>
+
+                          <div class="mt-4 flex flex-wrap gap-2">
+                            <button
+                              :if={
+                                proposal.state == "proposed" &&
+                                  proposal.research_status not in ["running", "completed"] &&
+                                  @enrichment_capabilities.research_available
+                              }
+                              type="button"
+                              phx-click="research_enrichment"
+                              phx-value-proposal_id={proposal.id}
+                              class="btn btn-sm btn-outline-primary"
+                            >
+                              {gettext("Research resource")}
+                            </button>
+                            <button
+                              :if={
+                                proposal_can_approve?(
+                                  proposal,
+                                  lesson,
+                                  @enrichment_capabilities
+                                )
+                              }
+                              type="button"
+                              phx-click="approve_enrichment"
+                              phx-value-proposal_id={proposal.id}
+                              class="btn btn-sm btn-primary"
+                            >
+                              {gettext("Approve proposal")}
+                            </button>
+                            <button
+                              :if={proposal_can_generate?(proposal, @enrichment_capabilities)}
+                              type="button"
+                              phx-click="generate_simulation"
+                              phx-value-proposal_id={proposal.id}
+                              class="btn btn-sm btn-primary"
+                            >
+                              {if(proposal_artifacts(proposal) == [],
+                                do: gettext("Generate preview"),
+                                else: gettext("Regenerate preview")
+                              )}
+                            </button>
+                            <button
+                              :if={reviewable_proposal_artifact(proposal)}
+                              type="button"
+                              phx-click="approve_simulation"
+                              phx-value-artifact_id={reviewable_proposal_artifact(proposal).id}
+                              class="btn btn-sm btn-primary"
+                            >
+                              {gettext("Approve exact artifact")}
+                            </button>
+                            <button
+                              :if={reviewable_proposal_artifact(proposal)}
+                              type="button"
+                              phx-click="reject_simulation"
+                              phx-value-artifact_id={reviewable_proposal_artifact(proposal).id}
+                              class="btn btn-sm btn-outline-danger"
+                            >
+                              {gettext("Reject artifact")}
+                            </button>
+                            <button
+                              :if={
+                                proposal.state in ["proposed", "approved"] &&
+                                  is_nil(approved_proposal_artifact(proposal))
+                              }
+                              type="button"
+                              phx-click="omit_enrichment"
+                              phx-value-proposal_id={proposal.id}
+                              class="btn btn-sm btn-outline-secondary"
+                            >
+                              {gettext("Omit proposal")}
+                            </button>
+                          </div>
+
+                          <details
+                            :if={proposal.approval_history not in [nil, []]}
+                            class="mt-3 text-xs"
+                          >
+                            <summary class="cursor-pointer font-semibold">
+                              {gettext("Approval history")}
+                            </summary>
+                            <ul class="mt-2 list-disc space-y-1 pl-5">
+                              <li :for={entry <- proposal.approval_history}>
+                                {map_string_key(entry, "action", gettext("updated"))} · {map_string_key(
+                                  entry,
+                                  "at",
+                                  ""
+                                )}
+                              </li>
+                            </ul>
+                          </details>
+                        </article>
+                      </div>
                     </section>
 
                     <section :if={plan_worked_examples(lesson) != []}>
@@ -923,12 +1271,38 @@
                             </li>
                           </ul>
                           <p
+                            :if={plan_item_value(question, "hint") != ""}
+                            class="mt-2 text-xs text-emerald-800"
+                          >
+                            <span class="font-semibold">{gettext("Hint")}:</span>
+                            {plan_item_value(question, "hint")}
+                          </p>
+                          <p
                             :if={plan_item_value(question, "remediation") != ""}
                             class="mt-2 text-xs text-emerald-800"
                           >
                             <span class="font-semibold">{gettext("Remediation")}:</span>
                             {plan_item_value(question, "remediation")}
                           </p>
+                          <div class="mt-2 flex flex-wrap gap-1.5 text-xs text-emerald-800">
+                            <span :if={plan_item_value(question, "allow_not_sure", false)}>
+                              {gettext("Includes a low-stakes Not sure path")}
+                            </span>
+                            <span :if={
+                              plan_item_value(question, "placement_after_section_id") != ""
+                            }>
+                              {gettext("Placed after")}: {plan_item_value(
+                                question,
+                                "placement_after_section_id"
+                              )}
+                            </span>
+                            <span :if={plan_item_strings(question, "media_ids") != []}>
+                              {gettext("Media")}: {Enum.join(
+                                plan_item_strings(question, "media_ids"),
+                                ", "
+                              )}
+                            </span>
+                          </div>
                         </article>
                       </div>
                     </section>
@@ -986,9 +1360,65 @@
                               gettext("No reviewer-visible reason was provided.")
                             )}
                           </p>
+                          <p
+                            :if={plan_item_value(excluded, "author_acknowledged", false) == true}
+                            class="mt-1 text-xs font-semibold text-emerald-800"
+                          >
+                            {gettext("Acknowledged in plan v%{version} at %{time}",
+                              version:
+                                plan_item_value(
+                                  excluded,
+                                  "acknowledged_plan_version",
+                                  gettext("unknown")
+                                ),
+                              time:
+                                plan_item_value(
+                                  excluded,
+                                  "acknowledged_at",
+                                  gettext("unknown time")
+                                )
+                            )}
+                          </p>
                         </li>
                       </ul>
+                      <p class="mt-2 text-xs font-medium text-yellow-950">
+                        {gettext(
+                          "Approving this lesson explicitly acknowledges the exclusions and their recorded reasons."
+                        )}
+                      </p>
                     </section>
+
+                    <details
+                      :if={lesson_coverage_rows(lesson) != []}
+                      class="rounded border border-slate-200 bg-slate-50"
+                    >
+                      <summary class="cursor-pointer px-3 py-2 text-sm font-semibold text-slate-900">
+                        {gettext("Full source coverage map")}
+                      </summary>
+                      <ul class="space-y-2 border-t border-slate-200 p-3 text-xs">
+                        <li
+                          :for={row <- lesson_coverage_rows(lesson)}
+                          data-openstax-source-block={plan_item_value(row, "id")}
+                          data-openstax-source-status={plan_item_value(row, "status")}
+                          class="rounded border border-slate-200 bg-white p-2"
+                        >
+                          <div class="flex flex-wrap items-center justify-between gap-2">
+                            <code class="break-all text-slate-800">
+                              {plan_item_value(row, "id")}
+                            </code>
+                            <span class="rounded bg-slate-100 px-2 py-0.5 font-semibold text-slate-700">
+                              {plan_item_value(row, "status")}
+                            </span>
+                          </div>
+                          <p
+                            :if={plan_item_value(row, "reason") != ""}
+                            class="mt-1 text-slate-600"
+                          >
+                            {plan_item_value(row, "reason")}
+                          </p>
+                        </li>
+                      </ul>
+                    </details>
 
                     <p
                       :if={!rich_lesson_material?(lesson)}

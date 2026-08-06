@@ -26,6 +26,7 @@ defmodule Oli.OpenStax.CourseImport.LessonPlan do
     field :approved_by_user, :boolean, default: false
     field :approved_at, :utc_datetime_usec
     field :rejection_reason, :string
+    field :exclusion_acknowledgements, {:array, :map}, default: []
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -43,7 +44,8 @@ defmodule Oli.OpenStax.CourseImport.LessonPlan do
       :created_by,
       :approved_by_user,
       :approved_at,
-      :rejection_reason
+      :rejection_reason,
+      :exclusion_acknowledgements
     ])
     |> validate_required([:lesson_id, :version])
     |> validate_number(:version, greater_than: 0)

@@ -5,6 +5,9 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerTest do
   alias Oli.OpenStax.CourseImport.AuthoringCompiler
   alias Oli.Utils.SchemaResolver
 
+  @simulation_proposal_id "00000000-0000-4000-8000-000000000001"
+  @simulation_hash String.duplicate("c", 64)
+
   test "compiles deterministic Basic Author pages with canonical short-answer models" do
     assert {:ok, first} =
              AuthoringCompiler.compile(
@@ -571,6 +574,158 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerTest do
     assert image_screen_index > models_screen_index
   end
 
+  test "compiles question media, hints, and the low-stakes Not sure path" do
+    content =
+      content()
+      |> Map.put("media", [
+        %{
+          "id" => "question-figure",
+          "alt" => "Particles spreading through a container"
+        }
+      ])
+
+    questions = %{
+      "items" => [
+        %{
+          "type" => "multiple_choice",
+          "prompt" => "Which description matches the figure?",
+          "choices" => [
+            %{"id" => "clustered", "text" => "The particles stay clustered."},
+            %{"id" => "spread", "text" => "The particles spread out.", "correct" => true}
+          ],
+          "correct_choice_id" => "spread",
+          "hint" => "Compare the particle spacing near each wall.",
+          "media_ids" => ["question-figure"],
+          "allow_not_sure" => true,
+          "placement_after_section_id" => "models"
+        },
+        %{
+          "type" => "short_answer",
+          "prompt" => "Explain the pattern.",
+          "hint" => "Describe both motion and spacing."
+        }
+      ]
+    }
+
+    assert {:ok, compiled} =
+             AuthoringCompiler.compile(
+               "basic",
+               "Particle motion",
+               content,
+               questions,
+               "question-contracts",
+               media_urls: %{
+                 "question-figure" => %{
+                   "url" => "staged://question-figure",
+                   "alt" => "Particles spreading through a container"
+                 }
+               }
+             )
+
+    [multiple_choice, short_answer] = compiled["activities"]
+    encoded_mcq = Jason.encode!(multiple_choice["model"])
+    encoded_short_answer = Jason.encode!(short_answer["model"])
+
+    assert encoded_mcq =~ "staged://question-figure"
+    assert encoded_mcq =~ "Particles spreading through a container"
+    assert encoded_mcq =~ "Compare the particle spacing near each wall."
+    assert encoded_mcq =~ "Not sure"
+    assert encoded_short_answer =~ "Describe both motion and spacing."
+  end
+
+  test "rejects question media ids that were not staged with the lesson" do
+    questions = %{
+      "items" => [
+        %{
+          "type" => "short_answer",
+          "prompt" => "Interpret the missing figure.",
+          "media_ids" => ["not-staged"]
+        },
+        %{"type" => "short_answer", "prompt" => "Explain the concept."}
+      ]
+    }
+
+    assert {:error, {:question_compile_failed, 1, {:unknown_question_media_ids, ["not-staged"]}}} =
+             AuthoringCompiler.compile(
+               "basic",
+               "Missing media",
+               content(),
+               questions,
+               "missing-question-media"
+             )
+  end
+
+  test "renders approved curated resources as placed annotated links in both authoring modes" do
+    curated = %{
+      "proposal_id" => "curated-1",
+      "delivery_mode" => "annotated_link",
+      "title" => "Open chemistry evidence",
+      "url" => "https://example.edu/open-chemistry",
+      "annotation" => "Compare this real-world evidence with the lesson model.",
+      "learner_task" => "Identify one agreement and one limitation.",
+      "placement" => %{"after_section_id" => "models"}
+    }
+
+    content = Map.put(v3_content(), "curated_enrichments", [curated])
+
+    assert {:ok, basic} =
+             AuthoringCompiler.compile(
+               "basic",
+               "Models and limits",
+               content,
+               v3_questions(),
+               "curated-basic",
+               media_urls: %{
+                 "search-growth" => %{
+                   "url" => "staged://search-growth",
+                   "alt" => "A graph comparing linear and logarithmic search growth"
+                 }
+               }
+             )
+
+    basic_model = basic["page_content_template"]["model"]
+
+    assert Enum.any?(collect_elements(basic_model, "a"), fn link ->
+             link["href"] == "https://example.edu/open-chemistry" and
+               collect_text(link) =~ "Open chemistry evidence"
+           end)
+
+    models_index = Enum.find_index(basic_model, &(collect_text(&1) =~ "Computation models"))
+
+    curated_index =
+      Enum.find_index(basic_model, fn block ->
+        Enum.any?(
+          collect_elements(block, "a"),
+          &(&1["href"] == "https://example.edu/open-chemistry")
+        )
+      end)
+
+    assert curated_index > models_index
+
+    assert {:ok, advanced} =
+             AuthoringCompiler.compile(
+               "advanced",
+               "Models and limits",
+               content,
+               v3_questions(),
+               "curated-advanced",
+               media_urls: %{
+                 "search-growth" => %{
+                   "url" => "staged://search-growth",
+                   "alt" => "A graph comparing linear and logarithmic search growth"
+                 }
+               }
+             )
+
+    curated_screen =
+      Enum.find(advanced["activities"], &(&1["title"] == "Open chemistry evidence"))
+
+    assert curated_screen
+    assert Jason.encode!(curated_screen["model"]) =~ "https://example.edu/open-chemistry"
+    assert collect_text(curated_screen["model"]) =~ "Identify one agreement and one limitation"
+    assert match?({:ok, _}, Model.parse(curated_screen["model"]))
+  end
+
   test "compiles the V3 Advanced blueprint into decision, slider, and numeric interactions" do
     content =
       v3_content()
@@ -766,6 +921,221 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerTest do
                    "alt" => "A graph comparing linear and logarithmic search growth"
                  }
                }
+             )
+  end
+
+  test "resolves a V4 generated simulation proposal into a restricted Advanced iframe" do
+    assert {:ok, compiled} =
+             AuthoringCompiler.compile(
+               "advanced",
+               "Models and limits",
+               enriched_v4_content(),
+               v3_questions(),
+               "v4-generated-simulation",
+               media_urls: %{
+                 "search-growth" => %{
+                   "url" => "staged://search-growth",
+                   "alt" => "A graph comparing linear and logarithmic search growth"
+                 }
+               },
+               simulation_artifact_resolver: fn @simulation_proposal_id ->
+                 {:ok, simulation_artifact()}
+               end,
+               simulation_artifact_url_resolver: fn _artifact ->
+                 {:ok, "https://media.example.edu/bundles/#{@simulation_hash}/index.html"}
+               end,
+               generated_simulation_origins: ["https://media.example.edu"]
+             )
+
+    simulation_screen =
+      Enum.find(compiled["activities"], &(&1["title"] == "Explore the gas model"))
+
+    iframe =
+      Enum.find(
+        simulation_screen["model"]["partsLayout"],
+        &(&1["type"] == "janus-capi-iframe")
+      )
+
+    assert get_in(iframe, ["custom", "src"]) ==
+             "https://media.example.edu/bundles/#{@simulation_hash}/index.html"
+
+    assert get_in(iframe, ["custom", "securityProfile"]) == "generated_simulation"
+    assert get_in(iframe, ["custom", "title"]) == "Gas pressure model"
+
+    assert get_in(iframe, ["custom", "description"]) ==
+             "Change volume and observe pressure."
+
+    assert get_in(iframe, ["custom", "artifactIdentity"]) == %{
+             "proposalId" => @simulation_proposal_id,
+             "artifactId" => "artifact-1",
+             "version" => 1,
+             "contentHash" => @simulation_hash,
+             "storageOrigin" => "https://media.example.edu"
+           }
+
+    assert get_in(iframe, ["custom", "capiInputs"]) == [
+             %{"defaultValue" => 1, "key" => "volume", "type" => "number"}
+           ]
+
+    assert get_in(iframe, ["custom", "capiOutputs"]) == [
+             %{
+               "defaultValue" => 0,
+               "key" => "pressure",
+               "type" => "number",
+               "branching" => %{
+                 "operator" => "greaterThanInclusive",
+                 "value" => 80,
+                 "remediation_section_id" => "models",
+                 "feedback" => "Review the computation model before interpreting this state."
+               }
+             }
+           ]
+
+    capi_branch =
+      Enum.find(
+        simulation_screen["model"]["authoring"]["rules"],
+        &(&1["name"] == "generated-capi-branch-1")
+      )
+
+    assert get_in(capi_branch, ["conditions", "all", Access.at(0), "operator"]) ==
+             "greaterThanInclusive"
+
+    assert get_in(capi_branch, ["conditions", "all", Access.at(0), "value"]) == 80
+
+    assert get_in(capi_branch, ["event", "params", "actions"])
+           |> Enum.any?(&(&1["type"] == "navigation"))
+
+    assert Enum.any?(compiled["activities"], fn activity ->
+             Enum.any?(activity["model"]["partsLayout"], fn part ->
+               part["type"] in ["janus-mcq", "janus-input-text"]
+             end)
+           end)
+
+    assert Enum.all?(compiled["activities"], fn screen ->
+             match?({:ok, _}, Model.parse(screen["model"]))
+           end)
+  end
+
+  test "maps generated CAPI branching when the exploration also contains a native question" do
+    content =
+      enriched_v4_content()
+      |> put_in(
+        ["advanced_blueprint", "screens"],
+        [
+          %{
+            "id" => "gas-decision",
+            "kind" => "exploration",
+            "role" => "evidence",
+            "title" => "Predict with the gas model",
+            "prompt" => "Which observation would support the model?",
+            "interaction_type" => "dropdown",
+            "choices" => [
+              %{
+                "id" => "lower",
+                "text" => "Pressure decreases",
+                "correct" => false,
+                "feedback" => "Compare the state with the gas-law explanation."
+              },
+              %{
+                "id" => "higher",
+                "text" => "Pressure increases",
+                "correct" => true,
+                "feedback" => "That observation is consistent with the model."
+              }
+            ],
+            "placement_after_section_id" => "models",
+            "remediation_section_id" => "models",
+            "enrichment_proposal_id" => @simulation_proposal_id
+          }
+        ]
+      )
+      |> put_in(
+        ["advanced_blueprint", "remediation_paths"],
+        [%{"from_question_id" => "gas-decision", "to_section_id" => "models"}]
+      )
+
+    assert {:ok, compiled} =
+             AuthoringCompiler.compile(
+               "advanced",
+               "Models and limits",
+               content,
+               v3_questions(),
+               "v4-generated-question-simulation",
+               media_urls: %{
+                 "search-growth" => %{
+                   "url" => "staged://search-growth",
+                   "alt" => "A graph comparing linear and logarithmic search growth"
+                 }
+               },
+               simulation_artifact_resolver: fn @simulation_proposal_id ->
+                 {:ok, simulation_artifact()}
+               end,
+               simulation_artifact_url_resolver: fn _artifact ->
+                 {:ok, "https://media.example.edu/bundles/#{@simulation_hash}/index.html"}
+               end,
+               generated_simulation_origins: ["https://media.example.edu"]
+             )
+
+    simulation_screen =
+      Enum.find(compiled["activities"], &(&1["title"] == "Predict with the gas model"))
+
+    assert Enum.any?(
+             simulation_screen["model"]["authoring"]["rules"],
+             &(&1["name"] == "generated-capi-branch-1")
+           )
+
+    assert Enum.any?(
+             simulation_screen["model"]["partsLayout"],
+             &(&1["type"] == "janus-dropdown")
+           )
+
+    assert match?({:ok, _}, Model.parse(simulation_screen["model"]))
+  end
+
+  test "never accepts a model-authored URL for a generated simulation" do
+    content =
+      put_in(
+        enriched_v4_content(),
+        ["advanced_blueprint", "screens", Access.at(0), "src"],
+        "https://model-authored.example/unsafe.html"
+      )
+
+    assert {:error, {:invalid_advanced_blueprint, 1, :generated_simulation_raw_url_forbidden}} =
+             AuthoringCompiler.compile(
+               "advanced",
+               "Models and limits",
+               content,
+               v3_questions(),
+               "v4-raw-simulation-url",
+               media_urls: %{
+                 "search-growth" => %{
+                   "url" => "staged://search-growth",
+                   "alt" => "A graph comparing linear and logarithmic search growth"
+                 }
+               },
+               simulation_artifact_resolver: fn _proposal_id ->
+                 flunk("raw URL must be rejected before artifact resolution")
+               end
+             )
+  end
+
+  test "fails closed when a referenced simulation artifact is not approved" do
+    assert {:error, {:invalid_advanced_blueprint, 1, :artifact_not_approved}} =
+             AuthoringCompiler.compile(
+               "advanced",
+               "Models and limits",
+               enriched_v4_content(),
+               v3_questions(),
+               "v4-unapproved-simulation",
+               media_urls: %{
+                 "search-growth" => %{
+                   "url" => "staged://search-growth",
+                   "alt" => "A graph comparing linear and logarithmic search growth"
+                 }
+               },
+               simulation_artifact_resolver: fn _proposal_id ->
+                 {:error, :artifact_not_approved}
+               end
              )
   end
 
@@ -1038,6 +1408,61 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerTest do
         %{"from_question_id" => "choose-model", "to_section_id" => "models"}
       ]
     })
+  end
+
+  defp enriched_v4_content do
+    v3_content()
+    |> Map.put("schema_version", 4)
+    |> Map.put("advanced_blueprint", %{
+      "screens" => [
+        %{
+          "id" => "gas-model",
+          "kind" => "content",
+          "role" => "evidence",
+          "title" => "Explore the gas model",
+          "body" => "Change the model, record what you observe, then answer the nearby check.",
+          "placement_after_section_id" => "models",
+          "enrichment_proposal_id" => @simulation_proposal_id
+        }
+      ],
+      "remediation_paths" => []
+    })
+  end
+
+  defp simulation_artifact do
+    %{
+      id: "artifact-1",
+      proposal_id: @simulation_proposal_id,
+      status: "approved",
+      version: 1,
+      content_hash: @simulation_hash,
+      storage_provider: "local",
+      storage_state: "promoted",
+      storage_key: "bundles/#{@simulation_hash}/index.html",
+      storage_origin: "https://media.example.edu",
+      manifest: %{"entrypoint" => "index.html"},
+      capi_manifest: %{
+        "inputs" => [%{"key" => "volume", "type" => "number", "default" => 1}],
+        "outputs" => [
+          %{
+            "key" => "pressure",
+            "type" => "number",
+            "default" => 0,
+            "branching" => %{
+              "operator" => "greater_than_or_equal",
+              "value" => 80,
+              "remediation_section_id" => "models",
+              "feedback" => "Review the computation model before interpreting this state."
+            }
+          }
+        ]
+      },
+      accessibility_metadata: %{
+        "title" => "Gas pressure model",
+        "description" => "Change volume and observe pressure."
+      },
+      validation_payload: %{"status" => "passed"}
+    }
   end
 
   defp content_screen_navigates_next?(screen) do

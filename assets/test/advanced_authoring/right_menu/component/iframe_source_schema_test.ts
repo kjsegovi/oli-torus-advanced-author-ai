@@ -1,10 +1,188 @@
 import {
+  DEFAULT_IFRAME_TITLE,
+  GENERATED_SIMULATION_REDACTED_CONFIG,
+  GENERATED_SIMULATION_SANDBOX,
+  THIRD_PARTY_IFRAME_PERMISSIONS,
+  authorizeGeneratedSimulationMessage,
+  createSchema,
   decodeSourceConfig,
+  redactGeneratedSimulationHandshake,
+  resolveIframeDescription,
+  resolveIframePermissions,
+  resolveIframeReferrerPolicy,
+  resolveIframeSandbox,
+  resolveIframeTitle,
+  sanitizeGeneratedSimulationValueChange,
+  schema,
+  simpleSchema,
   transformModelToSchema,
   transformSchemaToModel,
 } from 'components/parts/janus-capi-iframe/schema';
 
 describe('janus-capi-iframe source schema transforms', () => {
+  it('exposes distinct accessible title and description fields', () => {
+    expect(simpleSchema.title).toMatchObject({ title: 'Title', type: 'string' });
+    expect(simpleSchema.description).toMatchObject({ title: 'Description', type: 'string' });
+    expect(schema.title).toMatchObject({ title: 'Title', type: 'string' });
+    expect(schema.description).toMatchObject({ title: 'Description', type: 'string' });
+    expect(createSchema()).toMatchObject({
+      title: DEFAULT_IFRAME_TITLE,
+      description: '',
+    });
+  });
+
+  it('normalizes iframe accessibility metadata', () => {
+    expect(resolveIframeTitle(undefined)).toBe(DEFAULT_IFRAME_TITLE);
+    expect(resolveIframeTitle('  ')).toBe(DEFAULT_IFRAME_TITLE);
+    expect(resolveIframeTitle('Molecule model')).toBe('Molecule model');
+    expect(resolveIframeDescription('  ')).toBeUndefined();
+    expect(resolveIframeDescription('Change the temperature.')).toBe('Change the temperature.');
+  });
+
+  it('applies the restricted generated-simulation profile without changing third-party policy', () => {
+    const generated = { securityProfile: 'generated_simulation' as const };
+    const thirdParty = {};
+
+    expect(resolveIframeSandbox(generated)).toBe(GENERATED_SIMULATION_SANDBOX);
+    expect(resolveIframePermissions(generated)).toBe('');
+    expect(resolveIframeReferrerPolicy(generated)).toBe('no-referrer');
+
+    expect(resolveIframeSandbox(thirdParty)).toBeUndefined();
+    expect(resolveIframePermissions(thirdParty)).toBe(THIRD_PARTY_IFRAME_PERMISSIONS);
+    expect(resolveIframeReferrerPolicy(thirdParty)).toBeUndefined();
+  });
+
+  it('keeps generated handshakes redacted and requires the negotiated session tokens', () => {
+    const expected = {
+      requestToken: 'simulation-request',
+      authToken: 'parent-secret',
+      config: {
+        lessonId: 'real-lesson',
+        questionId: 'real-question',
+        sectionSlug: 'real-section',
+        userId: 'real-user',
+      },
+    };
+
+    expect(redactGeneratedSimulationHandshake(expected)).toEqual({
+      requestToken: 'simulation-request',
+      authToken: 'parent-secret',
+      config: GENERATED_SIMULATION_REDACTED_CONFIG,
+    });
+
+    expect(
+      authorizeGeneratedSimulationMessage(
+        { handshake: { requestToken: 'simulation-request' } },
+        expected,
+        false,
+        true,
+      ),
+    ).toBe(true);
+
+    expect(
+      authorizeGeneratedSimulationMessage(
+        {
+          handshake: {
+            requestToken: 'simulation-request',
+            authToken: 'parent-secret',
+          },
+        },
+        expected,
+        true,
+        false,
+      ),
+    ).toBe(true);
+
+    expect(
+      authorizeGeneratedSimulationMessage(
+        {
+          handshake: {
+            requestToken: 'simulation-request',
+            authToken: 'wrong-origin-session',
+          },
+        },
+        expected,
+        true,
+        false,
+      ),
+    ).toBe(false);
+
+    expect(
+      authorizeGeneratedSimulationMessage(
+        { handshake: { requestToken: 'replacement-request' } },
+        expected,
+        true,
+        true,
+      ),
+    ).toBe(false);
+  });
+
+  it('accepts only exact typed CAPI outputs from generated simulations', () => {
+    const model = {
+      securityProfile: 'generated_simulation' as const,
+      capiOutputs: [
+        { key: 'pressure', type: 'number' as const },
+        {
+          key: 'state',
+          type: 'enum' as const,
+          allowedValues: ['stable', 'changing'],
+        },
+      ],
+    };
+
+    const sanitized = sanitizeGeneratedSimulationValueChange(model, {
+      pressure: { type: 1, value: 2.5 },
+      state: { type: 5, value: 'not-declared' },
+      injected: { type: 2, value: 'ignore me' },
+    });
+
+    expect(Object.keys(sanitized)).toEqual(['pressure']);
+    expect(sanitized.pressure).toEqual({ type: 1, value: 2.5 });
+  });
+
+  it('rejects generated CAPI type confusion and oversized values', () => {
+    const model = {
+      securityProfile: 'generated_simulation' as const,
+      capiOutputs: [
+        { key: 'pressure', type: 'number' as const },
+        { key: 'notes', type: 'string' as const },
+      ],
+    };
+
+    const sanitized = sanitizeGeneratedSimulationValueChange(model, {
+      pressure: { type: 2, value: '2.5' },
+      notes: { type: 2, value: 'x'.repeat(20_000) },
+    });
+
+    expect(Object.keys(sanitized)).toHaveLength(0);
+  });
+
+  it('does not convert source-editor data into a generated simulation src', () => {
+    const trustedSrc =
+      'https://media.example.edu/bundles/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/index.html';
+
+    const transformed = transformSchemaToModel({
+      src: trustedSrc,
+      source: JSON.stringify({
+        mode: 'url',
+        pageId: null,
+        pageSlug: '',
+        url: 'https://model-authored.example/unsafe.html',
+      }),
+      securityProfile: 'generated_simulation',
+      artifactIdentity: {
+        proposalId: 'proposal-1',
+        artifactId: 'artifact-1',
+        version: 1,
+        contentHash: 'a'.repeat(64),
+        storageOrigin: 'https://media.example.edu',
+      },
+    });
+
+    expect(transformed.src).toBe(trustedSrc);
+    expect(transformed).not.toHaveProperty('source');
+  });
+
   it('encodes legacy external src into source config for editor', () => {
     const transformed = transformModelToSchema({
       src: 'https://example.com/widget',

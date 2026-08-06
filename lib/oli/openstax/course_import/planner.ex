@@ -6,6 +6,8 @@ defmodule Oli.OpenStax.CourseImport.Planner do
   planner. Its payload is also used to initialize outline-only lesson metadata.
   """
 
+  alias Oli.OpenStax.CourseImport.FullSource
+
   @keyword_stop_words MapSet.new(~w(
     apply chapter concept define describe explain from introduction lesson main
     objective openstax source the this topic understand using with
@@ -25,6 +27,7 @@ defmodule Oli.OpenStax.CourseImport.Planner do
   # Advanced Author lesson at all.
   @knowledge_check_min_words 450
   @knowledge_check_min_instructional_blocks 4
+  @refined_plan_schema_version 4
 
   @higher_order_objective_terms ~w(
     analyze choose classify compare decide design diagnose distinguish evaluate
@@ -52,17 +55,39 @@ defmodule Oli.OpenStax.CourseImport.Planner do
   )
 
   @spec build_lesson_plan(map(), pos_integer()) :: {String.t(), map()}
-  def build_lesson_plan(lesson, index) when is_map(lesson) and is_integer(index) do
+  def build_lesson_plan(lesson, index), do: build_lesson_plan(lesson, index, [])
+
+  @spec build_lesson_plan(map(), pos_integer(), keyword()) :: {String.t(), map()}
+  def build_lesson_plan(lesson, index, opts)
+      when is_map(lesson) and is_integer(index) and is_list(opts) do
+    schema_version = plan_schema_version(opts)
     title = lesson["title"] || "OpenStax lesson #{index}"
     evidence_links = lesson["source_evidence_links"] || lesson["source_sections"] || []
     objectives = normalize_objectives(lesson["source_objectives"], title)
     narrative = narrative(lesson, title)
-    instructional_sections = instructional_sections(lesson, title, evidence_links)
-    worked_examples = worked_examples(title, objectives, instructional_sections, evidence_links)
+
+    instructional_sections =
+      lesson
+      |> instructional_sections(title, evidence_links, schema_version)
+      |> then(&FullSource.preserve_sections(lesson, &1, schema_version))
+
+    worked_examples =
+      worked_examples(
+        title,
+        objectives,
+        instructional_sections,
+        evidence_links,
+        if(schema_version >= @refined_plan_schema_version,
+          do: source_objective_block_ids(lesson),
+          else: []
+        )
+      )
+
     key_takeaways = key_takeaways(objectives, instructional_sections, title)
-    source_block_ids = Enum.map(source_blocks(lesson), & &1["id"])
-    callouts = source_callouts(lesson)
-    media = source_media(lesson)
+    planning_blocks = planning_source_blocks(lesson, schema_version)
+    source_block_ids = source_block_ids_for_schema(lesson, planning_blocks, schema_version)
+    callouts = source_callouts(lesson, instructional_sections, schema_version)
+    media = source_media(lesson, instructional_sections, schema_version)
     curiosity_prompts = curiosity_prompts(instructional_sections)
     application_problems = application_problems(instructional_sections)
 
@@ -82,7 +107,9 @@ defmodule Oli.OpenStax.CourseImport.Planner do
           question_index,
           question_count(lesson, objectives),
           source_objective_block_ids(lesson),
-          source_blocks(lesson) != []
+          source_blocks(lesson) != [],
+          schema_version,
+          media
         )
       end)
 
@@ -91,14 +118,14 @@ defmodule Oli.OpenStax.CourseImport.Planner do
         plan_mode,
         mode_recommendation,
         instructional_sections,
-        questions
+        questions,
+        schema_version
       )
 
-    {
-      plan_mode,
+    payload =
       %{
         "content_payload" => %{
-          "schema_version" => 3,
+          "schema_version" => schema_version,
           "title" => title,
           "objective" => List.first(objectives),
           "learning_objectives" => objectives,
@@ -117,19 +144,40 @@ defmodule Oli.OpenStax.CourseImport.Planner do
           "estimated_minutes" => estimated_minutes(lesson),
           "source_evidence_links" => evidence_links,
           "source_block_ids" => source_block_ids,
-          "coverage_manifest" => %{
-            "available_block_ids" => source_block_ids,
-            "included_block_ids" => plan_evidence_ids(instructional_sections, callouts, media),
-            "excluded_blocks" => [],
-            "source_word_count" => lesson["source_word_count"] || source_word_count(lesson)
-          },
+          "coverage_manifest" =>
+            coverage_manifest(
+              lesson,
+              schema_version,
+              source_block_ids,
+              instructional_sections,
+              callouts,
+              media,
+              questions
+            ),
           "attribution" => source_attribution(lesson, evidence_links),
           "advanced_blueprint" => advanced_blueprint,
           "authoring_mode" => plan_mode
         },
         "questions_payload" => %{"items" => questions}
       }
-    }
+
+    payload =
+      if schema_version >= @refined_plan_schema_version do
+        Map.put(
+          payload,
+          "enrichment_proposals",
+          enrichment_proposals(
+            lesson,
+            objectives,
+            instructional_sections,
+            mode_recommendation
+          )
+        )
+      else
+        payload
+      end
+
+    {plan_mode, payload}
   end
 
   @spec build_unit_assessment(map(), [map()]) :: map()
@@ -377,7 +425,7 @@ defmodule Oli.OpenStax.CourseImport.Planner do
   defp repair_generic_plan(content, questions) do
     title = content["title"] || "this lesson"
     evidence_links = content["source_evidence_links"] || []
-    rich_plan? = content["schema_version"] == 3
+    rich_plan? = content["schema_version"] in [3, 4, "3", "4", "v3", "v4"]
 
     objectives =
       content
@@ -663,7 +711,102 @@ defmodule Oli.OpenStax.CourseImport.Planner do
     Enum.any?(terms, &MapSet.member?(tokens, &1))
   end
 
-  defp build_advanced_blueprint("advanced", recommendation, sections, questions) do
+  defp build_advanced_blueprint(
+         "advanced",
+         _recommendation,
+         sections,
+         questions,
+         schema_version
+       )
+       when schema_version >= @refined_plan_schema_version do
+    role_specs = [
+      {"prediction", "decision", "Predict before reviewing the evidence"},
+      {"evidence", "exploration", "Explore the evidence"},
+      {"interpretation", "decision", "Interpret what the evidence supports"},
+      {"transfer", "decision", "Transfer the idea to a new situation"}
+    ]
+
+    sections_by_id = Map.new(sections, &{&1["id"], &1})
+
+    screens =
+      questions
+      |> Enum.filter(fn question ->
+        question["type"] == "multiple_choice" and
+          length(List.wrap(question["choices"])) in 2..6
+      end)
+      |> Enum.take(4)
+      |> Enum.zip(role_specs)
+      |> Enum.with_index(1)
+      |> Enum.map(fn {{question, {role, kind, title}}, index} ->
+        section =
+          Map.get(sections_by_id, question["placement_after_section_id"]) ||
+            Enum.at(sections, rem(index - 1, max(length(sections), 1)), %{})
+
+        section_id = section["id"]
+
+        evidence_block_ids =
+          (List.wrap(question["evidence_block_ids"]) ++
+             List.wrap(section["evidence_block_ids"]))
+          |> Enum.filter(&present?/1)
+          |> Enum.uniq()
+
+        source_hint =
+          section
+          |> Map.get("explanation", section["heading"])
+          |> first_sentence()
+
+        %{
+          "id" => "adaptive-#{role}-#{index}",
+          "role" => role,
+          "kind" => kind,
+          "title" => title,
+          "prompt" => question["prompt"],
+          "interaction_type" => "multiple_choice",
+          "choices" => question["choices"],
+          "correct_choice_id" => question["correct_choice_id"],
+          "correct_feedback" =>
+            "This response is consistent with the cited evidence: #{source_hint}",
+          "incorrect_feedback" =>
+            "Compare the response with #{section["heading"]}: #{source_hint}",
+          "remediation" =>
+            "Return to #{section["heading"]} and use its cited evidence before trying again.",
+          "placement_after_section_id" => section_id,
+          "remediation_section_id" => section_id,
+          "evidence_block_ids" => evidence_block_ids
+        }
+      end)
+
+    remediation_paths =
+      Enum.map(screens, fn screen ->
+        %{
+          "from_question_id" => screen["id"],
+          "to_section_id" => screen["remediation_section_id"],
+          "misconception" =>
+            "The learner's response does not yet use the evidence in the targeted instructional section."
+        }
+      end)
+
+    %{
+      "arc" => [
+        "orientation",
+        "prediction",
+        "evidence",
+        "interpretation",
+        "transfer",
+        "remediation"
+      ],
+      "screens" => screens,
+      "remediation_paths" => remediation_paths
+    }
+  end
+
+  defp build_advanced_blueprint(
+         "advanced",
+         recommendation,
+         sections,
+         questions,
+         _schema_version
+       ) do
     section_ids =
       sections
       |> Enum.map(& &1["id"])
@@ -746,7 +889,14 @@ defmodule Oli.OpenStax.CourseImport.Planner do
     end
   end
 
-  defp build_advanced_blueprint(_mode, _recommendation, _sections, _questions), do: %{}
+  defp build_advanced_blueprint(
+         _mode,
+         _recommendation,
+         _sections,
+         _questions,
+         _schema_version
+       ),
+       do: %{}
 
   defp legacy_recommend_mode(lesson, index) do
     section_count = length(lesson["source_sections"] || [])
@@ -825,7 +975,9 @@ defmodule Oli.OpenStax.CourseImport.Planner do
          question_index,
          question_count,
          objective_block_ids,
-         rich_source?
+         rich_source?,
+         schema_version,
+         media
        ) do
     section =
       Enum.at(
@@ -853,56 +1005,105 @@ defmodule Oli.OpenStax.CourseImport.Planner do
       "source_evidence_links" => evidence_links
     }
 
-    if rich_source? and question_index <= 2 do
-      question_heading = section["heading"] || title
+    question =
+      if rich_source? and
+           question_index <=
+             if(schema_version >= @refined_plan_schema_version, do: 4, else: 2) do
+        question_heading = section["heading"] || title
 
-      correct_text =
-        section
-        |> Map.get("explanation", List.first(objective_ids) || title)
-        |> first_sentence()
-        |> case do
-          "" -> List.first(objective_ids) || title
-          text -> text
-        end
+        correct_text =
+          section
+          |> Map.get("explanation", List.first(objective_ids) || title)
+          |> first_sentence()
+          |> case do
+            "" -> List.first(objective_ids) || title
+            text -> text
+          end
 
-      Map.merge(base, %{
-        "prompt" =>
-          "Which explanation of #{question_heading} is best supported by the lesson evidence?",
-        "type" => "multiple_choice",
-        "choices" => [
-          %{
-            "id" => "q#{question_index}-supported",
-            "text" => correct_text,
-            "correct" => true,
-            "feedback" => "This explanation is supported by the cited lesson evidence."
-          },
-          %{
-            "id" => "q#{question_index}-partial",
-            "text" =>
-              "The idea is only a definition and has no connection to the lesson evidence.",
-            "correct" => false,
-            "feedback" =>
-              "The lesson develops the idea through evidence, examples, and application."
-          },
-          %{
-            "id" => "q#{question_index}-unrelated",
-            "text" =>
-              "The idea is unrelated to the objective and does not affect the explanation.",
-            "correct" => false,
-            "feedback" =>
-              "Review the mapped objective and the instructional section before choosing again."
-          }
-        ],
-        "correct_choice_id" => "q#{question_index}-supported"
-      })
-    else
-      Map.merge(base, %{
-        "type" => "short_answer",
-        "response_kind" => "application",
-        "answer_keywords" => answer_keywords
-      })
-    end
+        Map.merge(base, %{
+          "prompt" =>
+            "Which explanation of #{question_heading} is best supported by the lesson evidence?",
+          "type" => "multiple_choice",
+          "choices" => [
+            %{
+              "id" => "q#{question_index}-supported",
+              "text" => correct_text,
+              "correct" => true,
+              "feedback" => "This explanation is supported by the cited lesson evidence."
+            },
+            %{
+              "id" => "q#{question_index}-partial",
+              "text" =>
+                "The idea is only a definition and has no connection to the lesson evidence.",
+              "correct" => false,
+              "feedback" =>
+                "The lesson develops the idea through evidence, examples, and application."
+            },
+            %{
+              "id" => "q#{question_index}-unrelated",
+              "text" =>
+                "The idea is unrelated to the objective and does not affect the explanation.",
+              "correct" => false,
+              "feedback" =>
+                "Review the mapped objective and the instructional section before choosing again."
+            }
+          ],
+          "correct_choice_id" => "q#{question_index}-supported"
+        })
+      else
+        Map.merge(base, %{
+          "type" => "short_answer",
+          "response_kind" => "application",
+          "answer_keywords" => answer_keywords
+        })
+      end
+
+    maybe_add_v4_question_contract(question, section, question_index, media, schema_version)
   end
+
+  defp maybe_add_v4_question_contract(
+         question,
+         section,
+         question_index,
+         media,
+         schema_version
+       )
+       when schema_version >= @refined_plan_schema_version do
+    placement_id = question["placement_after_section_id"]
+    evidence_ids = List.wrap(question["evidence_block_ids"]) |> Enum.uniq()
+
+    media_ids =
+      media
+      |> Enum.filter(fn item ->
+        item["placement_after_section_id"] == placement_id or
+          not MapSet.disjoint?(
+            MapSet.new(List.wrap(item["evidence_block_ids"])),
+            MapSet.new(evidence_ids)
+          )
+      end)
+      |> Enum.map(& &1["source_media_id"])
+      |> Enum.filter(&present?/1)
+      |> Enum.uniq()
+
+    question
+    |> Map.put(
+      "hint",
+      "Review #{section["heading"] || "the preceding section"} and focus on the cited evidence before choosing."
+    )
+    |> Map.put("media_ids", media_ids)
+    |> Map.put("allow_not_sure", question["type"] == "multiple_choice")
+    |> Map.put("placement", %{
+      "after_section_id" => placement_id,
+      "sequence" => question_index
+    })
+    |> Map.put(
+      "evidence_refs",
+      Enum.map(evidence_ids, &%{"kind" => "source_block", "id" => &1})
+    )
+  end
+
+  defp maybe_add_v4_question_contract(question, _section, _index, _media, _schema_version),
+    do: question
 
   defp question_objective_ids(objectives, question_index, question_count) do
     objectives
@@ -942,60 +1143,91 @@ defmodule Oli.OpenStax.CourseImport.Planner do
   defp maybe_ensure_minimum_questions(items, false, title, evidence_links),
     do: ensure_minimum_questions(items, title, evidence_links)
 
-  defp instructional_sections(lesson, title, evidence_links) do
-    case source_sections_from_blocks(lesson, evidence_links) do
+  defp instructional_sections(lesson, title, evidence_links, schema_version) do
+    case source_sections_from_blocks(
+           planning_source_blocks(lesson, schema_version),
+           evidence_links,
+           schema_version
+         ) do
       [] ->
         lesson
         |> Map.get("source_excerpt", "")
         |> source_sections_from_excerpt(title, evidence_links)
-        |> ensure_instructional_sections(title, evidence_links)
+        |> ensure_instructional_sections_for_schema(
+          title,
+          evidence_links,
+          schema_version
+        )
 
       sections ->
         sections
-        |> Enum.take(7)
-        |> ensure_instructional_sections(title, evidence_links)
+        |> maybe_limit_instructional_sections(schema_version)
+        |> ensure_instructional_sections_for_schema(
+          title,
+          evidence_links,
+          schema_version
+        )
     end
   end
 
-  defp source_sections_from_blocks(lesson, evidence_links) do
-    lesson
-    |> source_blocks()
-    |> Enum.reduce({[], nil, []}, fn block, {sections, current_heading, pending_ids} ->
-      kind = block["kind"]
-      heading = block_heading(block, current_heading)
+  defp source_sections_from_blocks(blocks, evidence_links, schema_version) do
+    {sections, current_heading, pending_ids} =
+      Enum.reduce(blocks, {[], nil, []}, fn block, {sections, current_heading, pending_ids} ->
+        kind = block["kind"]
+        heading = block_heading(block, current_heading)
+        block_evidence_ids = source_block_evidence_ids(block)
 
-      cond do
-        kind == "heading" and present?(block["text"]) ->
-          {sections, block["text"], Enum.uniq(pending_ids ++ [block["id"]])}
+        cond do
+          kind == "heading" and present?(block["text"]) ->
+            {sections, block["text"], Enum.uniq(pending_ids ++ block_evidence_ids)}
 
-        kind in ["objective", "objectives"] ->
-          {sections, current_heading, Enum.uniq(pending_ids ++ [block["id"]])}
+          kind in ["objective", "objectives"] ->
+            {sections, current_heading, Enum.uniq(pending_ids ++ block_evidence_ids)}
 
-        kind in ["figure", "footnote"] ->
-          {sections, current_heading, pending_ids}
+          kind in ["figure", "footnote"] and schema_version < @refined_plan_schema_version ->
+            {sections, current_heading, pending_ids}
 
-        kind == "callout" ->
-          {sections, current_heading, pending_ids}
+          kind == "callout" ->
+            {sections, current_heading, pending_ids}
 
-        present?(block["text"]) ->
-          section_heading = heading || "Core ideas"
+          present?(block["text"]) ->
+            section_heading = heading || "Core ideas"
 
-          updated =
-            append_source_block(
-              sections,
-              section_heading,
-              block,
-              evidence_links,
-              pending_ids
-            )
+            updated =
+              append_source_block(
+                sections,
+                section_heading,
+                block,
+                evidence_links,
+                pending_ids
+              )
 
-          {updated, section_heading, []}
+            {updated, section_heading, []}
 
-        true ->
-          {sections, current_heading, pending_ids}
+          true ->
+            {sections, current_heading, pending_ids}
+        end
+      end)
+
+    sections =
+      if schema_version >= @refined_plan_schema_version and pending_ids != [] do
+        sections ++
+          [
+            %{
+              "id" => "section-#{length(sections) + 1}",
+              "heading" => current_heading || "Source objectives",
+              "explanation" =>
+                "Use this source heading and its mapped objectives to organize the lesson synthesis.",
+              "examples" => [],
+              "evidence_block_ids" => pending_ids,
+              "source_evidence_links" => evidence_links
+            }
+          ]
+      else
+        sections
       end
-    end)
-    |> elem(0)
+
+    sections
     |> Enum.map(fn section ->
       Map.update!(section, "explanation", &String.trim/1)
     end)
@@ -1003,8 +1235,7 @@ defmodule Oli.OpenStax.CourseImport.Planner do
   end
 
   defp append_source_block(sections, heading, block, evidence_links, pending_ids) do
-    block_id = block["id"]
-    block_ids = Enum.uniq(pending_ids ++ List.wrap(block_id))
+    block_ids = Enum.uniq(pending_ids ++ source_block_evidence_ids(block))
 
     case List.last(sections) do
       %{"heading" => ^heading} = last ->
@@ -1035,6 +1266,49 @@ defmodule Oli.OpenStax.CourseImport.Planner do
           ]
     end
   end
+
+  defp maybe_limit_instructional_sections(sections, schema_version)
+       when schema_version >= @refined_plan_schema_version,
+       do: sections
+
+  defp maybe_limit_instructional_sections(sections, _schema_version), do: Enum.take(sections, 7)
+
+  defp ensure_instructional_sections_for_schema(
+         sections,
+         title,
+         evidence_links,
+         schema_version
+       )
+       when schema_version >= @refined_plan_schema_version do
+    sections =
+      Enum.filter(sections, &(present?(&1["heading"]) and present?(&1["explanation"])))
+
+    case sections do
+      [] ->
+        ensure_instructional_sections([], title, evidence_links)
+
+      [section] ->
+        [
+          section,
+          instructional_section(
+            "Synthesis and transfer",
+            "Connect #{section["heading"]} to the lesson objective, then use the cited evidence to test the idea in a new situation.",
+            evidence_links
+          )
+        ]
+
+      values ->
+        values
+    end
+  end
+
+  defp ensure_instructional_sections_for_schema(
+         sections,
+         title,
+         evidence_links,
+         _schema_version
+       ),
+       do: ensure_instructional_sections(sections, title, evidence_links)
 
   defp block_heading(block, current_heading) do
     case block["heading_path"] do
@@ -1221,7 +1495,16 @@ defmodule Oli.OpenStax.CourseImport.Planner do
     }
   end
 
-  defp worked_examples(title, objectives, instructional_sections, evidence_links) do
+  defp worked_examples(title, objectives, instructional_sections, evidence_links),
+    do: worked_examples(title, objectives, instructional_sections, evidence_links, [])
+
+  defp worked_examples(
+         title,
+         objectives,
+         instructional_sections,
+         evidence_links,
+         objective_evidence_block_ids
+       ) do
     substantial_case_count =
       if length(instructional_sections) >= 4,
         do: min(length(instructional_sections), 3),
@@ -1254,7 +1537,9 @@ defmodule Oli.OpenStax.CourseImport.Planner do
         ],
         "conclusion" =>
           "The worked case connects the source explanation of #{heading} to #{objective}.",
-        "evidence_block_ids" => List.wrap(section["evidence_block_ids"]) |> Enum.uniq(),
+        "evidence_block_ids" =>
+          (List.wrap(section["evidence_block_ids"]) ++ objective_evidence_block_ids)
+          |> Enum.uniq(),
         "source_evidence_links" => evidence_links
       }
     end)
@@ -1594,6 +1879,73 @@ defmodule Oli.OpenStax.CourseImport.Planner do
     end)
   end
 
+  defp planning_source_blocks(lesson, schema_version)
+       when schema_version >= @refined_plan_schema_version do
+    raw_by_id =
+      lesson
+      |> Map.get("source_blocks", [])
+      |> List.wrap()
+      |> Enum.filter(&is_map/1)
+      |> Map.new(&{&1["id"] || &1[:id], &1})
+
+    lesson
+    |> source_blocks()
+    |> Enum.map(fn block ->
+      evidence_ids =
+        raw_by_id
+        |> Map.get(block["id"], block)
+        |> recursive_source_block_ids()
+
+      Map.put(block, "evidence_block_ids", evidence_ids)
+    end)
+  end
+
+  defp planning_source_blocks(lesson, _schema_version), do: source_blocks(lesson)
+
+  defp source_block_ids_for_schema(lesson, _planning_blocks, schema_version)
+       when schema_version >= @refined_plan_schema_version do
+    case get_in(lesson, ["source_coverage", "source_block_ids"]) do
+      ids when is_list(ids) and ids != [] -> Enum.filter(ids, &present?/1) |> Enum.uniq()
+      _ -> lesson |> Map.get("source_blocks", []) |> recursive_source_block_ids()
+    end
+  end
+
+  defp source_block_ids_for_schema(_lesson, planning_blocks, _schema_version),
+    do: Enum.map(planning_blocks, & &1["id"]) |> Enum.uniq()
+
+  defp source_block_evidence_ids(block) do
+    case block["evidence_block_ids"] do
+      ids when is_list(ids) and ids != [] -> Enum.filter(ids, &present?/1) |> Enum.uniq()
+      _ -> List.wrap(block["id"]) |> Enum.filter(&present?/1)
+    end
+  end
+
+  defp recursive_source_block_ids(block) when is_map(block) do
+    direct = List.wrap(block["id"] || block[:id]) |> Enum.filter(&present?/1)
+
+    direct ++
+      recursive_source_block_ids(block["blocks"] || block[:blocks]) ++
+      recursive_list_source_block_ids(block["items"] || block[:items])
+  end
+
+  defp recursive_source_block_ids(blocks) when is_list(blocks) do
+    blocks
+    |> Enum.flat_map(&recursive_source_block_ids/1)
+    |> Enum.uniq()
+  end
+
+  defp recursive_source_block_ids(_), do: []
+
+  defp recursive_list_source_block_ids(items) do
+    items
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      %{} = item -> recursive_source_block_ids(item["children"] || item[:children])
+      _ -> []
+    end)
+    |> Enum.uniq()
+  end
+
   defp source_objective_block_ids(lesson) do
     lesson
     |> source_blocks()
@@ -1602,9 +1954,9 @@ defmodule Oli.OpenStax.CourseImport.Planner do
     |> Enum.filter(&present?/1)
   end
 
-  defp source_callouts(lesson) do
+  defp source_callouts(lesson, instructional_sections, schema_version) do
     lesson
-    |> source_blocks()
+    |> planning_source_blocks(schema_version)
     |> Enum.filter(&(&1["kind"] == "callout"))
     |> Enum.with_index(1)
     |> Enum.map(fn {block, index} ->
@@ -1622,10 +1974,11 @@ defmodule Oli.OpenStax.CourseImport.Planner do
             block_heading(block, nil) || "Source connection",
         "body" => metadata["body"] || metadata[:body] || block["callout_body"] || block["text"],
         "placement_after_section_id" => nil,
-        "evidence_block_ids" => [block["id"]]
+        "evidence_block_ids" => source_block_evidence_ids(block)
       }
     end)
-    |> Enum.take(6)
+    |> maybe_limit_supporting_items(schema_version, 6)
+    |> place_supporting_items(instructional_sections, schema_version)
   end
 
   defp normalize_source_callout_type(type)
@@ -1640,12 +1993,12 @@ defmodule Oli.OpenStax.CourseImport.Planner do
 
   defp normalize_source_callout_type(_type), do: "learn_more"
 
-  defp source_media(lesson) do
+  defp source_media(lesson, instructional_sections, schema_version) do
     explicit = lesson |> Map.get("source_media", []) |> List.wrap()
 
     embedded =
       lesson
-      |> source_blocks()
+      |> planning_source_blocks(schema_version)
       |> Enum.flat_map(fn block ->
         case block["media"] do
           %{} = media -> [Map.put_new(media, "id", block["id"])]
@@ -1674,7 +2027,8 @@ defmodule Oli.OpenStax.CourseImport.Planner do
               "rights_status" =>
                 media["rights_status"] || media[:rights_status] || "requires_review",
               "evidence_block_ids" =>
-                media["evidence_block_ids"] || media[:evidence_block_ids] || [id]
+                media["evidence_block_ids"] || media[:evidence_block_ids] ||
+                  List.wrap(media["source_block_id"] || media[:source_block_id] || id)
             }
           ]
         else
@@ -1685,8 +2039,45 @@ defmodule Oli.OpenStax.CourseImport.Planner do
         []
     end)
     |> Enum.uniq_by(& &1["id"])
-    |> Enum.take(3)
+    |> maybe_filter_safe_media(schema_version)
+    |> maybe_limit_supporting_items(schema_version, 3)
+    |> place_supporting_items(instructional_sections, schema_version)
   end
+
+  defp maybe_filter_safe_media(media, schema_version)
+       when schema_version >= @refined_plan_schema_version,
+       do: Enum.filter(media, &(&1["rights_status"] == "approved"))
+
+  defp maybe_filter_safe_media(media, _schema_version), do: media
+
+  defp maybe_limit_supporting_items(items, schema_version, _legacy_limit)
+       when schema_version >= @refined_plan_schema_version,
+       do: items
+
+  defp maybe_limit_supporting_items(items, _schema_version, legacy_limit),
+    do: Enum.take(items, legacy_limit)
+
+  defp place_supporting_items(items, sections, schema_version)
+       when schema_version >= @refined_plan_schema_version do
+    Enum.map(items, fn item ->
+      item_evidence = MapSet.new(List.wrap(item["evidence_block_ids"]))
+
+      placement =
+        Enum.find_value(sections, fn section ->
+          section_evidence = MapSet.new(List.wrap(section["evidence_block_ids"]))
+
+          if not MapSet.disjoint?(item_evidence, section_evidence),
+            do: section["id"],
+            else: nil
+        end) || get_in(List.first(sections, %{}), ["id"])
+
+      item
+      |> Map.put("placement_after_section_id", placement)
+      |> Map.put("placement", %{"after_section_id" => placement})
+    end)
+  end
+
+  defp place_supporting_items(items, _sections, _schema_version), do: items
 
   defp curiosity_prompts(sections) do
     sections
@@ -1766,6 +2157,138 @@ defmodule Oli.OpenStax.CourseImport.Planner do
     |> Enum.uniq()
   end
 
+  defp coverage_manifest(
+         lesson,
+         schema_version,
+         source_block_ids,
+         sections,
+         callouts,
+         media,
+         questions
+       ) do
+    included_block_ids = plan_evidence_ids(sections, callouts, media)
+
+    base = %{
+      "available_block_ids" => source_block_ids,
+      "included_block_ids" => included_block_ids,
+      "excluded_blocks" => [],
+      "source_word_count" => lesson["source_word_count"] || source_word_count(lesson)
+    }
+
+    if schema_version >= @refined_plan_schema_version do
+      deterministic_ids =
+        get_in(lesson, ["source_coverage", "deterministically_omittable_block_ids"])
+        |> List.wrap()
+        |> Enum.filter(&present?/1)
+        |> Enum.uniq()
+
+      substantive_ids =
+        case get_in(lesson, ["source_coverage", "substantive_block_ids"]) do
+          ids when is_list(ids) and ids != [] -> Enum.filter(ids, &present?/1) |> Enum.uniq()
+          _ -> source_block_ids -- deterministic_ids
+        end
+
+      included_set = MapSet.new(included_block_ids)
+
+      unaccounted_ids =
+        substantive_ids
+        |> Enum.reject(&MapSet.member?(included_set, &1))
+        |> Enum.sort()
+
+      base
+      |> Map.put("policy", "full_substantive_source")
+      |> Map.put("policy_schema_version", @refined_plan_schema_version)
+      |> Map.put("substantive_block_ids", substantive_ids)
+      |> Map.put("deterministically_omittable_block_ids", deterministic_ids)
+      |> Map.put("unaccounted_block_ids", unaccounted_ids)
+      |> Map.put("exclusion_policy", %{
+        "deterministic_reason_codes" => [
+          "navigation",
+          "duplicated_boilerplate",
+          "unsafe_media"
+        ],
+        "other_exclusions_require_author_acknowledgement" => true
+      })
+      |> Map.put("placement_manifest", %{
+        "instructional_section_ids" => Enum.map(sections, & &1["id"]),
+        "callouts" => placement_entries(callouts),
+        "media" => placement_entries(media),
+        "questions" => placement_entries(questions)
+      })
+    else
+      base
+    end
+  end
+
+  defp placement_entries(items) do
+    Enum.map(items, fn item ->
+      %{
+        "id" => item["id"] || item["source_media_id"],
+        "after_section_id" => item["placement_after_section_id"],
+        "evidence_block_ids" => List.wrap(item["evidence_block_ids"])
+      }
+    end)
+  end
+
+  defp enrichment_proposals(lesson, objectives, sections, recommendation) do
+    recommended = recommendation["recommended_interactions"] || []
+    title = lesson["title"] || "this lesson"
+
+    proposal_specs =
+      []
+      |> maybe_add_enrichment_spec(
+        "prediction_exploration" in recommended,
+        "generated_simulation",
+        "Let learners manipulate a source-grounded model before interpreting its output."
+      )
+      |> maybe_add_enrichment_spec(
+        "decision_pathway" in recommended,
+        "existing_simulation",
+        "Let learners compare evidence-backed choices in an established interactive resource."
+      )
+      |> Kernel.++([
+        {"external_resource",
+         "Connect the lesson evidence to an authoritative, openly licensed real-world example."}
+      ])
+      |> Enum.uniq_by(&elem(&1, 0))
+      |> Enum.take(3)
+
+    proposal_specs
+    |> Enum.with_index(1)
+    |> Enum.map(fn {{kind, rationale}, index} ->
+      section = Enum.at(sections, rem(index - 1, max(length(sections), 1)), %{})
+      objective = Enum.at(objectives, rem(index - 1, max(length(objectives), 1)))
+      evidence_ids = List.wrap(section["evidence_block_ids"]) |> Enum.uniq()
+
+      %{
+        "id" => "enrichment-proposal-#{index}",
+        "kind" => kind,
+        "instructional_rationale" => rationale,
+        "objective_ids" => List.wrap(objective),
+        "source_evidence" => %{
+          "block_ids" => evidence_ids,
+          "source_urls" => lesson["source_evidence_links"] || lesson["source_sections"] || []
+        },
+        "placement" => %{"after_section_id" => section["id"]},
+        "learner_task" =>
+          "Use the resource to test a prediction about #{section["heading"] || title}, then explain the result with lesson evidence.",
+        "research_query" =>
+          "#{title} #{section["heading"] || "application"} authoritative open educational resource",
+        "research_evidence" => %{},
+        "metadata" => %{
+          "research_query" =>
+            "#{title} #{section["heading"] || "application"} authoritative open educational resource"
+        },
+        "state" => "draft"
+      }
+    end)
+  end
+
+  defp maybe_add_enrichment_spec(specs, true, kind, rationale),
+    do: specs ++ [{kind, rationale}]
+
+  defp maybe_add_enrichment_spec(specs, false, _kind, _rationale), do: specs
+
   defp source_attribution(lesson, evidence_links) do
     case lesson["attribution"] do
       %{} = attribution ->
@@ -1803,6 +2326,19 @@ defmodule Oli.OpenStax.CourseImport.Planner do
   end
 
   defp normalize_string_list(_, _limit), do: []
+
+  defp plan_schema_version(opts) do
+    case Keyword.get(opts, :plan_schema_version, 3) do
+      version when is_integer(version) and version >= @refined_plan_schema_version ->
+        @refined_plan_schema_version
+
+      version when is_integer(version) and version >= 1 ->
+        3
+
+      _ ->
+        3
+    end
+  end
 
   defp present?(value) when is_binary(value), do: String.trim(value) != ""
   defp present?(_), do: false
