@@ -168,7 +168,8 @@ defmodule Oli.OpenStax.CourseImport.Worker.ApplyWorker do
             )
           )
 
-        updated_project = set_openstax_attribution!(attribution_project, run)
+        attribution = openstax_attribution(run)
+        updated_project = set_openstax_attribution!(attribution_project, attribution)
         mark_applied!(run.id)
 
         result_payload = %{
@@ -179,11 +180,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.ApplyWorker do
           "lesson_resource_ids" => Enum.map(created.lesson_pages, & &1.resource_id),
           "assessment_resource_ids" => Enum.map(created.assessment_pages, & &1.resource_id),
           "root_revision_id" => root_revision.id,
-          "license" => %{
-            "license_type" => "cc_by_nc_sa",
-            "source_provider" => "OpenStax",
-            "source_url" => run.source_url
-          },
+          "license" => Map.take(attribution, ["license_type", "source_provider", "source_url"]),
           "completed_at" => DateTime.to_iso8601(DateTime.utc_now())
         }
 
@@ -358,21 +355,19 @@ defmodule Oli.OpenStax.CourseImport.Worker.ApplyWorker do
     end
   end
 
-  defp set_openstax_attribution!(project, run) do
+  defp set_openstax_attribution!(project, attribution) do
     attributes = project.attributes || %ProjectAttributes{}
-    title = get_in(run.preflight_snapshot || %{}, ["title"]) || run.book_slug
 
     attrs = %{
       "learning_language" => attributes.learning_language,
       "calculate_embeddings_on_publish" => attributes.calculate_embeddings_on_publish,
       "license" => %{
-        "license_type" => "cc_by_nc_sa",
+        "license_type" => attribution["license_type"],
         "custom_license_details" => "",
-        "source_provider" => "OpenStax",
-        "source_title" => title,
-        "source_url" => run.source_url,
-        "source_attribution" =>
-          "#{title} by OpenStax, licensed CC BY-NC-SA 4.0. Source: #{run.source_url}"
+        "source_provider" => attribution["source_provider"],
+        "source_title" => attribution["source_title"],
+        "source_url" => attribution["source_url"],
+        "source_attribution" => attribution["source_attribution"]
       }
     }
 
@@ -380,6 +375,55 @@ defmodule Oli.OpenStax.CourseImport.Worker.ApplyWorker do
     |> Project.changeset(%{"attributes" => attrs})
     |> Repo.update!()
   end
+
+  defp openstax_attribution(run) do
+    source = CourseImport.source_attribution(run)
+    license_type = normalized_license_type(source["license_type"] || source["license"])
+    license = license_label(license_type)
+
+    title =
+      source["source_title"] || get_in(run.preflight_snapshot || %{}, ["title"]) ||
+        run.book_slug
+
+    provider = source["source_provider"] || source["provider"] || "OpenStax"
+    source_url = source["source_url"] || run.source_url
+
+    %{
+      "license_type" => Atom.to_string(license_type),
+      "license" => license,
+      "source_provider" => provider,
+      "source_title" => title,
+      "source_url" => source_url,
+      "source_attribution" =>
+        "#{title} by #{provider}, licensed #{license}. Source: #{source_url}"
+    }
+  end
+
+  defp normalized_license_type(value) when is_binary(value) do
+    normalized =
+      value
+      |> String.downcase()
+      |> String.replace(~r/[^a-z0-9]+/u, "_")
+      |> String.trim("_")
+
+    cond do
+      String.contains?(normalized, "by_nc_nd") -> :cc_by_nc_nd
+      String.contains?(normalized, "by_nc_sa") -> :cc_by_nc_sa
+      String.contains?(normalized, "by_nc") -> :cc_by_nc
+      String.contains?(normalized, "by_nd") -> :cc_by_nd
+      String.contains?(normalized, "by_sa") -> :cc_by_sa
+      true -> :cc_by
+    end
+  end
+
+  defp normalized_license_type(_value), do: :cc_by
+
+  defp license_label(:cc_by_nc_nd), do: "CC BY-NC-ND 4.0"
+  defp license_label(:cc_by_nc_sa), do: "CC BY-NC-SA 4.0"
+  defp license_label(:cc_by_nc), do: "CC BY-NC 4.0"
+  defp license_label(:cc_by_nd), do: "CC BY-ND 4.0"
+  defp license_label(:cc_by_sa), do: "CC BY-SA 4.0"
+  defp license_label(:cc_by), do: "CC BY 4.0"
 
   defp mark_applied!(run_id) do
     Repo.update_all(

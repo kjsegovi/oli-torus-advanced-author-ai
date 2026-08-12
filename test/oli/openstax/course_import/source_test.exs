@@ -129,6 +129,15 @@ defmodule Oli.OpenStax.CourseImport.SourceTest do
                http_client: HTTPClient
              )
 
+    assert snapshot["license"] == %{
+             "book_slug" => "sample-book",
+             "license" => "CC BY 4.0",
+             "license_type" => "cc_by",
+             "license_url" => "https://creativecommons.org/licenses/by/4.0/",
+             "provider" => "OpenStax",
+             "source_url" => "https://openstax.org/details/books/sample-book"
+           }
+
     assert snapshot["title"] == "Sample Book"
     assert [%{"id" => "chapter-1"} = chapter] = snapshot["chapters"]
     assert length(chapter["sections"]) == 3
@@ -424,6 +433,122 @@ defmodule Oli.OpenStax.CourseImport.SourceTest do
     assert section["excerpt"] =~ "Table:"
   end
 
+  test "extracts a Torus-safe AST for formatting, links, lists, tables, equations, footnotes, callouts, and figures" do
+    body = """
+    <html><main><article data-book-content="true">
+      <h2 id="nature">The Nature of Science</h2>
+      <p id="formatted">
+        Scientific knowledge uses <strong>evidence</strong>, <em>reasoning</em>, and
+        <a href="/books/sample-book/pages/1-1-evidence">shared review</a>.
+        Water is H<sub>2</sub>O and a result can be revised<sup>1</sup>.
+      </p>
+      <ol id="process"><li>Observe carefully<ul><li>Record uncertainty</li></ul></li></ol>
+      <table id="evidence-table">
+        <tr><th>Evidence</th><th>Interpretation</th></tr>
+        <tr><td>Observation</td><td>Model</td></tr>
+      </table>
+      <div data-type="equation" data-latex="E = mc^2"></div>
+      <div data-type="note" id="science-note"><p>Explanations are tested against evidence.</p></div>
+      <figure id="scientific-model">
+        <img src="/apps/image-cdn/model.png" alt="A scientific model changing with evidence." />
+        <figcaption>Figure 1 A model is revised.</figcaption>
+      </figure>
+      <div data-type="footnote-refs" id="notes"><ol><li>Supporting source.</li></ol></div>
+    </article></main></html>
+    """
+
+    assert {:ok, section} =
+             Source.parse_section_page(
+               body,
+               "https://openstax.org/books/sample-book/pages/1-2-nature-of-science",
+               strict_book_content: true
+             )
+
+    blocks = section["content_blocks"]
+
+    paragraph = Enum.find(blocks, &(&1["source_locator"]["dom_id"] == "formatted"))
+    encoded_paragraph = Jason.encode!(paragraph["ast"])
+    assert encoded_paragraph =~ ~s("bold":true)
+    assert encoded_paragraph =~ ~s("italic":true)
+    assert encoded_paragraph =~ ~s("subscript":true)
+    assert encoded_paragraph =~ ~s("superscript":true)
+    assert encoded_paragraph =~ "https://openstax.org/books/sample-book/pages/1-1-evidence"
+
+    assert [%{"type" => "ol", "children" => list_children}] =
+             Enum.find(blocks, &(&1["kind"] == "list"))["ast"]
+
+    assert Enum.any?(list_children, &(&1["type"] == "ul"))
+
+    assert [%{"type" => "table", "children" => [%{"type" => "tr"} | _]}] =
+             Enum.find(blocks, &(&1["kind"] == "table"))["ast"]
+
+    assert %{"kind" => "equation", "latex" => "E = mc^2", "ast" => [equation]} =
+             Enum.find(blocks, &(&1["kind"] == "equation"))
+
+    assert equation["type"] == "formula"
+    assert Enum.any?(blocks, &(&1["kind"] == "callout" and &1["ast"] != []))
+    assert Enum.any?(blocks, &(&1["kind"] == "figure" and &1["ast"] != []))
+    assert Enum.any?(blocks, &(&1["kind"] == "footnotes" and &1["ast"] != []))
+  end
+
+  test "preserves MathML without duplicate semantic text and keeps worked examples intact" do
+    body = """
+    <html><main><article data-book-content="true">
+      <h2>Numbers in Astronomy</h2>
+      <p id="notation">Write the value as
+        <math display="inline"><semantics>
+          <mrow><mn>5</mn><mo>×</mo><msup><mn>10</mn><mn>8</mn></msup></mrow>
+          <annotation-xml encoding="MathML-Content">
+            <mrow><mn>5</mn><mo>×</mo><msup><mn>10</mn><mn>8</mn></msup></mrow>
+          </annotation-xml>
+        </semantics></math>.
+      </p>
+      <div data-type="example" id="example-1">
+        <header><h3>Example 1.1</h3></header>
+        <section><div class="body">
+          <h4 data-type="title">Scientific Notation</h4>
+          Express 79.2 billion in scientific notation.
+          <h4 data-type="title">Solution</h4>
+          The value is
+          <math display="inline"><semantics>
+            <mrow><mn>7.92</mn><mo>×</mo><msup><mn>10</mn><mn>10</mn></msup></mrow>
+            <annotation-xml encoding="MathML-Content">
+              <mrow><mn>7.92</mn><mo>×</mo><msup><mn>10</mn><mn>10</mn></msup></mrow>
+            </annotation-xml>
+          </semantics></math>.
+        </div></section>
+      </div>
+    </article></main></html>
+    """
+
+    assert {:ok, section} =
+             Source.parse_section_page(
+               body,
+               "https://openstax.org/books/astronomy-2e/pages/1-4-numbers-in-astronomy",
+               strict_book_content: true
+             )
+
+    paragraph = Enum.find(section["content_blocks"], &(&1["kind"] == "paragraph"))
+
+    assert [%{"type" => "p", "children" => children}] = paragraph["ast"]
+
+    assert %{"type" => "formula_inline", "subtype" => "mathml", "src" => mathml} =
+             Enum.find(children, &(&1["type"] == "formula_inline"))
+
+    assert mathml =~ "<msup>"
+    refute mathml == "5×1085×108"
+
+    assert [example] = Enum.filter(section["content_blocks"], &(&1["kind"] == "exercise"))
+    assert example["exercise_type"] == "example"
+    assert example["text"] =~ "Express 79.2 billion"
+    assert example["text"] =~ "Solution"
+    assert Jason.encode!(example["ast"]) =~ ~s("subtype":"mathml")
+
+    refute Enum.any?(section["content_blocks"], fn block ->
+             block["kind"] == "heading" and block["text"] == "Solution"
+           end)
+  end
+
   test "extracts canonical semantic blocks with stable ids and media metadata" do
     body = """
     <html><main>
@@ -713,7 +838,7 @@ defmodule Oli.OpenStax.CourseImport.SourceTest do
     assert Agent.get(tracker, &length/1) == 4
   end
 
-  test "rejects an oversized merged canonical discovery scope without truncation" do
+  test "discovers a merged canonical source with more than 120 sections without truncation" do
     source_url = "https://openstax.org/details/books/sample-book"
 
     client = fn
@@ -759,11 +884,66 @@ defmodule Oli.OpenStax.CourseImport.SourceTest do
          }}
     end
 
-    assert {:error, {:source_scope_too_large, 240, 120}} =
+    assert {:ok, snapshot} =
              Source.discover(source_url,
                http_client: client,
                discovery_candidate_limit: 1
              )
+
+    assert snapshot["title"] == "Large Sample Book"
+    assert length(snapshot["chapters"]) == 240
+    assert snapshot["chapters"] |> List.last() |> Map.fetch!("id") == "chapter-240"
+  end
+
+  test "ingests more than 120 selected sections without truncation" do
+    client = fn url, _headers, _opts ->
+      section_number = url |> String.split("/") |> List.last() |> String.split("-") |> hd()
+
+      {:ok,
+       %{
+         status_code: 200,
+         body: """
+         <html><main>
+           <h1>Section #{section_number}</h1>
+           <p>This source paragraph is long enough to be retained for lesson planning.</p>
+         </main></html>
+         """
+       }}
+    end
+
+    sections =
+      Enum.map(1..121, fn section_number ->
+        %{
+          "title" => "Section #{section_number}",
+          "url" => "https://openstax.org/books/sample-book/pages/#{section_number}-section",
+          "order" => section_number
+        }
+      end)
+
+    snapshot = %{
+      "book_slug" => "sample-book",
+      "source_url" => "https://openstax.org/details/books/sample-book",
+      "chapters" => [
+        %{
+          "id" => "chapter-1",
+          "title" => "Large chapter",
+          "order" => 1,
+          "selected" => true,
+          "sections" => sections
+        }
+      ]
+    }
+
+    assert {:ok, ingested} =
+             Source.ingest(snapshot, ["chapter-1"],
+               http_client: client,
+               fetch_concurrency: 12,
+               fetch_task_timeout: 1_000
+             )
+
+    assert [%{"sections" => ingested_sections}] = ingested["chapters"]
+    assert length(ingested_sections) == 121
+    assert List.last(ingested_sections)["order"] == 121
   end
 
   test "returns a controlled error when the initial discovery page times out" do

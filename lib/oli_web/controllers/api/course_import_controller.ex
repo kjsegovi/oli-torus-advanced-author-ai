@@ -296,11 +296,6 @@ defmodule OliWeb.Api.CourseImportController do
       {:conflict, "project_publication_changed",
        "The project changed while the import was starting. Refresh the curriculum and try again."}
 
-  defp error_details({:source_scope_too_large, count, limit}),
-    do:
-      {:unprocessable_entity, "source_scope_too_large",
-       "The selected scope has #{count} sections; imports are limited to #{limit}. Select fewer chapters."}
-
   defp error_details({:invalid_status, current, expected}),
     do: {:conflict, "invalid_status", "Expected #{expected}, but the run is #{current}."}
 

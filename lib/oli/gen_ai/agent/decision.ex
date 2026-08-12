@@ -12,6 +12,8 @@ defmodule Oli.GenAI.Agent.Decision do
           next_action: kind,
           tool_name: String.t() | nil,
           arguments: map | nil,
+          tool_call_id: String.t() | nil,
+          provider_output: [map()] | nil,
           assistant_message: String.t() | nil,
           updated_plan: [String.t()] | nil,
           rationale_summary: String.t() | nil
@@ -21,6 +23,8 @@ defmodule Oli.GenAI.Agent.Decision do
     :next_action,
     :tool_name,
     :arguments,
+    :tool_call_id,
+    :provider_output,
     :assistant_message,
     :updated_plan,
     :rationale_summary
@@ -78,7 +82,20 @@ defmodule Oli.GenAI.Agent.Decision do
     end
   end
 
-  @spec from_completion(map) :: {:ok, t} | {:error, term}
+  @spec from_completion(map | String.t()) :: {:ok, t} | {:error, term}
+  def from_completion(content) when is_binary(content) do
+    from_completion(%{
+      "choices" => [
+        %{
+          "message" => %{
+            "role" => "assistant",
+            "content" => content
+          }
+        }
+      ]
+    })
+  end
+
   def from_completion(normalized_payload) do
     try do
       decision = parse_normalized_response(normalized_payload)
@@ -109,7 +126,9 @@ defmodule Oli.GenAI.Agent.Decision do
         %__MODULE__{
           next_action: "tool",
           tool_name: Map.get(function, "name"),
-          arguments: parse_arguments(Map.get(function, "arguments"))
+          arguments: parse_arguments(Map.get(function, "arguments")),
+          tool_call_id: Map.get(tool_call, "id"),
+          provider_output: Map.get(payload, "responses_output")
         }
 
       # Structured JSON in content

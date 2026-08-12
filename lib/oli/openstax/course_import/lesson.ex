@@ -72,6 +72,7 @@ defmodule Oli.OpenStax.CourseImport.Lesson do
     field :planning_last_progress_at, :utc_datetime_usec
     field :planning_finished_at, :utc_datetime_usec
     field :planning_error, :map
+    field :generation_checkpoint, :map, default: %{}
 
     timestamps(type: :utc_datetime_usec)
   end
@@ -114,7 +115,8 @@ defmodule Oli.OpenStax.CourseImport.Lesson do
       :planning_started_at,
       :planning_last_progress_at,
       :planning_finished_at,
-      :planning_error
+      :planning_error,
+      :generation_checkpoint
     ])
     |> validate_required([:run_id, :unit_id, :order, :title])
     |> validate_number(:order, greater_than: 0)

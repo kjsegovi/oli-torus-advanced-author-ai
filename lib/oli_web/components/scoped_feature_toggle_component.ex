@@ -18,6 +18,9 @@ defmodule OliWeb.Components.ScopedFeatureToggleComponent do
       |> assign(assigns)
       |> assign_new(:edits_enabled, fn -> Map.get(assigns, :edits_enabled, false) end)
       |> assign_new(:title, fn -> Map.get(assigns, :title, "Feature Flags") end)
+      |> assign_new(:forced_enabled_features, fn ->
+        Map.get(assigns, :forced_enabled_features, [])
+      end)
       |> load_features()
 
     {:ok, socket}
@@ -87,28 +90,38 @@ defmodule OliWeb.Components.ScopedFeatureToggleComponent do
               ]}>
                 {if feature.enabled?, do: "Enabled", else: "Disabled"}
               </span>
+              <span
+                :if={feature.forced_enabled?}
+                class="ml-2 inline-flex items-center rounded-full bg-blue-100 px-2.5 py-1 text-xs font-semibold text-blue-800"
+              >
+                Enabled for local testing
+              </span>
             </div>
 
             <div class="md:col-span-2 text-right">
-              <%= if @edits_enabled do %>
-                <button
-                  type="button"
-                  class={[
-                    "rounded border px-3 py-1 text-xs font-medium transition",
-                    if(feature.enabled?,
-                      do: "border-red-300 text-red-700 hover:bg-red-50",
-                      else: "border-green-300 text-green-700 hover:bg-green-50"
-                    )
-                  ]}
-                  phx-click="toggle_feature"
-                  phx-target={@myself}
-                  phx-value-feature={Atom.to_string(feature.name)}
-                  phx-value-enabled={to_string(!feature.enabled?)}
-                >
-                  {if feature.enabled?, do: "Disable", else: "Enable"}
-                </button>
+              <%= if feature.forced_enabled? do %>
+                <span class="text-xs text-gray-500">Local development default</span>
               <% else %>
-                <span class="text-xs text-gray-500">Enable edits to modify</span>
+                <%= if @edits_enabled do %>
+                  <button
+                    type="button"
+                    class={[
+                      "rounded border px-3 py-1 text-xs font-medium transition",
+                      if(feature.enabled?,
+                        do: "border-red-300 text-red-700 hover:bg-red-50",
+                        else: "border-green-300 text-green-700 hover:bg-green-50"
+                      )
+                    ]}
+                    phx-click="toggle_feature"
+                    phx-target={@myself}
+                    phx-value-feature={Atom.to_string(feature.name)}
+                    phx-value-enabled={to_string(!feature.enabled?)}
+                  >
+                    {if feature.enabled?, do: "Disable", else: "Enable"}
+                  </button>
+                <% else %>
+                  <span class="text-xs text-gray-500">Enable edits to modify</span>
+                <% end %>
               <% end %>
             </div>
           </div>
@@ -128,74 +141,96 @@ defmodule OliWeb.Components.ScopedFeatureToggleComponent do
         %{"feature" => feature_name, "enabled" => enabled_str},
         socket
       ) do
-    if not socket.assigns.edits_enabled do
-      {:noreply, socket}
-    else
-      feature_atom = safe_to_existing_atom(feature_name)
+    feature_atom = safe_to_existing_atom(feature_name)
 
-      if is_nil(feature_atom) do
+    cond do
+      not socket.assigns.edits_enabled ->
+        {:noreply, socket}
+
+      is_nil(feature_atom) ->
         send(self(), {:scoped_feature_error, feature_name, "Unknown feature"})
         {:noreply, socket}
-      else
-        resource = socket.assigns.source
-        actor = Map.get(socket.assigns, :current_author)
-        enable? = enabled_str == "true"
-        feature_allowed? = scoped_feature_allowed?(feature_atom, socket.assigns.source_type)
 
-        if feature_allowed? do
-          result =
-            if enable? do
-              ScopedFeatureFlags.enable_feature(feature_atom, resource, actor)
-            else
-              ScopedFeatureFlags.disable_feature(feature_atom, resource, actor)
-            end
+      forced_enabled?(socket, feature_atom) ->
+        {:noreply, socket}
 
-          case result do
-            {:ok, _} ->
-              socket =
-                socket
-                |> load_features()
+      true ->
+        toggle_feature(socket, feature_atom, feature_name, enabled_str == "true")
+    end
+  end
 
-              send(
-                self(),
-                {:scoped_feature_updated, Atom.to_string(feature_atom), enable?, resource}
-              )
+  defp toggle_feature(socket, feature_atom, feature_name, enable?) do
+    resource = socket.assigns.source
+    actor = Map.get(socket.assigns, :current_author)
 
-              {:noreply, socket}
-
-            {:error, reason} ->
-              send(self(), {:scoped_feature_error, feature_name, error_message(reason)})
-              {:noreply, socket}
-          end
+    if scoped_feature_allowed?(feature_atom, socket.assigns.source_type) do
+      result =
+        if enable? do
+          ScopedFeatureFlags.enable_feature(feature_atom, resource, actor)
         else
+          ScopedFeatureFlags.disable_feature(feature_atom, resource, actor)
+        end
+
+      case result do
+        {:ok, _} ->
+          socket = load_features(socket)
+
           send(
             self(),
-            {:scoped_feature_error, feature_name, "ClickHouse analytics is not enabled"}
+            {:scoped_feature_updated, Atom.to_string(feature_atom), enable?, resource}
           )
 
           {:noreply, socket}
-        end
+
+        {:error, reason} ->
+          send(self(), {:scoped_feature_error, feature_name, error_message(reason)})
+          {:noreply, socket}
       end
+    else
+      send(
+        self(),
+        {:scoped_feature_error, feature_name, "ClickHouse analytics is not enabled"}
+      )
+
+      {:noreply, socket}
     end
+  end
+
+  defp forced_enabled?(socket, feature_atom) do
+    socket.assigns.forced_enabled_features
+    |> List.wrap()
+    |> Enum.any?(&(to_string(&1) == Atom.to_string(feature_atom)))
   end
 
   defp load_features(
          %{assigns: %{source: source, source_type: source_type, scopes: scopes}} = socket
        ) do
-    enabled_names = enabled_feature_names(source_type, source)
+    forced_names =
+      socket.assigns.forced_enabled_features
+      |> List.wrap()
+      |> Enum.map(&to_string/1)
+      |> MapSet.new()
+
+    enabled_names =
+      source_type
+      |> enabled_feature_names(source)
+      |> MapSet.union(forced_names)
 
     features =
       ScopedFeatureFlags.all_defined_features()
       |> filter_features_by_scopes(scopes, socket.assigns.source_type)
       |> filter_olap_features(socket.assigns.source_type)
-      |> Enum.map(&decorate_feature(&1, enabled_names))
+      |> Enum.map(&decorate_feature(&1, enabled_names, forced_names))
 
     assign(socket, :features, features)
   end
 
-  defp decorate_feature(feature, enabled_names) do
+  defp decorate_feature(feature, enabled_names, forced_names) do
     feature_string = Atom.to_string(feature.name)
-    Map.put(feature, :enabled?, MapSet.member?(enabled_names, feature_string))
+
+    feature
+    |> Map.put(:enabled?, MapSet.member?(enabled_names, feature_string))
+    |> Map.put(:forced_enabled?, MapSet.member?(forced_names, feature_string))
   end
 
   defp enabled_feature_names(:project, %Project{} = project) do

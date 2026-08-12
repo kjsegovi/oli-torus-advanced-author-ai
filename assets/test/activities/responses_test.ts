@@ -9,7 +9,11 @@ import {
   makeFeedback,
   makeResponse,
 } from 'components/activities/types';
-import { getResponses, normalizeCustomScoringForPart } from 'data/activities/model/responses';
+import {
+  getIncorrectResponse,
+  getResponses,
+  normalizeCustomScoringForPart,
+} from 'data/activities/model/responses';
 import { matchRule } from 'data/activities/model/rules';
 import { dispatch } from 'utils/test_utils';
 
@@ -58,6 +62,22 @@ describe('responses', () => {
     const newModel = dispatch(model, ResponseActions.removeTargetedFeedback(response.id));
     expect(newModel.authoring.parts[0].responses).toHaveLength(1);
     expect(newModel.authoring.targeted).toHaveLength(0);
+  });
+
+  it('accepts the legacy raw catch-all rule used by generated activities', () => {
+    const legacyModel = {
+      authoring: {
+        parts: [
+          {
+            id: DEFAULT_PART_ID,
+            incorrectScore: 0,
+            responses: [makeResponse(matchRule(choice.id), 1, '', true), makeResponse('.*', 0, '')],
+          },
+        ],
+      },
+    } as HasParts;
+
+    expect(getIncorrectResponse(legacyModel, DEFAULT_PART_ID).rule).toBe('.*');
   });
 
   describe('custom scoring normalization', () => {

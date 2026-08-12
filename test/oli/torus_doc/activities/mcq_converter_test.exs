@@ -134,7 +134,7 @@ defmodule Oli.TorusDoc.Activities.MCQConverterTest do
       # Should still have catch-all response
       responses = part["responses"]
       catch_all = List.last(responses)
-      assert catch_all["rule"] == ".*"
+      assert catch_all["rule"] == "input like {.*}"
       assert catch_all["score"] == 0
     end
 

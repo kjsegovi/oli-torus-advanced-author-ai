@@ -953,7 +953,9 @@ defmodule Oli.OpenStax.CourseImport.RichSource do
     |> Map.put_new("source_title", run.book_slug)
     |> Map.put_new("book_title", run.book_slug)
     |> Map.put_new("source_url", run.source_url)
-    |> Map.put_new("license", "CC BY-NC-SA 4.0")
+    |> Map.put_new("license", "CC BY 4.0")
+    |> Map.put_new("license_type", "cc_by")
+    |> Map.put_new("license_url", "https://creativecommons.org/licenses/by/4.0/")
   end
 
   defp put_value(map, key, value) when is_map(map), do: Map.put(map, key, value)

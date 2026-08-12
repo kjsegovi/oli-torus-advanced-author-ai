@@ -21,6 +21,7 @@ defmodule Oli.OpenStax.CourseImport.LessonPlan do
     field :version, :integer
     field :content_payload, :map, default: %{}
     field :questions_payload, :map, default: %{}
+    field :generation_metadata, :map, default: %{}
     field :checks_snapshot, :map, default: %{}
     field :created_by, :string, default: "ai"
     field :approved_by_user, :boolean, default: false
@@ -40,6 +41,7 @@ defmodule Oli.OpenStax.CourseImport.LessonPlan do
       :version,
       :content_payload,
       :questions_payload,
+      :generation_metadata,
       :checks_snapshot,
       :created_by,
       :approved_by_user,

@@ -1,6 +1,6 @@
 defmodule Oli.OpenStax.CourseImport.Worker.PreflightWorker do
   @moduledoc """
-  Discovers the bounded OpenStax table of contents and pauses for scope review.
+  Discovers the OpenStax table of contents and pauses for scope review.
   """
 
   use Oban.Worker,

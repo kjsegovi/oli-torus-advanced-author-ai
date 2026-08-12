@@ -1,6 +1,8 @@
 defmodule Oli.GenAI.ExecutionTest do
   use ExUnit.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Oli.GenAI.{AdmissionControl, BreakerSupervisor, Execution, HackneyPool}
   alias Oli.GenAI.Completions.{RegisteredModel, ServiceConfig}
 
@@ -172,6 +174,45 @@ defmodule Oli.GenAI.ExecutionTest do
                service_config,
                completions_mod: __MODULE__.AlwaysOkCompletions
              )
+  end
+
+  test "does not release a model counter when routing admitted only the pool" do
+    ensure_hackney_started()
+    previous_pool_size = HackneyPool.max_connections(:slow)
+    on_exit(fn -> HackneyPool.set_max_connections(:slow, previous_pool_size) end)
+
+    model = %RegisteredModel{
+      id: -1,
+      name: "Environment-backed model",
+      provider: :null,
+      routing_breaker_error_rate_threshold: 0.0,
+      routing_breaker_429_threshold: 0.0,
+      routing_breaker_latency_p95_ms: 0
+    }
+
+    service_config = %ServiceConfig{
+      id: -1,
+      name: "Environment-backed service",
+      primary_model: model
+    }
+
+    Process.put(:execution_test_pid, self())
+
+    log =
+      capture_log(fn ->
+        assert {:ok, _} =
+                 Execution.generate(
+                   %{request_type: :generate},
+                   [],
+                   [],
+                   service_config,
+                   completions_mod: __MODULE__.AlwaysOkCompletions
+                 )
+      end)
+
+    refute log =~ "counter below zero"
+    assert AdmissionControl.model_count(model.id) == 0
+    assert AdmissionControl.pool_count(:genai_slow_pool) == 0
   end
 
   test "opens breaker on OpenAI 429 status_code errors" do

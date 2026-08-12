@@ -28,7 +28,47 @@ defmodule Oli.GenAI.Agent.DecisionTest do
       assert {:ok, decision} = Decision.from_completion(openai_payload)
       assert decision.next_action == "tool"
       assert decision.tool_name == "search_codebase"
+      assert decision.tool_call_id == "call_123"
       assert decision.arguments == %{"query" => "find main function", "path" => "src/"}
+    end
+
+    test "retains Responses output in memory for a reasoning tool continuation" do
+      provider_output = [
+        %{"id" => "rs_1", "type" => "reasoning", "summary" => []},
+        %{
+          "id" => "fc_1",
+          "type" => "function_call",
+          "call_id" => "call_1",
+          "name" => "review_openstax_questions",
+          "arguments" => ~s({"candidate":[]})
+        }
+      ]
+
+      payload = %{
+        "responses_output" => provider_output,
+        "choices" => [
+          %{
+            "message" => %{
+              "role" => "assistant",
+              "content" => nil,
+              "tool_calls" => [
+                %{
+                  "id" => "call_1",
+                  "type" => "function",
+                  "function" => %{
+                    "name" => "review_openstax_questions",
+                    "arguments" => ~s({"candidate":[]})
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+
+      assert {:ok, decision} = Decision.from_completion(payload)
+      assert decision.tool_call_id == "call_1"
+      assert decision.provider_output == provider_output
     end
 
     test "parses normalized function call (formerly Anthropic-style)" do

@@ -95,6 +95,58 @@ defmodule OliWeb.Components.ScopedFeatureToggleComponentTest do
       assert ScopedFeatureFlags.enabled?(:mcp_authoring, project)
     end
 
+    test "renders a forced local feature as enabled without a persisted flag or toggle", %{
+      conn: conn,
+      author: author,
+      project: project
+    } do
+      attrs = %{
+        id: "toggle_component",
+        scopes: [:authoring, :both],
+        source_id: project.id,
+        source_type: :project,
+        source: project,
+        current_author: author,
+        edits_enabled: true,
+        forced_enabled_features: [:openstax_course_import]
+      }
+
+      {:ok, lcd, _html} = live_component_isolated(conn, ScopedFeatureToggleComponent, attrs)
+
+      assert has_element?(lcd, "h4", "Openstax course import")
+      assert has_element?(lcd, "span", "Enabled for local testing")
+      assert has_element?(lcd, "span", "Local development default")
+
+      refute has_element?(
+               lcd,
+               "button[phx-value-feature='openstax_course_import']"
+             )
+
+      refute ScopedFeatureFlags.enabled?(:openstax_course_import, project)
+      assert ScopedFeatureFlags.list_project_features(project) == []
+
+      socket = %Phoenix.LiveView.Socket{
+        assigns: %{
+          __changed__: %{},
+          edits_enabled: true,
+          forced_enabled_features: [:openstax_course_import],
+          source: project,
+          source_type: :project,
+          current_author: author
+        }
+      }
+
+      assert {:noreply, ^socket} =
+               ScopedFeatureToggleComponent.handle_event(
+                 "toggle_feature",
+                 %{"feature" => "openstax_course_import", "enabled" => "false"},
+                 socket
+               )
+
+      refute ScopedFeatureFlags.enabled?(:openstax_course_import, project)
+      assert ScopedFeatureFlags.list_project_features(project) == []
+    end
+
     test "renders delivery features for a section", %{
       conn: conn,
       author: author,

@@ -5,7 +5,7 @@ defmodule Oli.GenAI.Agent.LLMBridge do
   """
 
   require Logger
-  alias Oli.GenAI.Agent.{ToolBroker, Decision}
+  alias Oli.GenAI.Agent.{Decision, ToolBroker}
   alias Oli.GenAI.Completions
   alias Oli.GenAI.Completions.{ServiceConfig, RegisteredModel, Message, Function}
   alias Oli.GenAI.Execution
@@ -23,11 +23,23 @@ defmodule Oli.GenAI.Agent.LLMBridge do
   """
   @spec next_decision([message], opts) :: {:ok, Decision.t()} | {:error, term}
   def next_decision(messages, opts) do
+    case next_decision_with_metadata(messages, opts) do
+      {:ok, decision, _metadata} -> {:ok, decision}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  @doc "Calls the configured model and includes provider usage metadata."
+  @spec next_decision_with_metadata([message], opts) ::
+          {:ok, Decision.t(), map()} | {:error, term}
+  def next_decision_with_metadata(messages, opts) do
     config = Map.fetch!(opts, :service_config)
 
     with {:ok, _primary, _fallbacks} <- select_models(config),
-         {:ok, response} <- call_with_routing(config, messages, opts) do
-      Decision.from_completion(response)
+         {:ok, %{content: response, metadata: execution_metadata}} <-
+           call_with_routing(config, messages, opts),
+         {:ok, decision} <- Decision.from_completion(response) do
+      {:ok, decision, usage_metadata(response, execution_metadata)}
     else
       {:error, reason} ->
         Logger.error("LLM Bridge error: #{inspect(reason)}")
@@ -63,7 +75,7 @@ defmodule Oli.GenAI.Agent.LLMBridge do
       completion_messages = convert_messages_to_completion_format(messages)
 
       # Convert tools to Completions.Function format
-      tools = ToolBroker.tools_for_completion()
+      tools = Map.get(opts, :tools, ToolBroker.tools_for_completion())
       completion_functions = convert_tools_to_completion_functions(tools)
 
       # Use the Completions module for the actual call
@@ -83,7 +95,7 @@ defmodule Oli.GenAI.Agent.LLMBridge do
 
   defp call_with_routing(%ServiceConfig{} = config, messages, opts) do
     completion_messages = convert_messages_to_completion_format(messages)
-    tools = ToolBroker.tools_for_completion()
+    tools = Map.get(opts, :tools, ToolBroker.tools_for_completion())
     completion_functions = convert_tools_to_completion_functions(tools)
 
     request_ctx = %{
@@ -94,10 +106,39 @@ defmodule Oli.GenAI.Agent.LLMBridge do
       service_config_id: config.id
     }
 
-    Execution.generate(request_ctx, completion_messages, completion_functions, config)
+    Execution.generate_with_metadata(
+      request_ctx,
+      completion_messages,
+      completion_functions,
+      config
+    )
   end
 
-  defp convert_messages_to_completion_format(messages) do
+  @doc false
+  def usage_metadata(response, execution_metadata) do
+    usage =
+      case response do
+        response when is_map(response) ->
+          Map.get(response, "usage", Map.get(response, :usage, %{})) || %{}
+
+        _plain_content ->
+          %{}
+      end
+
+    %{
+      input_tokens:
+        usage["prompt_tokens"] || usage[:prompt_tokens] || usage["input_tokens"] ||
+          usage[:input_tokens] || 0,
+      output_tokens:
+        usage["completion_tokens"] || usage[:completion_tokens] || usage["output_tokens"] ||
+          usage[:output_tokens] || 0,
+      provider: execution_metadata[:provider] || execution_metadata["provider"],
+      model: execution_metadata[:model] || execution_metadata["model"]
+    }
+  end
+
+  @doc false
+  def convert_messages_to_completion_format(messages) do
     Enum.map(messages, fn msg ->
       role = Map.get(msg, :role, :user)
       content = Map.get(msg, :content, "")
@@ -114,11 +155,13 @@ defmodule Oli.GenAI.Agent.LLMBridge do
           Message.new("assistant", to_string(content))
 
         :tool ->
-          if name do
-            Message.new("tool", to_string(content), name)
-          else
-            Message.new("tool", to_string(content))
-          end
+          Message.function_result(
+            name || "tool",
+            Map.get(msg, :tool_call_id),
+            Map.get(msg, :tool_arguments, %{}),
+            to_string(content),
+            Map.get(msg, :provider_output)
+          )
 
         _ ->
           Message.new("user", to_string(content))

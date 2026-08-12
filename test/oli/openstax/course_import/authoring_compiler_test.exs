@@ -60,6 +60,209 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerTest do
              |> ExJsonSchema.Validator.validate(realized)
   end
 
+  test "golden compiles v5 source AST in order without dropping blocks or requiring a checkpoint" do
+    content = %{
+      "schema_version" => 5,
+      "authoring_mode" => "basic",
+      "title" => "The Nature of Science",
+      "orientation" => %{
+        "overview" => "Scientific explanations connect observations with testable models."
+      },
+      "learning_objectives" => [
+        "Explain how evidence can change a scientific explanation."
+      ],
+      "content_groups" => [
+        %{
+          "id" => "evidence",
+          "title" => "From observations to explanations",
+          "instructional_purpose" => "evidence",
+          "transition" => "Start with the evidence scientists can observe.",
+          "source_blocks" => [
+            %{
+              "id" => "lesson-title",
+              "kind" => "heading",
+              "rendering" => "lesson_title",
+              "ast" => [
+                %{
+                  "type" => "h2",
+                  "children" => [%{"text" => "The Nature of Science"}]
+                }
+              ]
+            },
+            %{
+              "id" => "heading-1",
+              "kind" => "heading",
+              "ast" => [
+                %{
+                  "type" => "h3",
+                  "children" => [%{"text" => "Evidence and scientific models"}]
+                }
+              ]
+            },
+            %{
+              "id" => "paragraph-1",
+              "kind" => "paragraph",
+              "ast" => [
+                %{
+                  "type" => "p",
+                  "children" => [
+                    %{"text" => "Measurements provide evidence."},
+                    %{"text" => " Models explain that evidence.", "italic" => true}
+                  ]
+                }
+              ]
+            },
+            %{
+              "id" => "list-1",
+              "kind" => "list",
+              "ast" => [
+                %{
+                  "type" => "ul",
+                  "children" => [
+                    %{"type" => "li", "children" => [%{"text" => "Observe a pattern"}]},
+                    %{"type" => "li", "children" => [%{"text" => "Test an explanation"}]}
+                  ]
+                }
+              ]
+            },
+            %{
+              "id" => "equation-1",
+              "kind" => "equation",
+              "ast" => [
+                %{
+                  "type" => "formula",
+                  "subtype" => "latex",
+                  "src" => "E = mc^2",
+                  "children" => [%{"text" => ""}]
+                }
+              ]
+            },
+            %{
+              "id" => "table-1",
+              "kind" => "table",
+              "ast" => [
+                %{
+                  "type" => "table",
+                  "children" => [
+                    %{
+                      "type" => "tr",
+                      "children" => [
+                        %{
+                          "type" => "th",
+                          "children" => [
+                            %{"type" => "p", "children" => [%{"text" => "Evidence"}]}
+                          ]
+                        },
+                        %{
+                          "type" => "th",
+                          "children" => [
+                            %{"type" => "p", "children" => [%{"text" => "Interpretation"}]}
+                          ]
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            },
+            %{
+              "id" => "callout-1",
+              "kind" => "callout",
+              "callout_type" => "note",
+              "ast" => [
+                %{
+                  "type" => "p",
+                  "children" => [
+                    %{"text" => "A model is useful only while evidence supports it."}
+                  ]
+                }
+              ]
+            },
+            %{
+              "id" => "footnotes-1",
+              "kind" => "footnotes",
+              "ast" => [
+                %{
+                  "type" => "ol",
+                  "children" => [
+                    %{"type" => "li", "children" => [%{"text" => "Supporting source note."}]}
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "instructional_sections" => [
+        %{"id" => "evidence", "title" => "From observations to explanations"}
+      ],
+      "media" => [],
+      "question_slots" => [],
+      "synthesis" => %{
+        "heading" => "Bring the evidence together",
+        "summary" => "Scientific explanations remain open to revision.",
+        "takeaways" => ["New evidence can change a scientific model."]
+      },
+      "attribution" => %{
+        "provider" => "OpenStax",
+        "license" => "CC BY 4.0",
+        "source_url" => "https://openstax.org/books/chemistry-2e/pages/1-2"
+      }
+    }
+
+    assert {:ok, compiled} =
+             AuthoringCompiler.compile(
+               "basic",
+               "The Nature of Science",
+               content,
+               %{"items" => []},
+               "nature-of-science-v5"
+             )
+
+    assert compiled["activities"] == []
+
+    assert {:ok, realized} =
+             AuthoringCompiler.realize_page(compiled["page_content_template"], %{})
+
+    rendered_text = collect_text(realized["model"])
+    assert rendered_text =~ "Scientific explanations connect observations"
+    assert length(Regex.scan(~r/The Nature of Science/, rendered_text)) == 1
+    assert rendered_text =~ "Evidence and scientific models"
+    assert rendered_text =~ "Measurements provide evidence"
+    assert rendered_text =~ "Observe a pattern"
+    assert rendered_text =~ "A model is useful only while evidence supports it"
+    assert rendered_text =~ "Supporting source note"
+    assert rendered_text =~ "Scientific explanations remain open to revision"
+
+    assert Enum.find_index(
+             realized["model"],
+             &(collect_text(&1) =~ "Measurements provide evidence")
+           ) <
+             Enum.find_index(
+               realized["model"],
+               &(collect_text(&1) =~ "Bring the evidence together")
+             )
+
+    assert length(collect_elements(realized["model"], "formula")) == 1
+    assert length(collect_elements(realized["model"], "table")) == 1
+
+    assert Enum.count(collect_elements(realized["model"], "group"), fn group ->
+             group["purpose"] == "learnmore"
+           end) == 2
+
+    assert Enum.any?(collect_elements(realized["model"], "h4"), fn heading ->
+             collect_text(heading) =~ "Evidence and scientific models"
+           end)
+
+    assert rendered_text =~ "Attribution"
+    refute rendered_text =~ "Sources"
+
+    assert :ok =
+             "page-content-basic.schema.json"
+             |> SchemaResolver.resolve()
+             |> ExJsonSchema.Validator.validate(realized)
+  end
+
   test "places structured instructional material and source links before Basic formative questions" do
     content =
       advanced_content()
@@ -351,7 +554,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerTest do
     model = realized["model"]
     text = collect_text(model)
 
-    assert text =~ "Why does a faster algorithm matter"
+    refute text =~ "Why does a faster algorithm matter"
     assert text =~ "Why this matters"
     assert text =~ "Computing and public decisions"
     assert text =~ "Trace binary search"
@@ -362,7 +565,23 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerTest do
     assert image["alt"] =~ "linear and logarithmic"
     assert image["caption"] =~ "Growth comparison"
 
-    assert Enum.any?(model, &(&1["type"] == "group" and &1["purpose"] == "manystudentswonder"))
+    refute Enum.any?(model, &(&1["type"] == "group" and &1["purpose"] == "manystudentswonder"))
+
+    Enum.each(compiled["activities"], fn activity ->
+      [part] = activity["model"]["authoring"]["parts"]
+      assert length(part["hints"]) == 3
+    end)
+
+    [multiple_choice, short_answer] = compiled["activities"]
+
+    [_, cognitive_hint, _] =
+      get_in(multiple_choice, ["model", "authoring", "parts", Access.at(0), "hints"])
+
+    assert collect_text(cognitive_hint["content"]) =~ "halves the remaining candidates"
+
+    assert short_answer
+           |> get_in(["model", "authoring", "parts", Access.at(0), "hints"])
+           |> Enum.all?(&(collect_text(&1["content"]) == ""))
 
     practice_groups =
       Enum.filter(model, &(&1["type"] == "group" and &1["purpose"] == "learnbydoing"))
@@ -374,6 +593,72 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerTest do
            |> Enum.map(& &1["activity_id"]) == [802, 801]
 
     refute Enum.any?(model, &(&1["type"] == "activity-reference"))
+  end
+
+  test "accepts one through ten Basic questions while retaining Advanced limits" do
+    content = v3_content() |> Map.put("media", []) |> Map.put("curiosity_prompts", [])
+
+    questions = fn count ->
+      %{
+        "items" =>
+          Enum.map(1..count, fn index ->
+            %{
+              "type" => "short_answer",
+              "prompt" =>
+                "Apply the lesson evidence to explain comparison case #{index} in your own words.",
+              "placement_after_section_id" => "models",
+              "objective_ids" => ["compare-models"],
+              "evidence_block_ids" => ["models-explanation"]
+            }
+          end)
+      }
+    end
+
+    assert {:ok, one} =
+             AuthoringCompiler.compile(
+               "basic",
+               "One question",
+               content,
+               questions.(1),
+               "one",
+               media_urls: %{
+                 "search-growth" => %{
+                   "url" => "staged://search-growth",
+                   "alt" => "A graph comparing search growth"
+                 }
+               }
+             )
+
+    assert length(one["activities"]) == 1
+
+    assert {:ok, ten} =
+             AuthoringCompiler.compile(
+               "basic",
+               "Ten questions",
+               content,
+               questions.(10),
+               "ten",
+               media_urls: %{
+                 "search-growth" => %{
+                   "url" => "staged://search-growth",
+                   "alt" => "A graph comparing search growth"
+                 }
+               }
+             )
+
+    assert length(ten["activities"]) == 10
+
+    assert {:error, :invalid_question_count} =
+             AuthoringCompiler.compile("basic", "No questions", content, %{"items" => []}, "none")
+
+    assert {:error, :invalid_question_count} =
+             AuthoringCompiler.compile(
+               "advanced",
+               "One Advanced question",
+               meaningful_v3_advanced_content(content),
+               questions.(1),
+               "advanced-one"
+             )
   end
 
   test "compiles V3 Advanced material into media and adaptive MCQ screens" do
@@ -602,7 +887,9 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerTest do
         %{
           "type" => "short_answer",
           "prompt" => "Explain the pattern.",
-          "hint" => "Describe both motion and spacing."
+          "hint" => "Describe both motion and spacing.",
+          "correct_feedback" => "You connected the motion and spacing.",
+          "incorrect_feedback" => "Explain how both the motion and spacing change."
         }
       ]
     }
@@ -631,6 +918,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerTest do
     assert encoded_mcq =~ "Compare the particle spacing near each wall."
     assert encoded_mcq =~ "Not sure"
     assert encoded_short_answer =~ "Describe both motion and spacing."
+    assert encoded_short_answer =~ "You connected the motion and spacing."
+    assert encoded_short_answer =~ "Explain how both the motion and spacing change."
   end
 
   test "rejects question media ids that were not staged with the lesson" do
@@ -1358,6 +1647,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerTest do
           "correct_choice_id" => "binary",
           "correct_feedback" => "Correct. Binary search halves the remaining candidates.",
           "incorrect_feedback" => "Review the growth and feasibility explanation.",
+          "hint" => "Focus on the method that halves the remaining candidates.",
           "placement_after_section_id" => "growth",
           "objective_ids" => ["compare-growth"],
           "evidence_block_ids" => ["growth-explanation"]

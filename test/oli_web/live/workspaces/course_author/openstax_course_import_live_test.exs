@@ -19,6 +19,22 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
   alias Oli.Resources.ResourceType
   alias Oli.ScopedFeatureFlags
 
+  defmodule DeterministicLessonPlanner do
+    def plan(lesson, index, opts) do
+      {plan_mode, payload} =
+        Oli.OpenStax.CourseImport.Planner.build_lesson_plan(lesson, index, opts)
+
+      {:ok,
+       %{
+         plan_mode: plan_mode,
+         payload: payload,
+         enrichment_proposals: [],
+         created_by: "system",
+         metadata: %{strategy: :deterministic_test}
+       }}
+    end
+  end
+
   defmodule HTTPClient do
     def get("https://openstax.org/details/books/sample-book", _headers, _opts) do
       {:ok,
@@ -114,10 +130,24 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
 
     previous_options = Application.get_env(:oli, :openstax_course_import_source_options)
 
+    previous_lesson_planner =
+      Application.get_env(:oli, :openstax_course_import_lesson_planner)
+
+    previous_test_conveniences =
+      Application.get_env(:oli, :openstax_course_import_test_conveniences_enabled)
+
+    Application.put_env(:oli, :openstax_course_import_test_conveniences_enabled, false)
+
     Application.put_env(
       :oli,
       :openstax_course_import_source_options,
       http_client: HTTPClient
+    )
+
+    Application.put_env(
+      :oli,
+      :openstax_course_import_lesson_planner,
+      DeterministicLessonPlanner
     )
 
     on_exit(fn ->
@@ -125,6 +155,26 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
         Application.delete_env(:oli, :openstax_course_import_source_options)
       else
         Application.put_env(:oli, :openstax_course_import_source_options, previous_options)
+      end
+
+      if is_nil(previous_lesson_planner) do
+        Application.delete_env(:oli, :openstax_course_import_lesson_planner)
+      else
+        Application.put_env(
+          :oli,
+          :openstax_course_import_lesson_planner,
+          previous_lesson_planner
+        )
+      end
+
+      if is_nil(previous_test_conveniences) do
+        Application.delete_env(:oli, :openstax_course_import_test_conveniences_enabled)
+      else
+        Application.put_env(
+          :oli,
+          :openstax_course_import_test_conveniences_enabled,
+          previous_test_conveniences
+        )
       end
     end)
 
@@ -393,15 +443,61 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
 
     assert has_element?(
              view,
-             "#openstax-course-scope input[name='chapters[]'][value='chapter-1']"
+             "#openstax-course-scope input[name='chapters[]'][value='chapter-1'][checked]"
            )
 
     assert has_element?(
              view,
-             "#openstax-course-scope input[name='chapters[]'][value='chapter-2']"
+             "#openstax-course-scope input[name='chapters[]'][value='chapter-2'][checked]"
            )
 
+    assert render(view) =~ "All discovered chapters are selected"
+    refute has_element?(view, "#openstax-course-scope button[disabled]")
+
     refute has_element?(view, "#openstax-course-import-processing")
+  end
+
+  test "local chapter scope starts empty, tracks changes, and rejects an empty submission", %{
+    conn: conn,
+    project: project,
+    author: author,
+    root: root
+  } do
+    Application.put_env(:oli, :openstax_course_import_test_conveniences_enabled, true)
+
+    assert {:ok, run} =
+             CourseImport.start_import(
+               project,
+               root,
+               author,
+               "https://openstax.org/details/books/sample-book"
+             )
+
+    assert :ok = perform_job(PreflightWorker, %{"run_id" => run.id})
+
+    {:ok, view, _html} =
+      live(
+        conn,
+        ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax?run_id=#{run.id}"
+      )
+
+    assert render(view) =~ "No chapters are selected by default"
+    refute has_element?(view, "#openstax-course-scope input[checked]")
+    assert has_element?(view, "#openstax-course-scope button[disabled]")
+
+    empty_html = view |> form("#openstax-course-scope", %{}) |> render_submit()
+    assert empty_html =~ "Select at least one chapter before continuing"
+
+    view
+    |> form("#openstax-course-scope", %{"chapters" => ["chapter-1"]})
+    |> render_change()
+
+    assert has_element?(
+             view,
+             "#openstax-course-scope input[value='chapter-1'][checked]"
+           )
+
+    refute has_element?(view, "#openstax-course-scope button[disabled]")
   end
 
   test "shows lesson titles, objectives, and sources before outline approval", %{
@@ -778,6 +874,106 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     refute has_element?(view, "#edit-openstax-lesson-#{lesson.id}")
   end
 
+  test "summarizes actionable lesson failure categories", %{
+    conn: conn,
+    project: project,
+    author: author,
+    root: root
+  } do
+    review_run = lesson_review_run(project, root, author)
+    [content_lesson | _] = review_run.units |> Enum.flat_map(& &1.lessons)
+
+    content_lesson
+    |> Ecto.Changeset.change(
+      planning_state: "failed",
+      planning_error: %{
+        "category" => "content_validation_exhausted",
+        "retryable" => false,
+        "message" => "Generated Basic content did not satisfy the lesson contract."
+      }
+    )
+    |> Oli.Repo.update!()
+
+    review_run
+    |> Run.update_changeset(%{
+      status: :failed,
+      error: %{
+        "phase" => "lesson_planning",
+        "recoverable" => true,
+        "message" => "One lesson plan could not be generated."
+      }
+    })
+    |> Oli.Repo.update!()
+
+    {:ok, view, _html} =
+      live(
+        conn,
+        ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax?run_id=#{review_run.id}"
+      )
+
+    assert render(view) =~ "Basic content validation exhausted: 1"
+    assert has_element?(view, "button[phx-click='retry_run']", "Retry import")
+  end
+
+  test "shows unresolved v5 repairs and blocks approval without failing the import", %{
+    conn: conn,
+    project: project,
+    author: author,
+    root: root
+  } do
+    review_run = lesson_review_run(project, root, author)
+    [lesson | _] = review_run.units |> Enum.flat_map(& &1.lessons)
+    plan = Enum.max_by(lesson.plans, & &1.version)
+
+    repair = %{
+      "severity" => "repair",
+      "code" => "feedback_consistency",
+      "path" => "$.questions_payload.items[0]",
+      "message" => "Align the answer guidance and feedback before approval."
+    }
+
+    plan
+    |> Ecto.Changeset.change(
+      content_payload:
+        plan.content_payload
+        |> Map.put("schema_version", 5)
+        |> Map.put("authoring_mode", "basic"),
+      generation_metadata: %{
+        "pipeline" => "openstax_basic_v5",
+        "quality_gate" => %{
+          "approved" => false,
+          "confidence" => 0.96,
+          "hard_blockers" => [],
+          "repairs" => [repair],
+          "advisories" => [],
+          "outcome" => "needs_attention"
+        }
+      },
+      checks_snapshot: %{"status" => "passed", "results" => []}
+    )
+    |> Oli.Repo.update!()
+
+    lesson
+    |> Ecto.Changeset.change(status: "needs_attention", planning_state: "completed")
+    |> Oli.Repo.update!()
+
+    {:ok, view, html} =
+      live(
+        conn,
+        ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax?run_id=#{review_run.id}"
+      )
+
+    assert html =~ "Repairs still required"
+    assert html =~ repair["message"]
+
+    assert has_element?(
+             view,
+             "button[phx-click='approve_lesson'][phx-value-lesson_id='#{lesson.id}'][disabled]"
+           )
+
+    refute has_element?(view, "button[phx-click='retry_run']", "Retry import")
+  end
+
   test "shows compiling as an instructor gate instead of active background work", %{
     conn: conn,
     project: project,
@@ -816,6 +1012,51 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     refute has_element?(view, "#openstax-course-import-processing")
   end
 
+  test "shows the development approve-all shortcut with explicit confirmation", %{
+    conn: conn,
+    project: project,
+    author: author,
+    root: root
+  } do
+    review_run = lesson_review_run(project, root, author)
+
+    {:ok, view, _html} =
+      live(
+        conn,
+        ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax?run_id=#{review_run.id}"
+      )
+
+    assert has_element?(
+             view,
+             "button[phx-click='approve_all'][data-confirm]",
+             "Approve all lessons"
+           )
+  end
+
+  test "hides the approve-all shortcut when the environment gate is disabled", %{
+    conn: conn,
+    project: project,
+    author: author,
+    root: root
+  } do
+    previous = Application.get_env(:oli, :openstax_course_import_approve_all_enabled)
+    Application.put_env(:oli, :openstax_course_import_approve_all_enabled, false)
+
+    on_exit(fn ->
+      Application.put_env(:oli, :openstax_course_import_approve_all_enabled, previous)
+    end)
+
+    review_run = lesson_review_run(project, root, author)
+
+    {:ok, view, _html} =
+      live(
+        conn,
+        ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax?run_id=#{review_run.id}"
+      )
+
+    refute has_element?(view, "button[phx-click='approve_all']")
+  end
+
   test "lesson edits preserve structured content and question metadata", %{
     conn: conn,
     project: project,
@@ -825,6 +1066,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     review_run = lesson_review_run(project, root, author)
 
     {:ok, review_run} = CourseImport.get_run(project, author, review_run.id)
+
     [lesson | _] = review_run.units |> Enum.flat_map(& &1.lessons)
     original_plan = List.first(lesson.plans)
     original_content = original_plan.content_payload
@@ -944,7 +1186,12 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     review_run = lesson_review_run(project, root, author)
 
     {:ok, review_run} = CourseImport.get_run(project, author, review_run.id)
-    [lesson | _] = review_run.units |> Enum.flat_map(& &1.lessons)
+
+    lesson =
+      review_run.units
+      |> Enum.flat_map(& &1.lessons)
+      |> Enum.max_by(& &1.source_word_count)
+
     original_plan = List.first(lesson.plans)
     [first_section | remaining_sections] = original_plan.content_payload["instructional_sections"]
 
@@ -1083,7 +1330,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     assert :ok = perform_job(PreflightWorker, %{"run_id" => run.id})
     assert {:ok, _run} = CourseImport.update_scope(run.id, author, ["chapter-1"])
     assert :ok = perform_job(OutlineWorker, %{"run_id" => run.id})
-    use_serial_lesson_planner(run.id)
+    use_legacy_serial_lesson_planner(run.id)
     assert {:ok, _run} = CourseImport.approve_outline(run.id, author)
     assert :ok = perform_job(LessonPlannerWorker, %{"run_id" => run.id})
 
@@ -1131,17 +1378,23 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     :ok = perform_job(PreflightWorker, %{"run_id" => run.id})
     {:ok, _run} = CourseImport.update_scope(run.id, author, ["chapter-1"])
     :ok = perform_job(OutlineWorker, %{"run_id" => run.id})
-    use_serial_lesson_planner(run.id)
+    use_legacy_serial_lesson_planner(run.id)
     {:ok, _run} = CourseImport.approve_outline(run.id, author)
     :ok = perform_job(LessonPlannerWorker, %{"run_id" => run.id})
     {:ok, review_run} = CourseImport.get_run(project, author, run.id)
     review_run
   end
 
-  defp use_serial_lesson_planner(run_id) do
+  # These LiveView examples intentionally exercise the persisted legacy-plan reader
+  # with the deterministic test planner. New production runs remain schema v5.
+  defp use_legacy_serial_lesson_planner(run_id) do
     Run
     |> Oli.Repo.get!(run_id)
-    |> Run.update_changeset(%{lesson_planning_strategy: :serial_v1})
+    |> Run.update_changeset(%{
+      source_schema_version: 3,
+      plan_schema_version: 4,
+      lesson_planning_strategy: :serial_v1
+    })
     |> Oli.Repo.update!()
   end
 

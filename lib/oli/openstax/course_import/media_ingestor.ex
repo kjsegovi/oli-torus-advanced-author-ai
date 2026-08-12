@@ -528,11 +528,9 @@ defmodule Oli.OpenStax.CourseImport.MediaIngestor do
        do: {:ok, media, :skipped, 0}
 
   defp stage_asset(asset, run, total_bytes, opts) do
-    with true <- trusted_source_url?(asset.source_url, opts),
+    with true <- Enum.any?(source_url_candidates(asset), &trusted_source_url?(&1, opts)),
          {:ok, staging} <- mark_staging(asset, run),
-         {:ok, bytes, mime_type, final_url} <- fetch_remote(asset.source_url, opts),
-         :ok <- validate_declared_mime(asset.declared_mime_type, mime_type),
-         :ok <- validate_total_bytes(total_bytes, byte_size(bytes), opts),
+         {:ok, bytes, mime_type, final_url} <- fetch_asset(asset, total_bytes, opts),
          {:ok, upload_status, media_item} <-
            upload(asset, run.project.slug, bytes, mime_type, opts),
          {:ok, media} <-
@@ -558,6 +556,55 @@ defmodule Oli.OpenStax.CourseImport.MediaIngestor do
         end
     end
   end
+
+  defp fetch_asset(asset, total_bytes, opts) do
+    asset
+    |> source_url_candidates()
+    |> Enum.filter(&trusted_source_url?(&1, opts))
+    |> Enum.reduce_while({:error, :media_source_unavailable}, fn url, _last_error ->
+      result =
+        with {:ok, bytes, mime_type, final_url} <- fetch_remote(url, opts),
+             :ok <- validate_declared_mime(asset.declared_mime_type, mime_type),
+             :ok <- validate_total_bytes(total_bytes, byte_size(bytes), opts) do
+          {:ok, bytes, mime_type, final_url}
+        end
+
+      case result do
+        {:ok, _bytes, _mime_type, _final_url} = success -> {:halt, success}
+        {:error, _reason} = error -> {:cont, error}
+      end
+    end)
+  end
+
+  defp source_url_candidates(asset) do
+    metadata = asset.metadata || %{}
+    semantic_payload = metadata["semantic_payload"] || metadata[:semantic_payload] || %{}
+
+    alternates =
+      semantic_payload["alternate_source_urls"] ||
+        semantic_payload[:alternate_source_urls] || metadata["alternate_source_urls"] ||
+        metadata[:alternate_source_urls] || []
+
+    srcset = semantic_payload["srcset"] || semantic_payload[:srcset]
+
+    ([asset.source_url] ++ List.wrap(alternates) ++ srcset_candidates(srcset))
+    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+    |> Enum.map(&String.trim/1)
+    |> Enum.uniq()
+  end
+
+  defp srcset_candidates(srcset) when is_binary(srcset) do
+    srcset
+    |> String.split(",", trim: true)
+    |> Enum.map(fn candidate ->
+      candidate
+      |> String.trim()
+      |> String.split(~r/\s+/, parts: 2)
+      |> List.first()
+    end)
+  end
+
+  defp srcset_candidates(_srcset), do: []
 
   defp mark_staging(asset, run) do
     media = asset.media || %Media{}

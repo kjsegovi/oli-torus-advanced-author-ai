@@ -2,7 +2,10 @@ defmodule Oli.TorusDoc.Activities.ShortAnswerConverter do
   @moduledoc """
   Converts parsed Short Answer activities to Torus JSON format.
 
-  This is a placeholder implementation - full support coming soon.
+  Text responses use a low-stakes reflection contract: any submitted response can
+  continue, while a separate zero-score catch-all remains available to authoring
+  and feedback UI. Generated correct and incorrect feedback is preserved on those
+  responses.
   """
 
   alias Oli.TorusDoc.ActivityConverter
@@ -95,19 +98,35 @@ defmodule Oli.TorusDoc.Activities.ShortAnswerConverter do
         {:ok, subtype, math_config, responses}
       end
     else
-      {:ok, nil, nil,
-       [
-         %{
-           "id" => ActivityConverter.generate_id(),
-           "rule" => ".*",
-           "score" => 1,
-           "feedback" => %{
+      with {:ok, correct_feedback} <-
+             ActivityConverter.convert_feedback(activity.explanation_md),
+           {:ok, incorrect_feedback} <-
+             ActivityConverter.convert_feedback(activity.incorrect_feedback_md) do
+        {:ok, nil, nil,
+         [
+           %{
              "id" => ActivityConverter.generate_id(),
-             "content" => []
+             "rule" => ".*",
+             "score" => 1,
+             "correct" => true,
+             "feedback" => correct_feedback || empty_feedback()
+           },
+           %{
+             "id" => ActivityConverter.generate_id(),
+             "rule" => "input like {.*}",
+             "score" => 0,
+             "feedback" => incorrect_feedback || empty_feedback()
            }
-         }
-       ]}
+         ]}
+      end
     end
+  end
+
+  defp empty_feedback do
+    %{
+      "id" => ActivityConverter.generate_id(),
+      "content" => []
+    }
   end
 
   defp maybe_put_item_config(json, nil, _config), do: json

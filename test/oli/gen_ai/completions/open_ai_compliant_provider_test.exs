@@ -1,7 +1,7 @@
 defmodule Oli.GenAI.Completions.OpenAICompliantProviderTest do
   use ExUnit.Case, async: true
 
-  alias Oli.GenAI.Completions.Function
+  alias Oli.GenAI.Completions.{Function, Message}
   alias Oli.GenAI.Completions.OpenAICompliantProvider
   alias HTTPoison.{AsyncEnd, Error}
 
@@ -235,6 +235,135 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProviderTest do
 
       refute Keyword.has_key?(params, :tools)
       refute Keyword.has_key?(params, :functions)
+    end
+  end
+
+  describe "Responses API tool requests" do
+    test "uses the flattened tool schema and medium reasoning" do
+      functions = [
+        %Function{
+          name: "review_openstax_questions",
+          description: "Review a complete question set",
+          parameters: %{"type" => "object"}
+        }
+      ]
+
+      params =
+        OpenAICompliantProvider.responses_params(
+          "gpt-5.6-luna",
+          [Message.new("user", "Review this set")],
+          functions
+        )
+
+      assert Keyword.get(params, :reasoning) == %{effort: "medium"}
+      assert Keyword.get(params, :parallel_tool_calls) == false
+
+      assert Keyword.get(params, :tools) == [
+               %{
+                 type: "function",
+                 name: "review_openstax_questions",
+                 description: "Review a complete question set",
+                 parameters: %{"type" => "object"}
+               }
+             ]
+
+      assert Keyword.get(params, :input) == [
+               %{role: "user", content: "Review this set"}
+             ]
+    end
+
+    test "replays provider output before the matching function result" do
+      provider_output = [
+        %{"id" => "rs_1", "type" => "reasoning", "summary" => []},
+        %{
+          "id" => "fc_1",
+          "type" => "function_call",
+          "call_id" => "call_1",
+          "name" => "review_openstax_questions",
+          "arguments" => ~s({"candidate":[]})
+        }
+      ]
+
+      messages = [
+        Message.new("user", "Review this set"),
+        Message.function_result(
+          "review_openstax_questions",
+          "call_1",
+          %{"candidate" => []},
+          ~s({"valid":true}),
+          provider_output
+        )
+      ]
+
+      assert OpenAICompliantProvider.encode_responses_input(messages) ==
+               [
+                 %{role: "user", content: "Review this set"}
+               ] ++
+                 provider_output ++
+                 [
+                   %{
+                     type: "function_call_output",
+                     call_id: "call_1",
+                     output: ~s({"valid":true})
+                   }
+                 ]
+    end
+
+    test "normalizes response function calls for the existing agent decision parser" do
+      provider_output = [
+        %{"id" => "rs_1", "type" => "reasoning", "summary" => []},
+        %{
+          "id" => "fc_1",
+          "type" => "function_call",
+          "call_id" => "call_1",
+          "name" => "review_openstax_questions",
+          "arguments" => ~s({"candidate":[]})
+        }
+      ]
+
+      normalized =
+        OpenAICompliantProvider.normalize_responses_response(%{
+          "id" => "resp_1",
+          "output" => provider_output,
+          "usage" => %{"input_tokens" => 20, "output_tokens" => 10}
+        })
+
+      assert normalized["responses_output"] == provider_output
+      assert normalized["usage"] == %{"input_tokens" => 20, "output_tokens" => 10}
+
+      assert get_in(normalized, [
+               "choices",
+               Access.at(0),
+               "message",
+               "tool_calls",
+               Access.at(0)
+             ]) == %{
+               "id" => "call_1",
+               "type" => "function",
+               "function" => %{
+                 "name" => "review_openstax_questions",
+                 "arguments" => ~s({"candidate":[]})
+               }
+             }
+    end
+
+    test "normalizes response text output" do
+      normalized =
+        OpenAICompliantProvider.normalize_responses_response(%{
+          "id" => "resp_2",
+          "output" => [
+            %{
+              "type" => "message",
+              "role" => "assistant",
+              "content" => [
+                %{"type" => "output_text", "text" => ~s({"action":"done"})}
+              ]
+            }
+          ]
+        })
+
+      assert get_in(normalized, ["choices", Access.at(0), "message", "content"]) ==
+               ~s({"action":"done"})
     end
   end
 

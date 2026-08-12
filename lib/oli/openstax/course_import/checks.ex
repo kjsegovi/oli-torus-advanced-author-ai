@@ -7,7 +7,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
   validation remain hard requirements during apply.
   """
 
-  alias Oli.OpenStax.CourseImport.FullSource
+  alias Oli.OpenStax.CourseImport.{BasicPlanV5, FullSource}
 
   @check_types [:source_fidelity, :pedagogy_assessment, :torus_accessibility]
   @v4_advanced_roles ~w(orientation prediction decision evidence exploration interpretation transfer remediation)
@@ -48,6 +48,212 @@ defmodule Oli.OpenStax.CourseImport.Checks do
   @spec passed?([result()]) :: boolean()
   def passed?(results) when is_list(results),
     do: results != [] and Enum.all?(results, &(&1.status == "passed"))
+
+  defp run_check(
+         :source_fidelity,
+         lesson,
+         %{"content_payload" => %{"schema_version" => 5} = content}
+       ) do
+    available_ids =
+      lesson
+      |> BasicPlanV5.source_blocks()
+      |> Enum.map(& &1["id"])
+      |> MapSet.new()
+
+    groups = List.wrap(content["content_groups"])
+    grouped_ids = groups |> Enum.flat_map(&List.wrap(&1["source_block_ids"]))
+    grouped_set = MapSet.new(grouped_ids)
+    coverage = content["coverage_manifest"] || %{}
+    declared_available = MapSet.new(List.wrap(coverage["available_source_block_ids"]))
+    declared_included = MapSet.new(List.wrap(coverage["included_source_block_ids"]))
+
+    missing_ast =
+      groups
+      |> Enum.flat_map(&List.wrap(&1["source_blocks"]))
+      |> Enum.filter(&(not is_list(&1["ast"]) or &1["ast"] == []))
+      |> Enum.map(& &1["id"])
+
+    duplicate_ids = (grouped_ids -- Enum.uniq(grouped_ids)) |> Enum.uniq()
+
+    failures =
+      []
+      |> maybe_add(available_ids == MapSet.new(), "The v5 lesson has no extracted source AST")
+      |> maybe_add(
+        grouped_set != available_ids,
+        "Every extracted source block must appear in exactly one v5 content group"
+      )
+      |> maybe_add(
+        duplicate_ids != [],
+        "A v5 source block appears in more than one content group"
+      )
+      |> maybe_add(
+        missing_ast != [],
+        "Every v5 content block must retain its deterministic Torus-safe AST"
+      )
+      |> maybe_add(
+        coverage["strategy"] != "exact_ast_coverage",
+        "Schema v5 requires exact AST coverage"
+      )
+      |> maybe_add(coverage["complete"] != true, "Schema v5 coverage must be explicitly complete")
+      |> maybe_add(
+        declared_available != available_ids or declared_included != available_ids,
+        "The v5 coverage manifest must match the exact extracted source block set"
+      )
+      |> maybe_add(
+        List.wrap(coverage["missing_source_block_ids"]) != [],
+        "The v5 coverage manifest reports missing source blocks"
+      )
+      |> maybe_add(
+        List.wrap(coverage["duplicate_source_block_ids"]) != [],
+        "The v5 coverage manifest reports duplicate source blocks"
+      )
+
+    evaluation = %{
+      "strategy" => "exact_ast_coverage",
+      "available_block_count" => MapSet.size(available_ids),
+      "covered_block_count" => MapSet.size(grouped_set),
+      "uncovered_major_block_ids" =>
+        MapSet.difference(available_ids, grouped_set) |> MapSet.to_list(),
+      "uncovered_substantive_block_ids" =>
+        MapSet.difference(available_ids, grouped_set) |> MapSet.to_list(),
+      "missing_full_text_block_ids" => missing_ast,
+      "unknown_block_ids" => MapSet.difference(grouped_set, available_ids) |> MapSet.to_list(),
+      "duplicate_block_ids" => duplicate_ids
+    }
+
+    case failures do
+      [] ->
+        %{
+          check_type: "source_fidelity",
+          status: "passed",
+          findings: %{"issues" => [], "evaluation" => %{"coverage" => evaluation}},
+          repair_plan: nil
+        }
+
+      failures ->
+        %{
+          check_type: "source_fidelity",
+          status: "failed",
+          findings: %{
+            "issues" => Enum.reverse(failures),
+            "evaluation" => %{"coverage" => evaluation}
+          },
+          repair_plan: %{"regenerate_v5_content_plan" => true}
+        }
+    end
+  end
+
+  defp run_check(
+         :pedagogy_assessment,
+         _lesson,
+         %{"content_payload" => %{"schema_version" => 5} = content} = plan
+       ) do
+    objectives = List.wrap(content["learning_objectives"])
+    groups = List.wrap(content["content_groups"])
+    slots = List.wrap(content["question_slots"])
+    questions = questions(plan)
+    slot_placements = slots |> Enum.map(& &1["placement_after_section_id"]) |> MapSet.new()
+    quality = quality_gate(plan)
+
+    failures =
+      []
+      |> maybe_add(
+        objectives == [] or Enum.any?(objectives, &(not present?(&1))),
+        "Preserve at least one source-faithful learning objective"
+      )
+      |> maybe_add(
+        groups == [] or
+          Enum.any?(
+            groups,
+            &(not present?(&1["title"]) or List.wrap(&1["source_block_ids"]) == [])
+          ),
+        "Every v5 content group needs a descriptive heading and source blocks"
+      )
+      |> maybe_add(length(questions) > 10, "Limit Basic formative questions to ten")
+      |> maybe_add(
+        slots == [] and questions != [],
+        "Do not insert checkpoints when the architect identified no genuine boundary"
+      )
+      |> maybe_add(
+        Enum.any?(
+          questions,
+          &(not MapSet.member?(slot_placements, &1["placement_after_section_id"]))
+        ),
+        "Place every v5 question in an architect-approved question slot"
+      )
+      |> maybe_add(
+        Enum.any?(questions, &invalid_question?/1),
+        "Every formative question must have a valid supported response contract"
+      )
+      |> maybe_add(
+        quality["approved"] != true,
+        "The independent v5 critics must explicitly approve the lesson"
+      )
+      |> maybe_add(
+        numeric_value(quality["confidence"]) < 0.9,
+        "The v5 critic confidence must be at least 0.90"
+      )
+      |> maybe_add(
+        List.wrap(quality["hard_blockers"]) != [],
+        "Resolve every v5 hard blocker before author approval"
+      )
+
+    result(:pedagogy_assessment, failures, %{
+      "organization" => "content_groups",
+      "fixed_section_quota" => false,
+      "fixed_word_quota" => false,
+      "fixed_question_quota" => false,
+      "question_range" => [0, 10],
+      "critic_confidence_threshold" => 0.9
+    })
+  end
+
+  defp run_check(
+         :torus_accessibility,
+         _lesson,
+         %{"content_payload" => %{"schema_version" => 5} = content} = plan
+       ) do
+    media = content_list(content, "media")
+    questions = questions(plan)
+
+    failures =
+      []
+      |> maybe_add(
+        content["authoring_mode"] != "basic",
+        "Schema v5 is available only for Basic pages"
+      )
+      |> maybe_add(not present?(content["title"]), "Add a descriptive lesson title")
+      |> maybe_add(
+        not present?(get_in(content, ["orientation", "overview"])),
+        "Add a compact source-faithful orientation"
+      )
+      |> maybe_add(
+        Enum.any?(questions, &(Map.get(&1, "type") not in ["short_answer", "multiple_choice"])),
+        "Use a supported accessible question type"
+      )
+      |> maybe_add(duplicate_ids?(questions), "Give each formative question a stable unique id")
+      |> maybe_add(
+        Enum.any?(
+          media,
+          &(not present?(&1["source_media_id"] || &1["id"]) or not present?(&1["alt"]))
+        ),
+        "Every retained v5 figure needs a server-issued id and useful source or critic-approved alt text"
+      )
+      |> maybe_add(
+        Enum.any?(
+          media,
+          &(&1["required"] == true and &1["rights_status"] in ["blocked", "conflicted"])
+        ),
+        "Required media cannot have blocked or conflicted rights"
+      )
+
+    result(:torus_accessibility, failures, %{
+      "supported_modes" => ["basic"],
+      "supported_question_types" => ["short_answer", "multiple_choice"],
+      "media_requires" => ["source_media_id", "alt"],
+      "generated_alt_requires_critic_approval" => true
+    })
+  end
 
   defp run_check(:source_fidelity, lesson, plan) do
     source_sections =
@@ -129,7 +335,8 @@ defmodule Oli.OpenStax.CourseImport.Checks do
     rich_source? = rich_source?(lesson)
     minimum_words = minimum_instructional_words(lesson, plan)
     minimum_sections = if rich_source?, do: 4, else: 2
-    minimum_questions = if rich_source?, do: 4, else: 2
+    minimum_questions = if mode == "basic", do: 1, else: if(rich_source?, do: 4, else: 2)
+    maximum_questions = if mode == "basic", do: 10, else: 6
     multiple_choice_count = Enum.count(questions, &(&1["type"] == "multiple_choice"))
 
     source_objectives_complete? =
@@ -157,7 +364,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
       )
       |> maybe_add(worked_examples == [], "Add at least one guided or worked example")
       |> maybe_add(
-        rich_source? and length(curiosity_prompts) < 2,
+        mode == "advanced" and rich_source? and length(curiosity_prompts) < 2,
         "Add at least two source-grounded curiosity or prediction prompts"
       )
       |> maybe_add(
@@ -169,13 +376,16 @@ defmodule Oli.OpenStax.CourseImport.Checks do
         length(questions) < minimum_questions,
         "Add at least #{minimum_questions} formative questions"
       )
-      |> maybe_add(length(questions) > 6, "Limit formative questions to six")
+      |> maybe_add(
+        length(questions) > maximum_questions,
+        "Limit formative questions to #{maximum_questions}"
+      )
       |> maybe_add(
         Enum.any?(questions, &(not present?(&1["prompt"]))),
         "Every question needs a learner-facing prompt"
       )
       |> maybe_add(
-        rich_source? and multiple_choice_count < 2,
+        mode == "advanced" and rich_source? and multiple_choice_count < 2,
         "Add at least two meaningful multiple-choice checks with misconception feedback"
       )
       |> maybe_add(
@@ -208,11 +418,12 @@ defmodule Oli.OpenStax.CourseImport.Checks do
         if(v4_plan?(plan), do: [minimum_sections, nil], else: [minimum_sections, 7]),
       "minimum_instructional_words" => minimum_words,
       "ensure_worked_example" => true,
-      "curiosity_prompt_range" => if(rich_source?, do: [2, 3], else: [0, 3]),
+      "curiosity_prompt_range" =>
+        if(mode == "advanced" and rich_source?, do: [2, 3], else: [0, 0]),
       "application_problem_range" => if(rich_source?, do: [3, 5], else: [0, 5]),
       "minimum_takeaways" => 3,
-      "question_range" => [minimum_questions, 6],
-      "minimum_multiple_choice" => if(rich_source?, do: 2, else: 0),
+      "question_range" => [minimum_questions, maximum_questions],
+      "minimum_multiple_choice" => if(mode == "advanced" and rich_source?, do: 2, else: 0),
       "objective_assessment_mapping" => true,
       "advanced_blueprint" => mode == "advanced"
     })
@@ -726,6 +937,11 @@ defmodule Oli.OpenStax.CourseImport.Checks do
 
   defp content(%{"content_payload" => content}) when is_map(content), do: content
   defp content(plan) when is_map(plan), do: plan
+
+  defp quality_gate(plan) when is_map(plan) do
+    metadata = plan["generation_metadata"] || plan[:generation_metadata] || %{}
+    metadata["quality_gate"] || metadata[:quality_gate] || %{}
+  end
 
   defp questions(%{"questions_payload" => %{"items" => items}}) when is_list(items), do: items
   defp questions(%{"questions" => items}) when is_list(items), do: items

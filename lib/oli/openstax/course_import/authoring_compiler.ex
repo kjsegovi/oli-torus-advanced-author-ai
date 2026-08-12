@@ -37,7 +37,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
              is_binary(stable_key) and is_list(opts) do
     questions = questions(questions_payload)
 
-    with {:ok, normalized_questions} <- validate_questions(questions),
+    with {:ok, normalized_questions} <- validate_questions(questions, mode, content_payload),
          {:ok, media_assets} <- resolve_media_assets(content_payload, opts),
          attribution <- normalize_attribution(content_payload, opts),
          {:ok, artifact} <-
@@ -206,6 +206,32 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
          attribution,
          references_by_section
        ) do
+    if content["schema_version"] == 5 do
+      basic_v5_instructional_blocks(
+        content,
+        stable_key,
+        media_assets,
+        attribution,
+        references_by_section
+      )
+    else
+      basic_legacy_instructional_blocks(
+        content,
+        stable_key,
+        media_assets,
+        attribution,
+        references_by_section
+      )
+    end
+  end
+
+  defp basic_legacy_instructional_blocks(
+         content,
+         stable_key,
+         media_assets,
+         attribution,
+         references_by_section
+       ) do
     objectives = learning_objectives(content)
     sections = instructional_sections(content)
     curated = normalize_curated_enrichments(content["curated_enrichments"])
@@ -220,11 +246,9 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     [
       lesson_overview_block(content, objectives, sections, stable_key)
     ] ++
-      opening_hook_blocks(content, stable_key) ++
       why_this_matters_blocks(content, stable_key) ++
       rich_callout_blocks(content["callouts"], "#{stable_key}:source-callouts") ++
       media_blocks(media_assets, nil, "#{stable_key}:opening-media") ++
-      curiosity_blocks(content["curiosity_prompts"], "#{stable_key}:curiosity") ++
       (sections
        |> Enum.with_index(1)
        |> Enum.flat_map(fn {section, index} ->
@@ -244,6 +268,278 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       source_evidence_block(content["source_evidence_links"], stable_key) ++
       attribution_blocks(attribution, stable_key)
   end
+
+  defp basic_v5_instructional_blocks(
+         content,
+         stable_key,
+         media_assets,
+         attribution,
+         references_by_group
+       ) do
+    media_lookup = v5_media_lookup(content, media_assets)
+
+    [v5_orientation_block(content, stable_key)] ++
+      (content
+       |> Map.get("content_groups", [])
+       |> List.wrap()
+       |> Enum.with_index(1)
+       |> Enum.flat_map(fn {group, index} ->
+         v5_content_group_blocks(
+           group,
+           index,
+           stable_key,
+           media_lookup,
+           Map.get(references_by_group, group["id"], [])
+         )
+       end)) ++
+      v5_synthesis_blocks(content["synthesis"], stable_key) ++
+      attribution_blocks(attribution, stable_key)
+  end
+
+  defp v5_orientation_block(content, stable_key) do
+    overview = get_in(content, ["orientation", "overview"]) || content["narrative"]
+
+    children =
+      [text_element("h2", content["title"] || "Lesson overview", "#{stable_key}:v5:title")] ++
+        paragraph_elements(overview, "#{stable_key}:v5:overview") ++
+        [
+          text_element("h3", "Learning Objectives", "#{stable_key}:v5:objectives-heading"),
+          string_list_element(
+            "ul",
+            learning_objectives(content),
+            "#{stable_key}:v5:objectives"
+          )
+        ]
+
+    content_block(children, "#{stable_key}:v5:orientation")
+  end
+
+  defp v5_content_group_blocks(group, index, stable_key, media_lookup, references) do
+    group_key = "#{stable_key}:v5:group:#{group["id"] || index}"
+
+    heading_content =
+      content_block(
+        [text_element("h2", group["title"], "#{group_key}:heading")] ++
+          paragraph_elements(group["transition"], "#{group_key}:transition"),
+        "#{group_key}:heading-content"
+      )
+
+    source_children =
+      group
+      |> Map.get("source_blocks", [])
+      |> List.wrap()
+      |> Enum.with_index(1)
+      |> Enum.flat_map(fn {source_block, block_index} ->
+        if source_block["rendering"] == "lesson_title" do
+          []
+        else
+          [
+            v5_source_block_child(
+              source_block,
+              block_index,
+              group_key,
+              media_lookup,
+              group["instructional_purpose"]
+            )
+          ]
+        end
+      end)
+
+    group_block = %{
+      "id" => stable_id("v5-group", group_key),
+      "type" => "group",
+      "layout" => "vertical",
+      "purpose" => v5_group_purpose(group["instructional_purpose"]),
+      "children" => [heading_content | source_children]
+    }
+
+    [group_block] ++ practice_group(references, "#{group_key}:checkpoint")
+  end
+
+  defp v5_source_block_child(
+         source_block,
+         block_index,
+         group_key,
+         media_lookup,
+         group_purpose
+       ) do
+    block_key = "#{group_key}:source:#{source_block["id"] || block_index}"
+
+    source_nodes =
+      source_block
+      |> Map.get("ast", [])
+      |> List.wrap()
+      |> Enum.with_index(1)
+      |> Enum.map(fn {node, node_index} ->
+        stabilize_v5_ast_node(node, "#{block_key}:#{node_index}", media_lookup)
+      end)
+      |> append_v5_figure_attribution(source_block, block_key)
+
+    content = content_block(source_nodes, "#{block_key}:content")
+
+    source_purpose =
+      if v5_group_purpose(group_purpose) == "none",
+        do: v5_source_block_purpose(source_block),
+        else: nil
+
+    case source_purpose do
+      nil ->
+        content
+
+      purpose ->
+        %{
+          "id" => stable_id("v5-source-group", block_key),
+          "type" => "group",
+          "layout" => "vertical",
+          "purpose" => purpose,
+          "children" => [content]
+        }
+    end
+  end
+
+  defp v5_source_block_purpose(%{"kind" => "exercise"}), do: "learnbydoing"
+
+  defp v5_source_block_purpose(%{"kind" => "callout", "callout_type" => type})
+       when type in ["concepts_in_practice", "example"],
+       do: "example"
+
+  defp v5_source_block_purpose(%{"kind" => kind}) when kind in ["callout", "footnotes"],
+    do: "learnmore"
+
+  defp v5_source_block_purpose(_source_block), do: nil
+
+  defp append_v5_figure_attribution(nodes, %{"kind" => "figure"} = source_block, key) do
+    existing_text = v5_ast_text(nodes)
+
+    [
+      {"Figure credit", source_block["credit"]},
+      {"Figure license", source_block["license"]}
+    ]
+    |> Enum.reduce(nodes, fn {label, value}, acc ->
+      if present_text?(value) and not String.contains?(existing_text, value) do
+        acc ++ paragraph_elements("#{label}: #{value}", "#{key}:#{String.downcase(label)}")
+      else
+        acc
+      end
+    end)
+  end
+
+  defp append_v5_figure_attribution(nodes, _source_block, _key), do: nodes
+
+  defp v5_ast_text(value) when is_map(value) do
+    [value["text"], v5_ast_text(value["children"])]
+    |> Enum.filter(&is_binary/1)
+    |> Enum.join(" ")
+  end
+
+  defp v5_ast_text(value) when is_list(value), do: Enum.map_join(value, " ", &v5_ast_text/1)
+  defp v5_ast_text(_value), do: ""
+
+  defp v5_group_purpose("example"), do: "example"
+  defp v5_group_purpose("application"), do: "learnbydoing"
+  defp v5_group_purpose("reference"), do: "learnmore"
+  defp v5_group_purpose(_purpose), do: "none"
+
+  defp v5_synthesis_blocks(synthesis, stable_key) when is_map(synthesis) do
+    takeaways = normalize_strings(synthesis["takeaways"])
+
+    children =
+      [
+        text_element(
+          "h2",
+          synthesis["heading"] || "Bring the ideas together",
+          "#{stable_key}:v5:synthesis-heading"
+        )
+      ] ++
+        paragraph_elements(synthesis["summary"], "#{stable_key}:v5:synthesis") ++
+        if(takeaways == [],
+          do: [],
+          else: [string_list_element("ul", takeaways, "#{stable_key}:v5:synthesis-takeaways")]
+        )
+
+    [content_block(children, "#{stable_key}:v5:synthesis")]
+  end
+
+  defp v5_synthesis_blocks(_synthesis, _stable_key), do: []
+
+  defp v5_media_lookup(content, media_assets) do
+    assets_by_id = Map.new(media_assets, &{&1.id, &1})
+
+    content
+    |> Map.get("media", [])
+    |> List.wrap()
+    |> Enum.reduce(%{}, fn descriptor, lookup ->
+      id = descriptor["source_media_id"] || descriptor["id"]
+
+      case assets_by_id[id] do
+        nil ->
+          lookup
+
+        asset ->
+          normalized = %{
+            "src" => asset.url,
+            "alt" => asset.alt,
+            "height" => asset.height,
+            "width" => "100%",
+            "display" => "block"
+          }
+
+          [descriptor["src"], descriptor["url"], descriptor["source_url"], asset.url]
+          |> Enum.filter(&present_text?/1)
+          |> Enum.reduce(lookup, &Map.put(&2, &1, normalized))
+      end
+    end)
+  end
+
+  defp stabilize_v5_ast_node(node, key, media_lookup) when is_map(node) do
+    type = v5_heading_type(node["type"])
+
+    node =
+      node
+      |> Map.new(fn {field, value} -> {to_string(field), value} end)
+      |> maybe_put_v5_ast_type(type)
+      |> maybe_put_v5_ast_id(type, key)
+      |> resolve_v5_ast_media(media_lookup)
+
+    case node["children"] do
+      children when is_list(children) ->
+        children =
+          children
+          |> Enum.with_index(1)
+          |> Enum.map(fn {child, index} ->
+            stabilize_v5_ast_node(child, "#{key}:#{index}", media_lookup)
+          end)
+
+        Map.put(node, "children", children)
+
+      _ ->
+        node
+    end
+  end
+
+  defp stabilize_v5_ast_node(node, _key, _media_lookup), do: node
+
+  defp v5_heading_type(type) when type in ["h1", "h2"], do: "h3"
+  defp v5_heading_type("h3"), do: "h4"
+  defp v5_heading_type("h4"), do: "h5"
+  defp v5_heading_type(type) when type in ["h5", "h6"], do: "h6"
+  defp v5_heading_type(type), do: type
+
+  defp maybe_put_v5_ast_type(node, nil), do: node
+  defp maybe_put_v5_ast_type(node, type), do: Map.put(node, "type", type)
+
+  defp maybe_put_v5_ast_id(node, nil, _key), do: node
+  defp maybe_put_v5_ast_id(%{"text" => _text} = node, _type, _key), do: node
+  defp maybe_put_v5_ast_id(node, type, key), do: Map.put_new(node, "id", stable_id(type, key))
+
+  defp resolve_v5_ast_media(%{"type" => "img", "src" => src} = node, media_lookup) do
+    case media_lookup[src] do
+      nil -> node
+      resolved -> Map.merge(node, resolved)
+    end
+  end
+
+  defp resolve_v5_ast_media(node, _media_lookup), do: node
 
   defp lesson_overview_block(content, objectives, sections, stable_key) do
     introduction =
@@ -274,15 +570,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end)
   end
 
-  defp opening_hook_blocks(content, stable_key) do
-    callout_blocks(
-      content["opening_hook"],
-      "manystudentswonder",
-      "Start here",
-      "#{stable_key}:opening-hook"
-    )
-  end
-
   defp why_this_matters_blocks(content, stable_key) do
     callout_blocks(
       content["why_this_matters"],
@@ -292,13 +579,10 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     )
   end
 
-  defp curiosity_blocks(prompts, stable_key) do
-    callout_blocks(prompts, "manystudentswonder", "Think about it", stable_key)
-  end
-
   defp rich_callout_blocks(callouts, stable_key) do
     callouts
     |> List.wrap()
+    |> Enum.reject(&curiosity_callout?/1)
     |> Enum.with_index(1)
     |> Enum.flat_map(fn {callout, index} ->
       callout_blocks(
@@ -314,8 +598,10 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
        when type in ["example", "concepts_in_practice"],
        do: "example"
 
-  defp callout_purpose(%{"type" => "curiosity"}), do: "manystudentswonder"
   defp callout_purpose(_), do: "learnmore"
+
+  defp curiosity_callout?(%{"type" => "curiosity"}), do: true
+  defp curiosity_callout?(_), do: false
 
   defp instructional_section_blocks(
          section,
@@ -334,9 +620,13 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
         source_evidence_elements(section["source_evidence_links"], section_key)
 
     [content_block(section_children, section_key)] ++
-      callout_blocks(section["callouts"], "learnmore", "Go deeper", "#{section_key}:callouts") ++
+      callout_blocks(
+        section["callouts"] |> List.wrap() |> Enum.reject(&curiosity_callout?/1),
+        "learnmore",
+        "Go deeper",
+        "#{section_key}:callouts"
+      ) ++
       media_blocks(media_assets, section["id"], "#{section_key}:media") ++
-      curiosity_blocks(section["curiosity_prompts"], "#{section_key}:curiosity") ++
       worked_example_blocks(section["examples"], "#{section_key}:examples") ++
       curated_enrichment_blocks(curated, "#{section_key}:curated") ++
       practice_group(references, "#{section_key}:practice")
@@ -483,7 +773,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   end
 
   defp callout_blocks(value, purpose, default_title, stable_key)
-       when purpose in ["manystudentswonder", "learnmore", "learnbydoing", "example"] do
+       when purpose in ["learnmore", "learnbydoing", "example"] do
     value
     |> normalize_callouts(default_title)
     |> Enum.with_index(1)
@@ -652,26 +942,13 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   defp practice_group([], _stable_key), do: []
 
   defp practice_group(references, stable_key) do
-    introduction =
-      content_block(
-        [
-          text_element("h3", "Practice the concept", "#{stable_key}:heading"),
-          text_element(
-            "p",
-            "Check your understanding before moving to the next section.",
-            "#{stable_key}:introduction"
-          )
-        ],
-        "#{stable_key}:introduction"
-      )
-
     [
       %{
         "id" => stable_id("practice-group", stable_key),
         "type" => "group",
         "layout" => "vertical",
         "purpose" => "learnbydoing",
-        "children" => [introduction | references]
+        "children" => references
       }
     ]
   end
@@ -714,6 +991,18 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
        "title" => title,
        "stem_md" => question["prompt"],
        "input_type" => "text",
+       "explanation_md" =>
+         question_feedback(
+           question,
+           "correct",
+           "Your response addresses the prompt. Continue when you are ready."
+         ),
+       "incorrect_feedback_md" =>
+         question_feedback(
+           question,
+           "incorrect",
+           "Review the preceding explanation and revise your response."
+         ),
        "hints" => question_hints(question)
      }}
   end
@@ -799,14 +1088,13 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   end
 
   defp question_hints(question) do
-    question["hint"]
-    |> List.wrap()
-    |> Enum.flat_map(fn hint ->
-      case present_string(hint) do
-        nil -> []
-        value -> [%{"body_md" => value}]
-      end
-    end)
+    cognitive_hint = present_string(question["hint"]) || ""
+
+    [
+      %{"body_md" => ""},
+      %{"body_md" => cognitive_hint},
+      %{"body_md" => ""}
+    ]
   end
 
   defp markdown_alt(value) do
@@ -3437,7 +3725,19 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   defp questions(items) when is_list(items), do: items
   defp questions(_), do: []
 
-  defp validate_questions(questions) when length(questions) in 2..6 do
+  defp validate_questions(questions, "basic", %{"schema_version" => 5})
+       when length(questions) in 0..10,
+       do: normalize_questions_for_compile(questions)
+
+  defp validate_questions(questions, mode, _content)
+       when (mode == "basic" and length(questions) in 1..10) or
+              (mode == "advanced" and length(questions) in 2..6) do
+    normalize_questions_for_compile(questions)
+  end
+
+  defp validate_questions(_, _, _), do: {:error, :invalid_question_count}
+
+  defp normalize_questions_for_compile(questions) do
     questions
     |> Enum.reduce_while({:ok, []}, fn question, {:ok, normalized} ->
       case normalize_question(question) do
@@ -3449,8 +3749,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       end
     end)
   end
-
-  defp validate_questions(_), do: {:error, :invalid_question_count}
 
   defp normalize_question(%{"prompt" => prompt, "type" => type} = question)
        when is_binary(prompt) and type in ["short_answer", "multiple_choice", "mcq"] do

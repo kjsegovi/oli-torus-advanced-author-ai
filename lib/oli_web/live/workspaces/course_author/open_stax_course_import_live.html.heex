@@ -336,9 +336,15 @@
             {gettext("Choose chapters to include")}
           </h3>
           <p class="mt-1 max-w-3xl text-sm text-gray-600">
-            {gettext(
-              "All discovered chapters are selected by default. Remove chapters you do not want in this course, then continue to the outline."
-            )}
+            {if @test_conveniences_enabled,
+              do:
+                gettext(
+                  "No chapters are selected by default for local testing. Choose only the chapters needed for this run, then continue to the outline."
+                ),
+              else:
+                gettext(
+                  "All discovered chapters are selected by default. Remove chapters you do not want in this course, then continue to the outline."
+                )}
           </p>
         </div>
         <span class="rounded bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800">
@@ -346,7 +352,12 @@
         </span>
       </div>
 
-      <form id="openstax-course-scope" phx-submit="save_scope" class="mt-5 space-y-3">
+      <form
+        id="openstax-course-scope"
+        phx-change="change_scope"
+        phx-submit="save_scope"
+        class="mt-5 space-y-3"
+      >
         <label
           :for={chapter <- scope_chapters(@run)}
           class="flex cursor-pointer items-start gap-3 rounded border border-gray-200 p-3 transition hover:border-blue-300 hover:bg-blue-50"
@@ -355,7 +366,7 @@
             type="checkbox"
             name="chapters[]"
             value={chapter.id}
-            checked={chapter.selected}
+            checked={chapter.id in @scope_selected_ids}
             class="mt-1 h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
           />
           <span>
@@ -378,7 +389,7 @@
         <.button
           type="submit"
           variant={:primary}
-          disabled={scope_chapters(@run) == []}
+          disabled={scope_chapters(@run) == [] or @scope_selected_ids == []}
           phx-disable-with={gettext("Saving selection...")}
         >
           {gettext("Continue with selected chapters")}
@@ -453,13 +464,30 @@
           <h3 class="text-lg font-semibold text-gray-900">{gettext("Review lesson plans")}</h3>
           <p class="mt-1 text-sm text-gray-600">
             {gettext(
-              "Each plan includes learner-facing explanations, worked examples, takeaways, and formative questions. Basic and Advanced Author lessons are intentionally mixed."
+              "Basic v5 plans preserve the complete source AST and show independent critic evidence. Advanced Author generation remains on its existing workflow."
             )}
           </p>
         </div>
-        <span class="rounded bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800">
-          {gettext("Individual approval required")}
-        </span>
+        <div class="flex flex-col items-start gap-2 sm:items-end">
+          <span class="rounded bg-blue-50 px-2 py-1 text-xs font-semibold text-blue-800">
+            {if @approve_all_enabled,
+              do: gettext("Development testing shortcut"),
+              else: gettext("Individual approval required")}
+          </span>
+          <.button
+            :if={@approve_all_enabled}
+            variant={:secondary}
+            phx-click="approve_all"
+            phx-disable-with={gettext("Approving all lessons…")}
+            data-confirm={
+              gettext(
+                "Approve every valid lesson and start course creation? This development shortcut cannot approve a partially valid set."
+              )
+            }
+          >
+            {gettext("Approve all lessons")}
+          </.button>
+        </div>
       </div>
       <div class="mt-5 space-y-4">
         <div :for={unit <- units_for_run(@run)} class="rounded border border-gray-200 p-4">
@@ -599,7 +627,7 @@
                       size={:sm}
                       phx-click="approve_lesson"
                       phx-value-lesson_id={lesson.id}
-                      disabled={lesson_busy?(lesson)}
+                      disabled={lesson_busy?(lesson) or not v5_approvable?(lesson)}
                     >
                       {gettext("Approve lesson")}
                     </.button>
@@ -694,7 +722,120 @@
                       </ul>
                     </section>
 
-                    <section :if={plan_instructional_sections(lesson) != []}>
+                    <section
+                      :if={v5_lesson?(lesson) && plan_content_groups(lesson) != []}
+                      data-openstax-v5-learner-preview
+                      class="rounded-xl border border-slate-200 bg-slate-50 p-4"
+                    >
+                      <div class="flex flex-wrap items-center justify-between gap-2">
+                        <div>
+                          <p class="text-xs font-semibold uppercase tracking-wide text-blue-700">
+                            {gettext("Learner preview · Basic v5")}
+                          </p>
+                          <h5 class="mt-1 text-lg font-semibold text-slate-950">
+                            {plan_content(lesson, "title", lesson.title)}
+                          </h5>
+                        </div>
+                        <span class="rounded-full bg-white px-3 py-1 text-xs font-semibold text-slate-700 shadow-sm">
+                          {length(plan_content_groups(lesson))} {gettext("content groups")}
+                        </span>
+                      </div>
+
+                      <div class="mx-auto mt-5 max-w-3xl space-y-6">
+                        <article
+                          :for={group <- plan_content_groups(lesson)}
+                          data-openstax-v5-content-group={plan_item_value(group, "id")}
+                          class="rounded-lg border border-slate-200 bg-white p-5 shadow-sm"
+                        >
+                          <div class="flex flex-wrap items-start justify-between gap-2">
+                            <h6 class="text-base font-semibold text-slate-950">
+                              {plan_item_value(group, "title", gettext("Source content"))}
+                            </h6>
+                            <span class="rounded bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-800">
+                              {humanize_check_key(
+                                plan_item_value(group, "instructional_purpose", "concept")
+                              )}
+                            </span>
+                          </div>
+                          <p
+                            :if={plan_item_value(group, "transition") != ""}
+                            class="mt-2 text-sm italic leading-6 text-slate-600"
+                          >
+                            {plan_item_value(group, "transition")}
+                          </p>
+                          <div class="mt-4 space-y-4">
+                            <article
+                              :for={block <- v5_group_source_blocks(group)}
+                              data-openstax-v5-source-block={plan_item_value(block, "id")}
+                              class="border-l-2 border-slate-200 pl-4"
+                            >
+                              <p class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                {humanize_check_key(plan_item_value(block, "kind", "source"))}
+                              </p>
+                              <p class="mt-1 whitespace-pre-line text-sm leading-7 text-slate-800">
+                                {v5_source_block_preview_text(block)}
+                              </p>
+                            </article>
+                          </div>
+                          <div :if={v5_group_media(group) != []} class="mt-5 space-y-4">
+                            <figure
+                              :for={media <- v5_group_media(group)}
+                              class="overflow-hidden rounded-lg border border-slate-200 bg-slate-50"
+                            >
+                              <img
+                                :if={media_preview_url(media)}
+                                src={media_preview_url(media)}
+                                alt={plan_item_value(media, "alt")}
+                                loading="lazy"
+                                class="max-h-96 w-full object-contain"
+                              />
+                              <figcaption class="border-t border-slate-200 p-3 text-xs leading-5 text-slate-700">
+                                <p>{plan_item_value(media, "caption")}</p>
+                                <p
+                                  :if={plan_item_value(media, "credit") != ""}
+                                  class="text-slate-500"
+                                >
+                                  {plan_item_value(media, "credit")}
+                                </p>
+                                <p
+                                  :if={plan_item_value(media, "alt_source") == "generated"}
+                                  class="mt-1 font-semibold text-indigo-700"
+                                >
+                                  {gettext("Contextual alt text generated and critic reviewed")}
+                                </p>
+                              </figcaption>
+                            </figure>
+                          </div>
+                          <p class="mt-4 break-words text-xs text-slate-500">
+                            <span class="font-semibold">{gettext("Source blocks")}:</span>
+                            {Enum.join(plan_item_strings(group, "source_block_ids"), ", ")}
+                          </p>
+                        </article>
+
+                        <article
+                          :if={is_map(plan_synthesis(lesson))}
+                          class="rounded-lg border border-emerald-200 bg-emerald-50 p-5"
+                        >
+                          <p class="text-xs font-semibold uppercase tracking-wide text-emerald-700">
+                            {gettext("Synthesis")}
+                          </p>
+                          <h6 class="mt-1 font-semibold text-emerald-950">
+                            {plan_item_value(
+                              plan_synthesis(lesson),
+                              "heading",
+                              gettext("Bring the ideas together")
+                            )}
+                          </h6>
+                          <p class="mt-2 text-sm leading-6 text-emerald-950">
+                            {plan_item_value(plan_synthesis(lesson), "summary")}
+                          </p>
+                        </article>
+                      </div>
+                    </section>
+
+                    <section :if={
+                      !v5_lesson?(lesson) && plan_instructional_sections(lesson) != []
+                    }>
                       <h5 class="text-sm font-semibold text-gray-900">
                         {gettext("Instructional sections")}
                       </h5>
@@ -733,7 +874,7 @@
                       </div>
                     </section>
 
-                    <section :if={plan_media(lesson) != []}>
+                    <section :if={!v5_lesson?(lesson) && plan_media(lesson) != []}>
                       <h5 class="text-sm font-semibold text-gray-900">
                         {gettext("Source figures")}
                       </h5>
@@ -1420,8 +1561,113 @@
                       </ul>
                     </details>
 
+                    <section
+                      :if={v5_lesson?(lesson)}
+                      data-openstax-v5-quality-review
+                      class="rounded-lg border border-indigo-200 bg-indigo-50 p-4"
+                    >
+                      <div class="flex flex-wrap items-start justify-between gap-3">
+                        <div>
+                          <p class="text-xs font-semibold uppercase tracking-wide text-indigo-700">
+                            {gettext("Independent critic review")}
+                          </p>
+                          <h5 class="mt-1 font-semibold text-indigo-950">
+                            {if v5_approvable?(lesson),
+                              do: gettext("Quality gate passed"),
+                              else: gettext("Approval blocked")}
+                          </h5>
+                        </div>
+                        <span class={[
+                          "rounded-full px-3 py-1 text-xs font-semibold",
+                          if(v5_quality_confidence(lesson) >= 0.9,
+                            do: "bg-emerald-100 text-emerald-800",
+                            else: "bg-red-100 text-red-800"
+                          )
+                        ]}>
+                          {gettext("%{confidence} confidence",
+                            confidence: v5_quality_confidence_label(lesson)
+                          )}
+                        </span>
+                      </div>
+
+                      <div class="mt-4 grid gap-4 lg:grid-cols-2">
+                        <div>
+                          <p class="text-xs font-semibold text-indigo-900">
+                            {gettext("Specialist models")}
+                          </p>
+                          <ul class="mt-2 space-y-1 text-xs text-indigo-950">
+                            <li :for={role <- v5_role_rows(lesson)}>
+                              <span class="font-semibold">{plan_item_value(role, "role")}:</span>
+                              {plan_item_value(role, "model")}
+                            </li>
+                          </ul>
+                        </div>
+                        <div>
+                          <p class="text-xs font-semibold text-indigo-900">
+                            {gettext("Repair history")}
+                          </p>
+                          <ul
+                            :if={v5_repair_history(lesson) != []}
+                            class="mt-2 space-y-1 text-xs text-indigo-950"
+                          >
+                            <li :for={attempt <- v5_repair_history(lesson)}>
+                              {plan_item_value(attempt, "stage")} · {gettext("attempt %{number}",
+                                number: plan_item_value(attempt, "attempt")
+                              )}
+                            </li>
+                          </ul>
+                          <p
+                            :if={v5_repair_history(lesson) == []}
+                            class="mt-2 text-xs text-indigo-800"
+                          >
+                            {gettext("No repair round was needed.")}
+                          </p>
+                        </div>
+                      </div>
+
+                      <div
+                        :if={v5_quality_findings(lesson, "hard_blocker") != []}
+                        class="mt-4 rounded border border-red-200 bg-red-50 p-3 text-xs text-red-950"
+                      >
+                        <p class="font-semibold">{gettext("Hard blockers")}</p>
+                        <ul class="mt-2 list-disc space-y-1 pl-5">
+                          <li :for={finding <- v5_quality_findings(lesson, "hard_blocker")}>
+                            {plan_item_value(finding, "message", gettext("Review required"))}
+                          </li>
+                        </ul>
+                      </div>
+
+                      <div
+                        :if={v5_quality_findings(lesson, "repair") != []}
+                        class="mt-4 rounded border border-amber-200 bg-amber-50 p-3 text-xs text-amber-950"
+                      >
+                        <p class="font-semibold">{gettext("Repairs still required")}</p>
+                        <ul class="mt-2 list-disc space-y-1 pl-5">
+                          <li :for={finding <- v5_quality_findings(lesson, "repair")}>
+                            {plan_item_value(finding, "message", gettext("Review required"))}
+                          </li>
+                        </ul>
+                      </div>
+
+                      <details
+                        :if={v5_quality_findings(lesson, "advisory") != []}
+                        class="mt-4 rounded border border-indigo-200 bg-white"
+                      >
+                        <summary class="cursor-pointer px-3 py-2 text-xs font-semibold text-indigo-900">
+                          {gettext("Advisories (%{count})",
+                            count: length(v5_quality_findings(lesson, "advisory"))
+                          )}
+                        </summary>
+                        <ul class="list-disc space-y-1 border-t border-indigo-100 p-3 pl-7 text-xs text-indigo-950">
+                          <li :for={finding <- v5_quality_findings(lesson, "advisory")}>
+                            {plan_item_value(finding, "message")}
+                          </li>
+                        </ul>
+                      </details>
+                    </section>
+
                     <p
-                      :if={!rich_lesson_material?(lesson)}
+                      :if={!v5_lesson?(lesson) && !rich_lesson_material?(lesson)}
                       class="rounded bg-yellow-50 p-3 text-sm text-yellow-900"
                     >
                       {gettext(
@@ -1495,9 +1741,15 @@
                       data-openstax-author-review-warning
                       class="font-medium text-yellow-900"
                     >
-                      {gettext(
-                        "Automated checks found items for author review. You may edit, regenerate, or approve this lesson as-is."
-                      )}
+                      {if v5_lesson?(lesson),
+                        do:
+                          gettext(
+                            "Automated checks found blocking items. Resolve them or regenerate this lesson before approval."
+                          ),
+                        else:
+                          gettext(
+                            "Automated checks found items for author review. You may edit, regenerate, or approve this lesson as-is."
+                          )}
                     </span>
                   </div>
                   <div
@@ -1929,6 +2181,14 @@
       >
         <p class="font-semibold">{gettext("Failure details")}</p>
         <p class="mt-1 break-words">{run_error_message(@run)}</p>
+        <ul
+          :if={lesson_planning_failure_categories(@run) != []}
+          class="mt-2 list-disc space-y-1 pl-5"
+        >
+          <li :for={item <- lesson_planning_failure_categories(@run)}>
+            {item.label}: {item.count}
+          </li>
+        </ul>
       </div>
       <div class="mt-5 flex flex-wrap gap-3">
         <.button

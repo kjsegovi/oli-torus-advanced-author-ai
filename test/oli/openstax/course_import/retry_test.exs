@@ -40,23 +40,6 @@ defmodule Oli.OpenStax.CourseImport.RetryTest do
     assert {:ok, %Run{status: :failed}} = CourseImport.fetch_run(run.id)
   end
 
-  test "an oversized source is an actionable non-recoverable failure", %{
-    author: author,
-    run: run
-  } do
-    assert {:ok, %Run{status: :failed} = failed} =
-             CourseImport.mark_failed(
-               run.id,
-               :preflight,
-               {:source_scope_too_large, 240, 120}
-             )
-
-    refute failed.error["recoverable"]
-    assert failed.error["message"] =~ "240 course sections"
-    assert failed.error["message"] =~ "limit of 120"
-    assert {:error, :not_recoverable} = CourseImport.retry_run(run.id, author)
-  end
-
   test "retry revalidates the locked current project root before reactivating", %{
     author: author,
     project: project,

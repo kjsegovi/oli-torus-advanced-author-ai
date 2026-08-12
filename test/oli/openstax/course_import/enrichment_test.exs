@@ -153,7 +153,7 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
     {:ok, artifact} = Enrichment.begin_artifact_generation(proposal.id)
 
     {:ok, preview} =
-      Enrichment.record_artifact_generation_result(artifact.id, {:ok, preview_attrs("z")})
+      Enrichment.record_artifact_generation_result(artifact.id, {:ok, preview_attrs("c")})
 
     {:ok, _cancelled} =
       run
@@ -249,8 +249,9 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
     assert {:ok, ^approved_v1} = Enrichment.resolve_approved_artifact(proposal.id)
 
     expected_hash = String.duplicate("a", 64)
+    expected_url = "https://simulations.example.edu/bundles/#{expected_hash}/index.html"
 
-    assert {:ok, "https://simulations.example.edu/bundles/#{expected_hash}/index.html"} =
+    assert {:ok, ^expected_url} =
              Enrichment.artifact_url(approved_v1,
                artifact_storage: FakeStorage,
                trusted_origin: "https://simulations.example.edu"

@@ -15,9 +15,14 @@ import {
   MatchConfigs,
   MathExpressionQuestionConfig,
   MathExpressionQuestionType,
-  isAlwaysMatchConfig,
 } from 'data/activities/model/match';
-import { containsRule, eqRule, equalsRule, matchRule } from 'data/activities/model/rules';
+import {
+  containsRule,
+  eqRule,
+  equalsRule,
+  isCatchAllResponse,
+  matchRule,
+} from 'data/activities/model/rules';
 import { getByUnsafe, getPartById } from 'data/activities/model/utils';
 
 export const makeMatchConfigResponse = (
@@ -178,8 +183,7 @@ export const getIncorrectResponse = (model: HasParts, partId: string) => {
       return (
         // check score for edge case where author sets a correct response of .*
         r.score === getIncorrectPoints(model, partId) &&
-        (isAlwaysMatchConfig(r.matchConfig) ||
-          r.rule === matchRule('.*') ||
+        (isCatchAllResponse(r) ||
           // Allow for special rule form used by ResponseMulti
           (typeof r.rule === 'string' &&
             r.rule.startsWith('input_ref') &&

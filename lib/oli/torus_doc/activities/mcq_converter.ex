@@ -144,7 +144,7 @@ defmodule Oli.TorusDoc.Activities.MCQConverter do
   defp build_catch_all_response(nil) do
     %{
       "id" => ActivityConverter.generate_id(),
-      "rule" => ".*",
+      "rule" => "input like {.*}",
       "score" => 0,
       "feedback" => %{
         "id" => ActivityConverter.generate_id(),
@@ -158,7 +158,7 @@ defmodule Oli.TorusDoc.Activities.MCQConverter do
       {:ok, feedback} ->
         %{
           "id" => ActivityConverter.generate_id(),
-          "rule" => ".*",
+          "rule" => "input like {.*}",
           "score" => 0,
           "feedback" => feedback
         }

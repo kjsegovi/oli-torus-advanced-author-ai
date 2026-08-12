@@ -205,7 +205,7 @@ defmodule Oli.OpenStax.CourseImport.Section12GoldenTest do
 
     basic_groups = collect_elements(realized_basic, "group")
     assert Enum.any?(basic_groups, &(&1["purpose"] == "example"))
-    assert Enum.any?(basic_groups, &(&1["purpose"] == "manystudentswonder"))
+    refute Enum.any?(basic_groups, &(&1["purpose"] == "manystudentswonder"))
     assert Enum.any?(basic_groups, &(&1["purpose"] == "learnbydoing"))
     assert length(collect_elements(realized_basic, "activity-reference")) == 4
     assert collect_text(realized_basic) =~ "Adapted from OpenStax"

@@ -19,11 +19,23 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProvider do
 
   def generate(messages, functions, %RegisteredModel{model: model} = registered_model) do
     config = config(:sync, registered_model)
-    params = completion_params(model, messages, functions)
 
-    case api_post(config.api_url <> "/v1/chat/completions", params, config) do
+    {path, params, normalize} =
+      case responses_tool_request?(registered_model, functions) do
+        true ->
+          {"/v1/responses", responses_params(model, messages, functions),
+           &normalize_responses_response/1}
+
+        false ->
+          {"/v1/chat/completions", completion_params(model, messages, functions),
+           &Function.identity/1}
+      end
+
+    case api_post(config.api_url <> path, params, config) do
       {:ok, response} ->
-        extract_generate_result(response)
+        response
+        |> normalize.()
+        |> extract_generate_result()
 
       {:error, reason} ->
         {:error, reason}
@@ -123,6 +135,60 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProvider do
     end
   end
 
+  @doc false
+  def responses_params(model, messages, functions) do
+    [
+      model: model,
+      input: encode_responses_input(messages),
+      tools: encode_responses_tools(functions),
+      parallel_tool_calls: false,
+      reasoning: %{effort: "medium"}
+    ]
+  end
+
+  @doc false
+  def encode_responses_input(messages) do
+    Enum.flat_map(messages, fn message ->
+      case message.role do
+        role when role in [:function, "function"] ->
+          encode_responses_function_result(message)
+
+        role ->
+          [%{role: normalize_responses_role(role), content: to_string(message.content || "")}]
+      end
+    end)
+  end
+
+  @doc false
+  def normalize_responses_response(response) do
+    response = decode_response(response)
+    output = Map.get(response, "output", [])
+    tool_calls = Enum.filter(output, &(Map.get(&1, "type") == "function_call"))
+
+    message =
+      case tool_calls do
+        [] ->
+          %{
+            "role" => "assistant",
+            "content" => responses_output_text(output)
+          }
+
+        calls ->
+          %{
+            "role" => "assistant",
+            "content" => nil,
+            "tool_calls" => Enum.map(calls, &normalize_responses_tool_call/1)
+          }
+      end
+
+    %{
+      "id" => Map.get(response, "id"),
+      "choices" => [%{"message" => message}],
+      "usage" => Map.get(response, "usage", %{}),
+      "responses_output" => output
+    }
+  end
+
   def encode_messages(messages) do
     Enum.flat_map(messages, fn message ->
       case message.role do
@@ -133,6 +199,81 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProvider do
           [encode_standard_message(message)]
       end
     end)
+  end
+
+  defp responses_tool_request?(
+         %RegisteredModel{provider: :open_ai, model: model},
+         functions
+       )
+       when model in ["gpt-5.6-terra", "gpt-5.6-luna"],
+       do: functions != []
+
+  defp responses_tool_request?(_registered_model, _functions), do: false
+
+  defp encode_responses_function_result(message) do
+    call_id = message.id || new_tool_call_id()
+    arguments = Jason.encode!(message.input || %{})
+
+    prior_output =
+      case Map.get(message, :provider_output) do
+        output when is_list(output) and output != [] ->
+          output
+
+        _ ->
+          [
+            %{
+              type: "function_call",
+              call_id: call_id,
+              name: message.name,
+              arguments: arguments
+            }
+          ]
+      end
+
+    prior_output ++
+      [
+        %{
+          type: "function_call_output",
+          call_id: call_id,
+          output: to_string(message.content || "")
+        }
+      ]
+  end
+
+  defp normalize_responses_role(role) when role in [:system, :user, :assistant],
+    do: Atom.to_string(role)
+
+  defp normalize_responses_role(role) when role in ["system", "user", "assistant"], do: role
+  defp normalize_responses_role(_role), do: "user"
+
+  defp encode_responses_tools(functions) do
+    Enum.map(functions, fn function ->
+      %{
+        type: "function",
+        name: function.name,
+        description: function.description,
+        parameters: function.parameters
+      }
+    end)
+  end
+
+  defp normalize_responses_tool_call(call) do
+    %{
+      "id" => Map.get(call, "call_id") || Map.get(call, "id") || new_tool_call_id(),
+      "type" => "function",
+      "function" => %{
+        "name" => Map.get(call, "name"),
+        "arguments" => Map.get(call, "arguments", "{}")
+      }
+    }
+  end
+
+  defp responses_output_text(output) do
+    output
+    |> Enum.filter(&(Map.get(&1, "type") == "message"))
+    |> Enum.flat_map(&Map.get(&1, "content", []))
+    |> Enum.filter(&(Map.get(&1, "type") == "output_text"))
+    |> Enum.map_join("", &Map.get(&1, "text", ""))
   end
 
   def process_response_body(body) do

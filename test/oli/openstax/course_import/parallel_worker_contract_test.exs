@@ -33,7 +33,7 @@ defmodule Oli.OpenStax.CourseImport.ParallelWorkerContractTest do
     assert Ecto.Changeset.get_field(changeset, :worker) == inspect(LessonPlanWorker)
     assert Ecto.Changeset.get_field(changeset, :args) == args
     assert Ecto.Changeset.get_field(changeset, :max_attempts) == 4
-    assert LessonPlanWorker.timeout(%Oban.Job{}) == :timer.minutes(5)
+    assert LessonPlanWorker.timeout(%Oban.Job{}) == :timer.minutes(12)
 
     unique = Ecto.Changeset.get_change(changeset, :unique)
 

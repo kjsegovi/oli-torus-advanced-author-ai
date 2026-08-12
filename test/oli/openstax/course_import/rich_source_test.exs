@@ -106,6 +106,9 @@ defmodule Oli.OpenStax.CourseImport.RichSourceTest do
             "title" => "Global Issues in Technology",
             "subtitle" => "Targeted Advertising",
             "text" => callout_body,
+            "ast" => [
+              %{"type" => "p", "children" => [%{"text" => callout_body}]}
+            ],
             "source_locator" => %{"css" => "#targeted-advertising"},
             "blocks" => [
               %{
@@ -140,6 +143,9 @@ defmodule Oli.OpenStax.CourseImport.RichSourceTest do
              "Targeted Advertising"
 
     assert callout["callout_body"] == callout_body
+
+    assert get_in(callout, ["ast", Access.at(0), "children", Access.at(0), "text"]) ==
+             callout_body
   end
 
   test "links lesson evidence to ordered blocks and loads only that lesson corpus", %{

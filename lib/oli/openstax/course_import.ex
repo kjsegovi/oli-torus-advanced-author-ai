@@ -95,13 +95,21 @@ defmodule Oli.OpenStax.CourseImport do
 
   @spec available?(Project.t(), Author.t()) :: boolean()
   def available?(%Project{} = project, %Author{} = author) do
-    ScopedFeatureFlags.enabled?(:openstax_course_import, project) and
+    (test_conveniences_enabled?() or
+       ScopedFeatureFlags.enabled?(:openstax_course_import, project)) and
       authorize_project(project, author) == :ok
   rescue
     _ -> false
   end
 
   def available?(_, _), do: false
+
+  @doc "Returns whether local-only OpenStax import testing conveniences are active."
+  @spec test_conveniences_enabled?() :: boolean()
+  def test_conveniences_enabled? do
+    Application.get_env(:oli, :env) in [:dev, :test] and
+      Application.get_env(:oli, :openstax_course_import_test_conveniences_enabled, false) == true
+  end
 
   @doc "Returns project-scoped enrichment availability for the author review UI."
   @spec enrichment_capabilities(Project.t()) :: map()
@@ -485,6 +493,7 @@ defmodule Oli.OpenStax.CourseImport do
           version: version,
           content_payload: content_payload,
           questions_payload: plan.questions_payload,
+          generation_metadata: plan.generation_metadata,
           checks_snapshot: checks_snapshot(results),
           created_by: "author",
           approved_by_user: false,
@@ -509,6 +518,47 @@ defmodule Oli.OpenStax.CourseImport do
   end
 
   defp exclusion_needs_acknowledgement?(_source_context, _exclusion, _plan_version), do: false
+
+  defp ensure_v4_full_source_approvable(
+         lesson,
+         %LessonPlan{content_payload: %{"authoring_mode" => "basic"}} = plan,
+         run_plan_schema_version
+       )
+       when is_integer(run_plan_schema_version) and run_plan_schema_version >= 5 do
+    quality_gate = get_in(plan.generation_metadata || %{}, ["quality_gate"]) || %{}
+    coverage = plan.content_payload["coverage_manifest"] || %{}
+    available = MapSet.new(List.wrap(coverage["available_source_block_ids"]))
+    included = MapSet.new(List.wrap(coverage["included_source_block_ids"]))
+
+    cond do
+      plan.content_payload["schema_version"] != 5 ->
+        {:error, :plan_schema_version_mismatch}
+
+      quality_gate["approved"] != true or numeric_confidence(quality_gate["confidence"]) < 0.9 ->
+        {:error, :v5_quality_gate_not_approved}
+
+      List.wrap(quality_gate["hard_blockers"]) != [] ->
+        {:error, :v5_quality_hard_blockers}
+
+      List.wrap(quality_gate["repairs"]) != [] ->
+        {:error, :v5_quality_repairs_pending}
+
+      coverage["complete"] != true or available != included or
+        List.wrap(coverage["missing_source_block_ids"]) != [] or
+          List.wrap(coverage["duplicate_source_block_ids"]) != [] ->
+        {:error, :v5_source_coverage_incomplete}
+
+      true ->
+        results =
+          Checks.run(lesson_source_context(lesson), %{
+            "content_payload" => plan.content_payload,
+            "questions_payload" => plan.questions_payload,
+            "generation_metadata" => plan.generation_metadata
+          })
+
+        if Checks.passed?(results), do: :ok, else: {:error, :v5_quality_checks_failed}
+    end
+  end
 
   defp ensure_v4_full_source_approvable(
          lesson,
@@ -556,33 +606,140 @@ defmodule Oli.OpenStax.CourseImport do
 
   defp ensure_v4_full_source_approvable(_lesson, %LessonPlan{}, _run_plan_schema_version), do: :ok
 
+  defp numeric_confidence(value) when is_integer(value), do: value / 1
+  defp numeric_confidence(value) when is_float(value), do: value
+
+  defp numeric_confidence(value) when is_binary(value) do
+    case Float.parse(value) do
+      {number, _rest} -> number
+      _ -> 0.0
+    end
+  end
+
+  defp numeric_confidence(_value), do: 0.0
+
   @spec approve_all_lessons(Run.t() | Ecto.UUID.t(), Author.t()) ::
           {:ok, Run.t()} | {:error, term()}
   def approve_all_lessons(%Run{id: run_id}, %Author{} = author),
     do: approve_all_lessons(run_id, author)
 
   def approve_all_lessons(run_id, %Author{} = author) do
-    with {:ok, run} <- authorized_run(run_id, author) do
-      cond do
-        run.status == :compiling ->
-          {:ok, preload_run(run)}
+    with true <- approve_all_lessons_enabled?(),
+         {:ok, run} <- authorized_run(run_id, author) do
+      result =
+        Repo.transaction(fn ->
+          locked_run = lock_run!(run.id)
+          :ok = rollback_unless_ok(reauthorize_locked_run(locked_run, author))
 
-        run.status != :awaiting_lesson_approval ->
-          {:error, {:invalid_status, run.status, :awaiting_lesson_approval}}
+          cond do
+            locked_run.status == :compiling ->
+              locked_run
 
-        not run_has_lessons?(run.id) ->
-          {:error, :no_lessons_to_approve}
+            locked_run.status != :awaiting_lesson_approval ->
+              Repo.rollback({:invalid_status, locked_run.status, :awaiting_lesson_approval})
 
-        all_lessons_approved?(run.id) ->
-          with :ok <- Enrichment.ensure_generation_complete(run.id) do
-            transition_to_compiling_if_ready(run.id)
+            true ->
+              lessons = lock_selected_lessons(locked_run.id)
+
+              if lessons == [] do
+                Repo.rollback(:no_lessons_to_approve)
+              end
+
+              :ok = rollback_unless_ok(Enrichment.ensure_generation_complete(locked_run.id))
+              now = DateTime.utc_now()
+
+              approvals =
+                Enum.map(lessons, fn lesson ->
+                  :ok = rollback_unless_ok(ensure_lesson_not_busy(lesson))
+                  plan = latest_plan_or_nil(lesson.id) || Repo.rollback(:missing_lesson_plan)
+
+                  if lesson.last_plan_version != plan.version do
+                    Repo.rollback(:lesson_plan_version_stale)
+                  end
+
+                  :ok = rollback_unless_ok(ensure_plan_approvable(plan))
+                  plan = acknowledged_plan_for_approval!(lesson, plan, author, now)
+
+                  :ok =
+                    rollback_unless_ok(
+                      ensure_v4_full_source_approvable(
+                        lesson,
+                        plan,
+                        locked_run.plan_schema_version
+                      )
+                    )
+
+                  {lesson, plan}
+                end)
+
+              Enum.each(approvals, fn {lesson, plan} ->
+                lesson
+                |> Lesson.changeset(%{
+                  status: "approved",
+                  approved_by_author_id: author.id,
+                  approved_at: now,
+                  planning_state: "completed",
+                  planning_error: nil,
+                  last_plan_version: plan.version,
+                  planning_finished_at: lesson.planning_finished_at || now
+                })
+                |> Repo.update!()
+
+                plan
+                |> LessonPlan.changeset(%{
+                  approved_by_user: true,
+                  approved_at: now,
+                  rejection_reason: nil
+                })
+                |> Repo.update!()
+              end)
+
+              case maybe_transition_to_compiling_locked(locked_run) do
+                {:transitioned, compiling_run} -> compiling_run
+                :not_ready -> Repo.rollback(:lessons_pending_approval)
+              end
+          end
+        end)
+
+      case result do
+        {:ok, compiling_run} ->
+          with {:ok, updated_run} <- after_transition({:ok, compiling_run}),
+               %Project{} = project <- Repo.get(Project, updated_run.project_id),
+               {:ok, downstream_run} <- start_apply(project, updated_run.id, author) do
+            sync_review_counts(run.id)
+            maybe_reconcile_parallel_review_progress(run.id)
+            {:ok, preload_run(downstream_run)}
+          else
+            nil -> {:error, :not_found}
+            {:error, _reason} = error -> error
           end
 
-        true ->
-          {:error, :lessons_pending_approval}
+        {:error, reason} ->
+          {:error, reason}
       end
+    else
+      false -> {:error, :bulk_approval_disabled}
+      {:error, _reason} = error -> error
     end
   end
+
+  @doc false
+  def approve_all_lessons_enabled? do
+    Application.get_env(:oli, :env) in [:dev, :test] and
+      Application.get_env(:oli, :openstax_course_import_approve_all_enabled, false) == true
+  end
+
+  defp reauthorize_locked_run(
+         %Run{author_id: author_id} = run,
+         %Author{id: author_id} = author
+       ) do
+    case Repo.get(Project, run.project_id) do
+      %Project{} = project -> authorize_project(project, author)
+      nil -> {:error, :not_found}
+    end
+  end
+
+  defp reauthorize_locked_run(_run, _author), do: {:error, :not_found}
 
   @spec reject_lesson(Ecto.UUID.t(), Ecto.UUID.t(), Author.t(), String.t()) ::
           {:ok, Lesson.t()} | {:error, term()}
@@ -989,7 +1146,9 @@ defmodule Oli.OpenStax.CourseImport do
       get_in(run.preflight_snapshot || %{}, ["title"]) || run.book_slug
     )
     |> Map.put_new("source_url", run.source_url)
-    |> Map.put_new("license", "CC BY-NC-SA 4.0")
+    |> Map.put_new("license", "CC BY 4.0")
+    |> Map.put_new("license_type", "cc_by")
+    |> Map.put_new("license_url", "https://creativecommons.org/licenses/by/4.0/")
   end
 
   @doc false
@@ -1077,12 +1236,7 @@ defmodule Oli.OpenStax.CourseImport do
 
   @doc false
   def persist_scope_snapshot(run_id, snapshot) when is_map(snapshot) do
-    chapters =
-      snapshot
-      |> Map.get("chapters", [])
-      |> Enum.map(&Map.put(&1, "selected", true))
-
-    selected_ids = Enum.map(chapters, & &1["id"])
+    {chapters, selected_ids} = initial_or_stored_scope_selection(run_id, snapshot)
 
     update_run_if_status(run_id, :preflighting, %{
       preflight_snapshot: Map.put(snapshot, "chapters", chapters),
@@ -1103,6 +1257,46 @@ defmodule Oli.OpenStax.CourseImport do
         ]
       }
     })
+  end
+
+  defp initial_or_stored_scope_selection(run_id, snapshot) do
+    discovered = Map.get(snapshot, "chapters", [])
+
+    stored_selection =
+      case Repo.get(Run, run_id) do
+        %Run{scope_manifest: manifest} when is_map(manifest) ->
+          if Map.has_key?(manifest, "selected_chapter_ids") do
+            {:stored, List.wrap(manifest["selected_chapter_ids"])}
+          else
+            :initial
+          end
+
+        _ ->
+          :initial
+      end
+
+    selected_ids =
+      case stored_selection do
+        {:stored, ids} ->
+          ids
+
+        :initial ->
+          if test_conveniences_enabled?(),
+            do: [],
+            else: Enum.map(discovered, & &1["id"])
+      end
+
+    selected_set = MapSet.new(selected_ids)
+
+    chapters =
+      Enum.map(discovered, fn chapter ->
+        Map.put(chapter, "selected", MapSet.member?(selected_set, chapter["id"]))
+      end)
+
+    discovered_ids = MapSet.new(chapters, & &1["id"])
+    selected_ids = Enum.filter(selected_ids, &MapSet.member?(discovered_ids, &1))
+
+    {chapters, selected_ids}
   end
 
   @doc false
@@ -1211,22 +1405,15 @@ defmodule Oli.OpenStax.CourseImport do
   def link_lesson_sources(run_id), do: RichSource.link_lessons(run_id)
 
   @doc false
-  def rich_content_versions(%Project{} = project) do
-    refined_v4_enabled? =
-      Application.get_env(:oli, :openstax_refined_planning_v4_enabled, false) or
-        ScopedFeatureFlags.enabled?(:openstax_refined_planning_v4, project)
+  def rich_content_versions(%Project{}), do: {3, 5}
 
-    rich_v3_enabled? =
-      Application.get_env(:oli, :openstax_rich_content_v3_enabled, false) or
-        ScopedFeatureFlags.enabled?(:openstax_rich_content_v3, project)
-
-    cond do
-      refined_v4_enabled? -> {2, 4}
-      rich_v3_enabled? -> {2, 3}
-      true -> {1, 2}
-    end
+  @doc false
+  def basic_v5_enabled?(%Project{} = project) do
+    Application.get_env(:oli, :env) == :dev or
+      Application.get_env(:oli, :openstax_basic_pages_v5_enabled, false) or
+      ScopedFeatureFlags.enabled?(:openstax_basic_pages_v5, project)
   rescue
-    _ -> {1, 2}
+    _ -> false
   end
 
   @doc false
@@ -1334,6 +1521,7 @@ defmodule Oli.OpenStax.CourseImport do
 
         {:ok, {:claimed, lesson, run, _reconciliation}} ->
           source = lesson_source_map(lesson)
+          project = Repo.get(Project, run.project_id)
 
           with :ok <- ensure_usable_lesson_source(run, source) do
             PubSub.broadcast(run)
@@ -1351,8 +1539,16 @@ defmodule Oli.OpenStax.CourseImport do
             {:ok,
              %{
                source: source,
+               lesson_id: lesson.id,
+               run_id: run.id,
+               project_id: run.project_id,
+               author_id: run.author_id,
+               generation_checkpoint: lesson.generation_checkpoint || %{},
+               objective_ledger:
+                 approved_objective_ledger(run.id, lesson.planning_position || job_args.position),
                planning_position: lesson.planning_position || job_args.position,
-               plan_schema_version: run.plan_schema_version
+               plan_schema_version: run.plan_schema_version,
+               basic_v5_enabled: not is_nil(project) and basic_v5_enabled?(project)
              }}
           end
 
@@ -1365,12 +1561,119 @@ defmodule Oli.OpenStax.CourseImport do
   def claim_lesson_plan_job(_args, _attempt, _job_id), do: {:error, :invalid_lesson_job}
 
   @doc false
+  def persist_lesson_generation_checkpoint(args, stage, payload)
+      when is_map(args) and is_binary(stage) and is_map(payload) do
+    with {:ok, job_args} <- normalize_lesson_job_args(args) do
+      Repo.transaction(fn ->
+        run = lock_run!(job_args.run_id)
+
+        :ok =
+          rollback_unless_ok(
+            ensure_parallel_generation(
+              run,
+              job_args.generation,
+              planning_statuses(job_args.operation)
+            )
+          )
+
+        lesson = lock_lesson!(job_args.lesson_id, run.id)
+
+        if lesson.planning_request_id != job_args.request_id or
+             lesson.planning_generation != job_args.generation do
+          Repo.rollback(:stale_lesson_planning_job)
+        end
+
+        checkpoint = %{
+          "request_id" => job_args.request_id,
+          "stage" => stage,
+          "payload" => payload,
+          "updated_at" => DateTime.to_iso8601(DateTime.utc_now())
+        }
+
+        lesson
+        |> Lesson.changeset(%{
+          generation_checkpoint: checkpoint,
+          planning_last_progress_at: DateTime.utc_now()
+        })
+        |> Repo.update!()
+
+        checkpoint
+      end)
+    end
+  end
+
+  def persist_lesson_generation_checkpoint(_args, _stage, _payload),
+    do: {:error, :invalid_generation_checkpoint}
+
+  @doc false
+  def approved_objective_ledger(run_id, planning_position)
+      when is_binary(run_id) and is_integer(planning_position) and planning_position > 0 do
+    Lesson
+    |> where(
+      [lesson],
+      lesson.run_id == ^run_id and lesson.selected == true and
+        lesson.planning_position < ^planning_position
+    )
+    |> order_by([lesson], asc: lesson.planning_position)
+    |> Repo.all()
+    |> Enum.flat_map(&lesson_objective_ledger_entries/1)
+  end
+
+  def approved_objective_ledger(_run_id, _planning_position), do: []
+
+  defp lesson_objective_ledger_entries(%Lesson{} = lesson) do
+    checkpoint = lesson.generation_checkpoint || %{}
+    stage = checkpoint["stage"]
+    checkpoint_payload = checkpoint["payload"] || %{}
+
+    content =
+      cond do
+        stage in ["content_approved", "questions_approved", "completed"] ->
+          checkpoint_payload["content_payload"] || %{}
+
+        true ->
+          case latest_plan_or_nil(lesson.id) do
+            %LessonPlan{} = plan ->
+              if get_in(plan.generation_metadata || %{}, ["quality_gate", "approved"]) == true,
+                do: plan.content_payload || %{},
+                else: %{}
+
+            nil ->
+              %{}
+          end
+      end
+
+    evidence_ids =
+      content
+      |> Map.get("source_block_ids", [])
+      |> List.wrap()
+      |> Enum.filter(&is_binary/1)
+
+    content
+    |> Map.get("learning_objectives", [])
+    |> List.wrap()
+    |> Enum.filter(&(is_binary(&1) and String.trim(&1) != ""))
+    |> Enum.with_index(1)
+    |> Enum.map(fn {objective, index} ->
+      %{
+        "id" => "#{lesson.id}:objective-#{index}",
+        "text" => objective,
+        "lesson_id" => lesson.id,
+        "lesson_title" => lesson.title,
+        "planning_position" => lesson.planning_position,
+        "evidence_block_ids" => evidence_ids
+      }
+    end)
+  end
+
+  @doc false
   def complete_lesson_plan_job(
         args,
         %{plan_mode: plan_mode, payload: payload, created_by: created_by} = planning_result
       )
       when is_map(args) and is_map(payload) do
     enrichment_proposals = Map.get(planning_result, :enrichment_proposals, [])
+    generation_metadata = Map.get(planning_result, :metadata, %{})
 
     with {:ok, job_args} <- normalize_lesson_job_args(args),
          :ok <- validate_plan_mode(plan_mode) do
@@ -1411,6 +1714,8 @@ defmodule Oli.OpenStax.CourseImport do
                 if job_args.operation == "initial" and not is_nil(existing) do
                   {Repo.preload(lesson, :plans, force: true), false}
                 else
+                  payload = Map.put(payload, "generation_metadata", generation_metadata)
+
                   {:ok, payload} =
                     sync_planned_enrichments(
                       run,
@@ -1426,7 +1731,7 @@ defmodule Oli.OpenStax.CourseImport do
                       payload,
                       plan_mode,
                       created_by,
-                      true,
+                      plan_mode == "advanced",
                       run.plan_schema_version
                     ),
                     true
@@ -1442,7 +1747,9 @@ defmodule Oli.OpenStax.CourseImport do
                   planning_attempts: max(planned_lesson.planning_attempts, 1),
                   planning_last_progress_at: now,
                   planning_finished_at: now,
-                  planning_error: nil
+                  planning_error: nil,
+                  generation_checkpoint:
+                    completed_generation_checkpoint(planned_lesson.generation_checkpoint, now)
                 })
                 |> Repo.update!()
                 |> Repo.preload(:plans, force: true)
@@ -1488,16 +1795,38 @@ defmodule Oli.OpenStax.CourseImport do
 
   def complete_lesson_plan_job(_args, _result), do: {:error, :invalid_lesson_plan_result}
 
+  defp completed_generation_checkpoint(checkpoint, now) when is_map(checkpoint) do
+    checkpoint
+    |> Map.put("stage", "completed")
+    |> Map.put("updated_at", DateTime.to_iso8601(now))
+  end
+
+  defp completed_generation_checkpoint(_checkpoint, _now), do: %{}
+
   @doc false
   def retry_lesson_plan_job(args, attempt, category)
       when is_map(args) and is_integer(attempt) and attempt > 0 and is_atom(category) do
-    update_lesson_plan_job_failure(args, attempt, category, "retrying")
+    retry_lesson_plan_job(args, attempt, category, %{})
+  end
+
+  @doc false
+  def retry_lesson_plan_job(args, attempt, category, details)
+      when is_map(args) and is_integer(attempt) and attempt > 0 and is_atom(category) and
+             is_map(details) do
+    update_lesson_plan_job_failure(args, attempt, category, "retrying", details)
   end
 
   @doc false
   def fail_lesson_plan_job(args, attempt, category)
       when is_map(args) and is_integer(attempt) and attempt > 0 and is_atom(category) do
-    update_lesson_plan_job_failure(args, attempt, category, "failed")
+    fail_lesson_plan_job(args, attempt, category, %{})
+  end
+
+  @doc false
+  def fail_lesson_plan_job(args, attempt, category, details)
+      when is_map(args) and is_integer(attempt) and attempt > 0 and is_atom(category) and
+             is_map(details) do
+    update_lesson_plan_job_failure(args, attempt, category, "failed", details)
   end
 
   @doc false
@@ -1778,7 +2107,7 @@ defmodule Oli.OpenStax.CourseImport do
                    :planning_lessons
                  ),
                {:ok, planning_result} <-
-                 AIPlanner.plan(lesson_source_map(lesson), index,
+                 plan_import_lesson(lesson_source_map(lesson), index,
                    plan_schema_version: plan_schema_version
                  ),
                {:ok, planned_lesson} <-
@@ -1828,6 +2157,14 @@ defmodule Oli.OpenStax.CourseImport do
 
       {:error, _} = error ->
         error
+    end
+  end
+
+  defp plan_import_lesson(source, index, opts) do
+    case Application.get_env(:oli, :openstax_course_import_lesson_planner, AIPlanner) do
+      planner when is_atom(planner) -> planner.plan(source, index, opts)
+      planner when is_function(planner, 3) -> planner.(source, index, opts)
+      _invalid -> {:error, {:ai_configuration_failed, :invalid_lesson_planner}}
     end
   end
 
@@ -2287,10 +2624,10 @@ defmodule Oli.OpenStax.CourseImport do
     if lesson.run_id == run_id do
       persist_lesson_plan(
         lesson,
-        payload,
+        Map.put(payload, "generation_metadata", Map.get(planning_result, :metadata, %{})),
         plan_mode,
         created_by,
-        true,
+        plan_mode == "advanced",
         skip_if_exists: true,
         enrichment_proposals: Map.get(planning_result, :enrichment_proposals, [])
       )
@@ -2411,7 +2748,9 @@ defmodule Oli.OpenStax.CourseImport do
          run_plan_schema_version
        ) do
     :ok =
-      rollback_unless_ok(ensure_payload_schema_version(payload, run_plan_schema_version))
+      rollback_unless_ok(
+        ensure_payload_schema_version(payload, run_plan_schema_version, plan_mode)
+      )
 
     normalized =
       normalize_lesson_payload(
@@ -2450,6 +2789,7 @@ defmodule Oli.OpenStax.CourseImport do
             combined_repair_plan(first_results),
             lesson_source_context(locked_lesson)
           )
+          |> Map.put("generation_metadata", normalized["generation_metadata"] || %{})
 
         repaired_version = first_version + 1
         repaired_results = Checks.run(source_context, repaired)
@@ -2479,7 +2819,10 @@ defmodule Oli.OpenStax.CourseImport do
         {first_plan, first_results, 0}
       end
 
-    status = if Checks.passed?(final_results), do: "ready_for_review", else: "needs_attention"
+    status =
+      if Checks.passed?(final_results) and not v5_quality_attention_required?(final_plan),
+        do: "ready_for_review",
+        else: "needs_attention"
 
     updated_lesson =
       locked_lesson
@@ -2508,6 +2851,7 @@ defmodule Oli.OpenStax.CourseImport do
       version: version,
       content_payload: payload["content_payload"],
       questions_payload: payload["questions_payload"],
+      generation_metadata: payload["generation_metadata"] || %{},
       checks_snapshot: checks_snapshot(results),
       created_by: created_by,
       approved_by_user: false
@@ -2529,6 +2873,19 @@ defmodule Oli.OpenStax.CourseImport do
       |> Repo.insert!()
     end)
   end
+
+  defp v5_quality_attention_required?(%LessonPlan{
+         content_payload: %{"schema_version" => 5, "authoring_mode" => "basic"},
+         generation_metadata: metadata
+       }) do
+    quality_gate = get_in(metadata || %{}, ["quality_gate"]) || %{}
+
+    quality_gate["approved"] != true or numeric_confidence(quality_gate["confidence"]) < 0.9 or
+      List.wrap(quality_gate["hard_blockers"]) != [] or
+      List.wrap(quality_gate["repairs"]) != []
+  end
+
+  defp v5_quality_attention_required?(_plan), do: false
 
   defp checks_snapshot(results) do
     %{
@@ -2563,6 +2920,9 @@ defmodule Oli.OpenStax.CourseImport do
     existing_content = if(existing, do: existing.content_payload || %{}, else: %{})
     existing_questions = if(existing, do: existing.questions_payload || %{}, else: %{})
 
+    existing_generation_metadata =
+      if(existing, do: existing.generation_metadata || %{}, else: %{})
+
     incoming_content =
       case payload["content_payload"] || payload[:content_payload] do
         content when is_map(content) -> content
@@ -2594,7 +2954,7 @@ defmodule Oli.OpenStax.CourseImport do
 
     questions =
       incoming_questions
-      |> normalize_questions()
+      |> normalize_questions(if(plan_mode == "basic", do: 10, else: 6))
       |> Enum.with_index(1)
       |> Enum.map(fn {question, index} ->
         question
@@ -2605,24 +2965,28 @@ defmodule Oli.OpenStax.CourseImport do
 
     content =
       content
-      |> enforce_system_schema_version(run_plan_schema_version)
+      |> enforce_system_schema_version(run_plan_schema_version, plan_mode)
       |> strip_untrusted_exclusion_acknowledgements(run_plan_schema_version)
       |> ensure_authoring_blueprint(questions, plan_mode)
 
     %{
       "content_payload" => content,
-      "questions_payload" => %{"items" => questions}
+      "questions_payload" => %{"items" => questions},
+      "generation_metadata" =>
+        payload["generation_metadata"] || payload[:generation_metadata] ||
+          existing_generation_metadata
     }
   end
 
-  defp ensure_payload_schema_version(payload, run_plan_schema_version)
+  defp ensure_payload_schema_version(payload, run_plan_schema_version, plan_mode)
        when is_integer(run_plan_schema_version) and run_plan_schema_version >= 4 do
     incoming = payload["content_payload"] || payload[:content_payload] || payload
+    expected = expected_content_schema_version(run_plan_schema_version, plan_mode)
 
     case incoming do
       %{} = content ->
         case Map.fetch(content, "schema_version") do
-          {:ok, 4} ->
+          {:ok, ^expected} ->
             :ok
 
           {:ok, _other} ->
@@ -2630,7 +2994,7 @@ defmodule Oli.OpenStax.CourseImport do
 
           :error ->
             case Map.fetch(content, :schema_version) do
-              {:ok, 4} -> :ok
+              {:ok, ^expected} -> :ok
               {:ok, _other} -> {:error, :plan_schema_version_immutable}
               :error -> :ok
             end
@@ -2641,13 +3005,24 @@ defmodule Oli.OpenStax.CourseImport do
     end
   end
 
-  defp ensure_payload_schema_version(_payload, _run_plan_schema_version), do: :ok
+  defp ensure_payload_schema_version(_payload, _run_plan_schema_version, _plan_mode), do: :ok
 
-  defp enforce_system_schema_version(content, run_plan_schema_version)
+  defp enforce_system_schema_version(content, run_plan_schema_version, plan_mode)
        when is_integer(run_plan_schema_version) and run_plan_schema_version >= 4,
-       do: Map.put(content, "schema_version", 4)
+       do:
+         Map.put(
+           content,
+           "schema_version",
+           expected_content_schema_version(run_plan_schema_version, plan_mode)
+         )
 
-  defp enforce_system_schema_version(content, _run_plan_schema_version), do: content
+  defp enforce_system_schema_version(content, _run_plan_schema_version, _plan_mode), do: content
+
+  defp expected_content_schema_version(run_plan_schema_version, "basic")
+       when run_plan_schema_version >= 5,
+       do: 5
+
+  defp expected_content_schema_version(_run_plan_schema_version, _plan_mode), do: 4
 
   defp strip_untrusted_exclusion_acknowledgements(content, run_plan_schema_version)
        when is_integer(run_plan_schema_version) and run_plan_schema_version >= 4 do
@@ -2769,13 +3144,13 @@ defmodule Oli.OpenStax.CourseImport do
     end
   end
 
-  defp normalize_questions(%{"items" => items}) when is_list(items),
-    do: normalize_questions(items)
+  defp normalize_questions(%{"items" => items}, limit) when is_list(items),
+    do: normalize_questions(items, limit)
 
-  defp normalize_questions(%{"questions" => items}) when is_list(items),
-    do: normalize_questions(items)
+  defp normalize_questions(%{"questions" => items}, limit) when is_list(items),
+    do: normalize_questions(items, limit)
 
-  defp normalize_questions(items) when is_list(items) do
+  defp normalize_questions(items, limit) when is_list(items) and limit in [6, 10] do
     items
     |> Enum.map(fn
       question when is_binary(question) -> %{"prompt" => String.trim(question)}
@@ -2783,10 +3158,10 @@ defmodule Oli.OpenStax.CourseImport do
       _ -> %{}
     end)
     |> Enum.filter(&(is_binary(&1["prompt"]) and String.trim(&1["prompt"]) != ""))
-    |> Enum.take(6)
+    |> Enum.take(limit)
   end
 
-  defp normalize_questions(_), do: []
+  defp normalize_questions(_, _limit), do: []
 
   defp latest_plan_or_nil(lesson_id) do
     Repo.one(
@@ -4101,7 +4476,8 @@ defmodule Oli.OpenStax.CourseImport do
         planning_started_at: nil,
         planning_last_progress_at: now,
         planning_finished_at: nil,
-        planning_error: nil
+        planning_error: nil,
+        generation_checkpoint: lesson.generation_checkpoint || %{}
       }
     end
   end
@@ -4453,7 +4829,8 @@ defmodule Oli.OpenStax.CourseImport do
             planning_started_at: nil,
             planning_last_progress_at: now,
             planning_finished_at: nil,
-            planning_error: nil
+            planning_error: nil,
+            generation_checkpoint: %{}
           })
           |> Repo.update!()
 
@@ -4485,7 +4862,7 @@ defmodule Oli.OpenStax.CourseImport do
     end
   end
 
-  defp update_lesson_plan_job_failure(args, attempt, category, planning_state) do
+  defp update_lesson_plan_job_failure(args, attempt, category, planning_state, details) do
     with {:ok, job_args} <- normalize_lesson_job_args(args) do
       result =
         Repo.transaction(fn ->
@@ -4511,9 +4888,8 @@ defmodule Oli.OpenStax.CourseImport do
           now = DateTime.utc_now()
           terminal? = planning_state == "failed"
 
-          updated_lesson =
-            lesson
-            |> Lesson.changeset(%{
+          failure_attrs =
+            %{
               planning_state: planning_state,
               planning_attempts: max(lesson.planning_attempts, attempt),
               planning_last_progress_at: now,
@@ -4521,9 +4897,16 @@ defmodule Oli.OpenStax.CourseImport do
               planning_error: %{
                 "category" => Atom.to_string(category),
                 "attempt" => attempt,
-                "retryable" => not terminal?
+                "retryable" => not terminal?,
+                "message" => lesson_planning_failure_message(category),
+                "details" => details
               }
-            })
+            }
+            |> maybe_put_terminal_lesson_attention(terminal?)
+
+          updated_lesson =
+            lesson
+            |> Lesson.changeset(failure_attrs)
             |> Repo.update!()
 
           duration =
@@ -4552,6 +4935,92 @@ defmodule Oli.OpenStax.CourseImport do
       end
     end
   end
+
+  defp lesson_planning_failure_message(:content_validation_exhausted),
+    do: "Generated Basic content did not satisfy the lesson contract after three candidates."
+
+  defp lesson_planning_failure_message(:content_quality_exhausted),
+    do:
+      "The independent content critic did not approve this Basic lesson after three repair rounds."
+
+  defp lesson_planning_failure_message(:content_quality_stalled),
+    do: "Content repair stopped because the independent critic repeated the same findings."
+
+  defp lesson_planning_failure_message(:question_quality_exhausted),
+    do:
+      "The independent question critic did not approve the question set after three repair rounds."
+
+  defp lesson_planning_failure_message(:question_quality_stalled),
+    do: "Question repair stopped because the independent critic repeated the same findings."
+
+  defp lesson_planning_failure_message(:agent_persistence_failed),
+    do: "Question generation could not start with the lesson's author context."
+
+  defp lesson_planning_failure_message(:question_agent_exhausted),
+    do: "Question generation exhausted its bounded review or validation budget."
+
+  defp lesson_planning_failure_message(:source_prompt_limit_exceeded),
+    do: "The retained lesson source is too large for one generation request."
+
+  defp lesson_planning_failure_message(:basic_v5_reimport_required),
+    do:
+      "This legacy Basic run cannot be regenerated. Start a new OpenStax import to use Basic v5."
+
+  defp lesson_planning_failure_message(:basic_v5_source_ast_required),
+    do:
+      "This Basic lesson does not contain the v5 source AST. Start a new OpenStax import instead."
+
+  defp lesson_planning_failure_message(:basic_v5_disabled),
+    do: "Basic v5 generation is not enabled for this project."
+
+  defp lesson_planning_failure_message(:provider_timeout),
+    do: "The content provider timed out; the lesson will be retried automatically."
+
+  defp lesson_planning_failure_message(:rate_limited),
+    do: "The content provider throttled the request; the lesson will be retried automatically."
+
+  defp lesson_planning_failure_message(:provider_unavailable),
+    do:
+      "The content provider is temporarily unavailable; the lesson will be retried automatically."
+
+  defp lesson_planning_failure_message(:database_unavailable),
+    do: "The database was temporarily unavailable; the lesson will be retried automatically."
+
+  defp lesson_planning_failure_message(:provider_unauthorized),
+    do: "The content provider rejected the configured credentials."
+
+  defp lesson_planning_failure_message(:provider_forbidden),
+    do: "The content provider denied this generation request."
+
+  defp lesson_planning_failure_message(:provider_request_rejected),
+    do: "The content provider rejected the generation request."
+
+  defp lesson_planning_failure_message(:provider_not_configured),
+    do: "The content provider is not configured for this environment."
+
+  defp lesson_planning_failure_message(:provider_configuration_error),
+    do: "The content provider configuration is invalid."
+
+  defp lesson_planning_failure_message(:unclassified_generation_failure),
+    do:
+      "Lesson generation returned an unexpected result and was stopped without automatic retries."
+
+  defp lesson_planning_failure_message(:lesson_plan_persistence_failed),
+    do: "The generated lesson could not be saved and needs attention."
+
+  defp lesson_planning_failure_message(:plan_schema_version_mismatch),
+    do: "The generated lesson did not match this import's plan schema version."
+
+  defp lesson_planning_failure_message(:internal_exception),
+    do: "Lesson generation encountered an unexpected internal error and needs attention."
+
+  defp lesson_planning_failure_message(_category),
+    do: "The lesson could not be generated and needs attention."
+
+  defp maybe_put_terminal_lesson_attention(attrs, true),
+    do: Map.put(attrs, :status, "needs_attention")
+
+  defp maybe_put_terminal_lesson_attention(attrs, false), do: attrs
 
   defp authorized_run(run_id, author) do
     with {:ok, run} <- get_owned_run(run_id, author),
@@ -4669,9 +5138,10 @@ defmodule Oli.OpenStax.CourseImport do
   end
 
   defp ensure_feature_available(project) do
-    if ScopedFeatureFlags.enabled?(:openstax_course_import, project),
-      do: :ok,
-      else: {:error, :feature_disabled}
+    if test_conveniences_enabled?() or
+         ScopedFeatureFlags.enabled?(:openstax_course_import, project),
+       do: :ok,
+       else: {:error, :feature_disabled}
   rescue
     _ -> {:error, :feature_disabled}
   end
@@ -4719,10 +5189,6 @@ defmodule Oli.OpenStax.CourseImport do
     Enum.reduce(chapters, 0, &(&2 + length(&1["sections"] || [])))
   end
 
-  defp failure_message(_phase, {:source_scope_too_large, count, limit}) do
-    "This OpenStax book exposes #{count} course sections, which exceeds the importer limit of #{limit}. Use a smaller book or split the source before starting a course import."
-  end
-
   defp failure_message(phase, reason) do
     "The #{phase} stage failed: #{inspect(reason)}"
   end
@@ -4739,7 +5205,6 @@ defmodule Oli.OpenStax.CourseImport do
   defp recoverable_failure?(:validation, _reason), do: false
   defp recoverable_failure?("validation", _reason), do: false
   defp recoverable_failure?(_phase, :invalid_openstax_url), do: false
-  defp recoverable_failure?(_phase, {:source_scope_too_large, _, _}), do: false
   defp recoverable_failure?(_phase, _reason), do: true
 
   defp stringify_keys(map) when is_map(map) do

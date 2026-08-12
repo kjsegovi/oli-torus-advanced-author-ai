@@ -153,6 +153,48 @@ defmodule Oli.OpenStax.CourseImport.MediaIngestorTest do
     assert media.failure_reason["reason"] =~ "untrusted_or_excessive_redirect"
   end
 
+  test "tries trusted alternate source URLs before declaring an asset unavailable", %{run: run} do
+    canonical_url = "https://openstax.org/assets/missing-diagram.png"
+    alternate_url = "https://assets.openstax.org/figures/available-diagram.png"
+    png = png_bytes("alternate")
+
+    asset = persist_asset(run.id, canonical_url, "image/png")
+
+    asset
+    |> SourceAsset.changeset(%{
+      metadata: %{
+        "semantic_payload" => %{
+          "alternate_source_urls" => [alternate_url]
+        }
+      }
+    })
+    |> Repo.update!()
+
+    HTTPClient.reset(%{
+      canonical_url =>
+        {:ok, %{status_code: 404, headers: [{"content-type", "text/plain"}], body: ""}},
+      alternate_url =>
+        {:ok,
+         %{
+           status_code: 200,
+           headers: [{"content-type", "image/png"}],
+           body: png
+         }}
+    })
+
+    assert {:ok, %MediaIngestor.Result{staged: 1, skipped: 0}} =
+             MediaIngestor.stage_run(run.id,
+               http_client: HTTPClient,
+               media_library: MediaLibraryStub
+             )
+
+    assert Enum.map(HTTPClient.calls(), &elem(&1, 0)) == [canonical_url, alternate_url]
+
+    media = Repo.one!(from(media in Media, where: media.run_id == ^run.id))
+    assert media.status == "staged"
+    assert media.final_source_url == alternate_url
+  end
+
   test "skips MIME signature mismatches and oversized responses before upload", %{run: run} do
     source_url = "https://assets.openstax.org/figures/not-a-png.png"
     invalid_png = "GIF89a-not-really-a-png"

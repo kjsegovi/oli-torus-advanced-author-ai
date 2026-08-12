@@ -264,9 +264,12 @@ defmodule Oli.GenAI.Execution do
 
   defp release_admission!(%{admission: :bypass}), do: :ok
 
-  defp release_admission!(%{pool_name: pool_name, selected_model: %{id: model_id}}) do
+  defp release_admission!(%{pool_name: pool_name, selected_model: %{id: model_id}} = plan) do
     AdmissionControl.release_pool(pool_name)
-    AdmissionControl.release_model(model_id)
+
+    if Map.get(plan, :model_admitted, false) do
+      AdmissionControl.release_model(model_id)
+    end
   end
 
   defp release_admission!(_), do: :ok

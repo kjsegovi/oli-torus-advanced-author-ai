@@ -118,7 +118,7 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
        when is_map(content) do
     case Keyword.get(opts, :plan_schema_version) do
       version when is_integer(version) and version >= 4 ->
-        if content["schema_version"] == 4 do
+        if content["schema_version"] == expected_content_schema_version(version, plan_mode) do
           inject_v4_enrichments(content, run_id, lesson_id, plan_mode, opts)
         else
           {:error, :plan_schema_version_mismatch}
@@ -131,6 +131,12 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
 
   defp inject_approved_enrichments(content, _run_id, _lesson_id, _plan_mode, _opts),
     do: {:ok, content}
+
+  defp expected_content_schema_version(run_plan_schema_version, "basic")
+       when run_plan_schema_version >= 5,
+       do: 5
+
+  defp expected_content_schema_version(_run_plan_schema_version, _plan_mode), do: 4
 
   defp inject_v4_enrichments(content, run_id, lesson_id, plan_mode, opts) do
     proposals =

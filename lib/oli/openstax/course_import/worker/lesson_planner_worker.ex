@@ -94,9 +94,9 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlannerWorker do
   def backoff(%Oban.Job{attempt: attempt}), do: trunc(:math.pow(2, attempt) * 10)
 
   @impl Oban.Worker
-  # A full 120-section source can produce roughly 60 lesson plans. Keeping the
-  # work in one resumable job preserves deterministic ordering and lets retries
-  # skip persisted lessons, while this explicit budget accommodates configured
+  # A full book can produce many lesson plans. Keeping serial planning in one
+  # resumable job preserves deterministic ordering and lets retries skip
+  # persisted lessons, while this explicit budget accommodates configured
   # provider receive timeouts for a book-scale run.
   def timeout(_job), do: :timer.hours(4)
 end

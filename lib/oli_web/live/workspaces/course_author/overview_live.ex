@@ -16,6 +16,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OverviewLive do
   alias Oli.Resources.Collaboration
   alias Oli.ScopedFeatureFlags
   alias Oli.GoogleSlides.Credentials
+  alias Oli.OpenStax.CourseImport
   alias OliWeb.Common.Utils
   alias OliWeb.Components.{Common, Modal, Overview}
   alias OliWeb.Components.Project.{AdvancedActivityItem, AsyncExporter}
@@ -576,6 +577,11 @@ defmodule OliWeb.Workspaces.CourseAuthor.OverviewLive do
             source={@project}
             current_author={@ctx.author}
             title="Project Features"
+            forced_enabled_features={
+              if CourseImport.test_conveniences_enabled?(),
+                do: [:openstax_course_import],
+                else: []
+            }
           />
         </Overview.section>
       <% end %>

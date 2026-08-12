@@ -40,19 +40,15 @@ runtime_env =
       end
   end
 
-openstax_rich_content_v3_default =
-  if runtime_env in [:dev, :test], do: "true", else: "false"
+openstax_basic_pages_v5_default =
+  if runtime_env == :dev, do: "true", else: "false"
 
 config :oli,
-       :openstax_rich_content_v3_enabled,
+       :openstax_basic_pages_v5_enabled,
        get_env_as_boolean.(
-         "OPENSTAX_RICH_CONTENT_V3_ENABLED",
-         openstax_rich_content_v3_default
+         "OPENSTAX_BASIC_PAGES_V5_ENABLED",
+         openstax_basic_pages_v5_default
        )
-
-config :oli,
-       :openstax_refined_planning_v4_enabled,
-       get_env_as_boolean.("OPENSTAX_REFINED_PLANNING_V4_ENABLED", "false")
 
 config :oli,
        :openstax_generated_enrichment_enabled,

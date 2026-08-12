@@ -1,7 +1,7 @@
 defmodule Oli.GenAI.Agent.LLMBridgeTest do
   use ExUnit.Case, async: true
   alias Oli.GenAI.Agent.{LLMBridge, Decision, ToolBroker}
-  alias Oli.GenAI.Completions.{ServiceConfig, RegisteredModel}
+  alias Oli.GenAI.Completions.{Message, OpenAICompliantProvider, RegisteredModel, ServiceConfig}
   import Mox
 
   setup :verify_on_exit!
@@ -103,6 +103,69 @@ defmodule Oli.GenAI.Agent.LLMBridgeTest do
 
       # Would need to mock Oli.GenAI.Completions.generate/3
       # assert {:ok, response} = LLMBridge.call_provider(model, messages, opts)
+    end
+  end
+
+  describe "tool result history" do
+    test "encodes a tool observation as a matched assistant tool call and tool response" do
+      call_id = "call_123"
+
+      provider_output = [
+        %{"id" => "rs_123", "type" => "reasoning", "summary" => []},
+        %{
+          "id" => "fc_123",
+          "type" => "function_call",
+          "call_id" => call_id,
+          "name" => "review_openstax_questions",
+          "arguments" => ~s({"questions_payload":{"items":[]}})
+        }
+      ]
+
+      [message] =
+        LLMBridge.convert_messages_to_completion_format([
+          %{
+            role: :tool,
+            name: "review_openstax_questions",
+            tool_call_id: call_id,
+            tool_arguments: %{"questions_payload" => %{"items" => []}},
+            provider_output: provider_output,
+            content: ~s({"valid":true})
+          }
+        ])
+
+      assert %Message{
+               role: :function,
+               id: ^call_id,
+               name: "review_openstax_questions",
+               input: %{"questions_payload" => %{"items" => []}},
+               provider_output: ^provider_output
+             } = message
+
+      assert [assistant_call, tool_response] =
+               OpenAICompliantProvider.encode_messages([message])
+
+      assert get_in(assistant_call, [:tool_calls, Access.at(0), :id]) == call_id
+
+      assert get_in(assistant_call, [:tool_calls, Access.at(0), :function, :name]) ==
+               "review_openstax_questions"
+
+      assert tool_response == %{
+               role: "tool",
+               tool_call_id: call_id,
+               content: ~s({"valid":true})
+             }
+    end
+
+    test "uses routing metadata when a provider returns plain text without usage" do
+      assert LLMBridge.usage_metadata(
+               ~s({"action":"done"}),
+               %{provider: :open_ai, model: "gpt-test"}
+             ) == %{
+               input_tokens: 0,
+               output_tokens: 0,
+               provider: :open_ai,
+               model: "gpt-test"
+             }
     end
   end
 
@@ -299,6 +362,14 @@ defmodule Oli.GenAI.Agent.LLMBridgeTest do
       assert {:ok, decision} = Decision.from_completion(response)
       assert decision.next_action == "done"
       assert decision.rationale_summary == "Task completed successfully"
+    end
+
+    test "parses provider text content without requiring a response envelope" do
+      assert {:ok, decision} =
+               Decision.from_completion(~s({"action":"done","rationale":"protocol accepted"}))
+
+      assert decision.next_action == "done"
+      assert decision.rationale_summary == "protocol accepted"
     end
   end
 end

@@ -2,19 +2,21 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   @moduledoc """
   Generates a reviewable OpenStax lesson through the configured GenAI route.
 
-  Deterministic planning is used only when this feature has no configured
-  service. Provider and response failures remain errors so the durable job can
-  retry them instead of silently replacing AI output.
+  Current Basic imports require the content provider and governed question
+  agent. Legacy payloads retain their prior deterministic compatibility path.
+  Provider failures remain errors so the durable job can retry them. Advanced
+  response-contract failures use the existing deterministic Advanced builder
+  with explicit fallback metadata; Basic v5 always fails closed.
   """
 
   alias Oli.GenAI.Completions.{Message, RegisteredModel, ServiceConfig}
   alias Oli.GenAI.Execution
   alias Oli.GenAI.FeatureConfig
-  alias Oli.OpenStax.CourseImport.{FullSource, Planner}
+  alias Oli.OpenStax.CourseImport.{BasicPipelineV5, FullSource, Planner}
 
   @feature :openstax_course_import
   @default_openai_url "https://api.openai.com"
-  @default_openai_model "gpt-4o-mini"
+  @default_openai_model "gpt-5.6-luna"
   @default_openai_timeout 8_000
   @default_openai_receive_timeout 120_000
   @max_instructional_sections 7
@@ -39,6 +41,48 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
         normalized_plan_schema_version(Keyword.get(opts, :plan_schema_version, 3))
       )
 
+    recommended_mode = Planner.authoring_mode_recommendation(lesson, index)["mode"]
+
+    basic_v5_enabled? =
+      Keyword.get(
+        opts,
+        :basic_v5_enabled,
+        Application.get_env(:oli, :openstax_basic_pages_v5_enabled, false)
+      )
+
+    case {recommended_mode, basic_v5_enabled?, lesson["__plan_schema_version"],
+          source_blocks(lesson)} do
+      {"basic", false, _plan_schema_version, _source_blocks} ->
+        {:error, {:basic_v5_disabled, :feature_not_enabled}}
+
+      {"basic", true, plan_schema_version, _source_blocks}
+      when plan_schema_version < 5 ->
+        {:error, {:basic_v5_required, :start_a_new_import}}
+
+      {"basic", true, _plan_schema_version, []} ->
+        {:error, {:basic_v5_source_ast_required, :start_a_new_import}}
+
+      {"basic", true, _plan_schema_version, _source_blocks} ->
+        plan_configured_basic_v5(lesson, index, opts)
+
+      {"advanced", _basic_v5_enabled, _plan_schema_version, _source_blocks} ->
+        plan_advanced(lesson, index, opts)
+    end
+  end
+
+  def plan(_, _, _), do: {:error, :invalid_lesson}
+
+  defp plan_configured_basic_v5(lesson, index, opts) do
+    case service_config(opts) do
+      {:ok, service_config} ->
+        plan_basic_v5(lesson, index, service_config, opts)
+
+      {:error, reason} ->
+        {:error, {:ai_configuration_failed, {:basic_question_agent_unavailable, reason}}}
+    end
+  end
+
+  defp plan_advanced(lesson, index, opts) do
     case service_config(opts) do
       {:error, {:missing_feature_config, _message}} ->
         {:ok, deterministic_result(lesson, index, opts)}
@@ -47,17 +91,15 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
         {:ok, deterministic_result(lesson, index, opts)}
 
       {:ok, service_config} ->
-        with {:ok, %{content: content, metadata: metadata}} <-
-               call_execution(lesson, index, service_config, opts),
-             {:ok, plan_mode, payload} <- parse_response(content, lesson, index, opts) do
-          {:ok,
-           maybe_downgrade_plan_schema(
-             planning_result(plan_mode, payload, "ai", metadata, opts),
-             opts
-           )}
-        else
-          {:error, reason} -> {:error, {:ai_planning_failed, reason}}
-          other -> {:error, {:ai_planning_failed, {:invalid_execution_response, other}}}
+        case call_execution(lesson, index, service_config, opts) do
+          {:ok, %{content: content, metadata: metadata}} ->
+            plan_advanced_response(content, metadata, lesson, index, opts)
+
+          {:error, reason} ->
+            {:error, {:ai_planning_failed, reason}}
+
+          other ->
+            {:error, {:ai_planning_failed, {:invalid_execution_response, other}}}
         end
 
       {:error, reason} ->
@@ -65,7 +107,38 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
     end
   end
 
-  def plan(_, _, _), do: {:error, :invalid_lesson}
+  defp plan_advanced_response(content, metadata, lesson, index, opts) do
+    case parse_response(content, lesson, index, opts) do
+      {:ok, plan_mode, payload} ->
+        {:ok,
+         maybe_downgrade_plan_schema(
+           planning_result(plan_mode, payload, "ai", metadata, opts),
+           opts
+         )}
+
+      {:error, reason} ->
+        {:ok, deterministic_advanced_fallback(lesson, index, opts, reason)}
+    end
+  end
+
+  defp plan_basic_v5(lesson, index, service_config, opts) do
+    services = v5_services(service_config, opts)
+
+    with {:ok, result} <- BasicPipelineV5.plan(lesson, index, services, opts) do
+      payload = %{
+        "content_payload" => result.content_payload,
+        "questions_payload" => result.questions_payload
+      }
+
+      {:ok,
+       maybe_downgrade_plan_schema(
+         planning_result("basic", payload, "ai", result.metadata, opts),
+         opts
+       )}
+    else
+      {:error, reason} -> {:error, {:ai_planning_failed, reason}}
+    end
+  end
 
   defp deterministic_result(lesson, index, opts) do
     {plan_mode, payload} = Planner.build_lesson_plan(lesson, index, opts)
@@ -74,6 +147,19 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
       planning_result(plan_mode, payload, "system", %{strategy: :deterministic}, opts),
       opts
     )
+  end
+
+  defp deterministic_advanced_fallback(lesson, index, opts, reason) do
+    result = deterministic_result(lesson, index, opts)
+
+    %{
+      result
+      | metadata: %{
+          strategy: :deterministic,
+          fallback_from: :invalid_ai_response_contract,
+          fallback_reason: reason
+        }
+    }
   end
 
   defp planning_result(plan_mode, payload, created_by, metadata, opts) do
@@ -99,6 +185,9 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
 
   defp maybe_downgrade_plan_schema(result, opts) do
     case Keyword.get(opts, :plan_schema_version, 3) do
+      version when version >= 5 and result.plan_mode == "basic" ->
+        put_in(result, [:payload, "content_payload", "schema_version"], 5)
+
       version when version >= 4 ->
         put_in(result, [:payload, "content_payload", "schema_version"], 4)
 
@@ -113,6 +202,55 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
 
         put_in(result, [:payload, "content_payload"], content)
     end
+  end
+
+  defp v5_services(%ServiceConfig{} = base, opts) do
+    env_getter = Keyword.get(opts, :env_getter, &System.get_env/1)
+
+    %{
+      architect:
+        role_service_config(
+          base,
+          "content-architect",
+          env_getter.("OPENSTAX_CONTENT_ARCHITECT_MODEL") || "gpt-5.6-terra"
+        ),
+      critic:
+        role_service_config(
+          base,
+          "content-critic",
+          env_getter.("OPENSTAX_CONTENT_CRITIC_MODEL") || "gpt-5.6-sol"
+        ),
+      question_writer:
+        role_service_config(
+          base,
+          "question-writer",
+          env_getter.("OPENSTAX_QUESTION_WRITER_MODEL") || "gpt-5.6-terra"
+        ),
+      question_critic:
+        role_service_config(
+          base,
+          "question-critic",
+          env_getter.("OPENSTAX_QUESTION_CRITIC_MODEL") || "gpt-5.6-sol"
+        )
+    }
+  end
+
+  defp role_service_config(%ServiceConfig{} = service_config, role, model_name) do
+    primary_model = service_config.primary_model
+
+    role_model = %{
+      primary_model
+      | name: "openstax-v5-#{role}",
+        model: model_name
+    }
+
+    %{
+      service_config
+      | name: "openstax-v5-#{role}",
+        primary_model: role_model,
+        secondary_model: nil,
+        backup_model: nil
+    }
   end
 
   defp service_config(opts) do
@@ -2023,6 +2161,10 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   end
 
   defp normalize_string_list(_, _limit), do: []
+
+  defp normalized_plan_schema_version(version)
+       when is_integer(version) and version >= 5,
+       do: 5
 
   defp normalized_plan_schema_version(version)
        when is_integer(version) and version >= 4,

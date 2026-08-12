@@ -5,6 +5,7 @@ defmodule Oli.OpenStax.CourseImport.ParallelLessonPlanningTest do
   alias Oli.OpenStax.CourseImport
 
   alias Oli.OpenStax.CourseImport.{
+    BasicPlanV5,
     Lesson,
     LessonPlan,
     LessonSource,
@@ -41,6 +42,11 @@ defmodule Oli.OpenStax.CourseImport.ParallelLessonPlanningTest do
         author,
         "https://openstax.org/details/books/parallel-planning"
       )
+
+    run =
+      run
+      |> Run.update_changeset(%{source_schema_version: 2, plan_schema_version: 3})
+      |> Repo.update!()
 
     run = advance_to_outline_review(run)
     lessons = insert_lessons(run, 5)
@@ -224,6 +230,21 @@ defmodule Oli.OpenStax.CourseImport.ParallelLessonPlanningTest do
     assert {:ok, failed_run} = CourseImport.fetch_run(run.id)
     assert failed_run.status == :failed
 
+    failed_checkpoint = %{
+      "stage" => "question_repair_pending",
+      "payload" => %{
+        "next_attempt" => 4,
+        "question_reviews" => [%{"approved" => false}]
+      }
+    }
+
+    checkpoint_lesson =
+      run.id
+      |> ordered_lessons()
+      |> Enum.find(&(&1.planning_state == "failed"))
+      |> Ecto.Changeset.change(generation_checkpoint: failed_checkpoint)
+      |> Repo.update!()
+
     assert {:ok, retried} = CourseImport.retry_run(run.id, author)
     assert retried.status == :planning_lessons
     assert retried.lesson_planning_generation == generation + 1
@@ -248,6 +269,8 @@ defmodule Oli.OpenStax.CourseImport.ParallelLessonPlanningTest do
 
     assert Enum.all?(retrying, &(&1.planning_state == "queued"))
     assert length(child_jobs(run.id, retry_generation)) == 3
+
+    assert Repo.get!(Lesson, checkpoint_lesson.id).generation_checkpoint == failed_checkpoint
   end
 
   test "health recovery detects one orphan while sibling jobs remain active", %{
@@ -468,10 +491,11 @@ defmodule Oli.OpenStax.CourseImport.ParallelLessonPlanningTest do
     assert claim.source["source_excerpt"] =~ "Evidence and observations"
   end
 
-  test "transient provider errors retry while authentication errors fail permanently", %{
-    author: author,
-    run: run
-  } do
+  test "provider receive timeouts and 5xx errors retry while authentication errors fail permanently",
+       %{
+         author: author,
+         run: run
+       } do
     previous_planner =
       Application.get_env(:oli, :openstax_course_import_lesson_planner)
 
@@ -479,7 +503,7 @@ defmodule Oli.OpenStax.CourseImport.ParallelLessonPlanningTest do
 
     run.id
     |> ordered_lessons()
-    |> Enum.take(2)
+    |> Enum.take(3)
     |> Enum.each(&insert_normalized_source!(run, &1, &1.order))
 
     Application.put_env(
@@ -487,8 +511,9 @@ defmodule Oli.OpenStax.CourseImport.ParallelLessonPlanningTest do
       :openstax_course_import_lesson_planner,
       fn _source, position, _opts ->
         case position do
-          1 -> {:error, {:ai_planning_failed, :timeout}}
+          1 -> {:error, {:ai_planning_failed, :recv_timeout}}
           2 -> {:error, {:ai_planning_failed, %{status: 401}}}
+          3 -> {:error, {:ai_planning_failed, %{status_code: 503}}}
         end
       end
     )
@@ -504,6 +529,7 @@ defmodule Oli.OpenStax.CourseImport.ParallelLessonPlanningTest do
 
     transient_job = job_for_position!(run.id, generation, 1)
     permanent_job = job_for_position!(run.id, generation, 2)
+    unavailable_job = job_for_position!(run.id, generation, 3)
 
     assert {:error, :provider_timeout} =
              LessonPlanWorker.perform(%{
@@ -521,14 +547,351 @@ defmodule Oli.OpenStax.CourseImport.ParallelLessonPlanningTest do
                  state: "executing"
              })
 
+    assert {:error, :provider_unavailable} =
+             LessonPlanWorker.perform(%{
+               unavailable_job
+               | attempt: 1,
+                 max_attempts: 4,
+                 state: "executing"
+             })
+
     transient = Repo.get!(Lesson, transient_job.args["lesson_id"])
     permanent = Repo.get!(Lesson, permanent_job.args["lesson_id"])
+    unavailable = Repo.get!(Lesson, unavailable_job.args["lesson_id"])
 
     assert transient.planning_state == "retrying"
     assert transient.planning_error["retryable"]
+    assert transient.planning_error["message"] =~ "timed out"
+    refute transient.status == "needs_attention"
     assert permanent.planning_state == "failed"
+    assert permanent.status == "needs_attention"
     refute permanent.planning_error["retryable"]
+    assert unavailable.planning_state == "retrying"
+    assert unavailable.planning_error["retryable"]
     assert lesson_plan_count(run.id) == 0
+  end
+
+  test "known transient provider failures stop after two total job attempts", %{
+    author: author,
+    run: run
+  } do
+    previous_planner = Application.get_env(:oli, :openstax_course_import_lesson_planner)
+    on_exit(fn -> restore_lesson_planner(previous_planner) end)
+
+    [first_lesson | _] = ordered_lessons(run.id)
+    insert_normalized_source!(run, first_lesson, first_lesson.order)
+
+    Application.put_env(
+      :oli,
+      :openstax_course_import_lesson_planner,
+      fn _source, _position, _opts ->
+        {:error, {:ai_planning_failed, :recv_timeout}}
+      end
+    )
+
+    assert {:ok, planning} = CourseImport.approve_outline(run.id, author)
+    generation = planning.lesson_planning_generation
+
+    assert :ok =
+             perform_job(LessonPlanningCoordinatorWorker, %{
+               "run_id" => run.id,
+               "generation" => generation
+             })
+
+    job = job_for_position!(run.id, generation, 1)
+
+    assert {:error, :provider_timeout} =
+             LessonPlanWorker.perform(%{
+               job
+               | attempt: 1,
+                 max_attempts: 4,
+                 state: "executing"
+             })
+
+    assert {:discard, :provider_timeout} =
+             LessonPlanWorker.perform(%{
+               job
+               | attempt: 2,
+                 max_attempts: 4,
+                 state: "executing"
+             })
+
+    failed = Repo.get!(Lesson, job.args["lesson_id"])
+    assert failed.planning_state == "failed"
+    assert failed.planning_attempts == 2
+    refute failed.planning_error["retryable"]
+  end
+
+  test "invalid Advanced blueprints receive one bounded provider retry", %{
+    author: author,
+    run: run
+  } do
+    previous_planner = Application.get_env(:oli, :openstax_course_import_lesson_planner)
+    on_exit(fn -> restore_lesson_planner(previous_planner) end)
+
+    [first_lesson | _] = ordered_lessons(run.id)
+    insert_normalized_source!(run, first_lesson, first_lesson.order)
+
+    Application.put_env(
+      :oli,
+      :openstax_course_import_lesson_planner,
+      fn _source, _position, _opts ->
+        {:error, {:ai_planning_failed, :invalid_advanced_blueprint}}
+      end
+    )
+
+    assert {:ok, planning} = CourseImport.approve_outline(run.id, author)
+    generation = planning.lesson_planning_generation
+
+    assert :ok =
+             perform_job(LessonPlanningCoordinatorWorker, %{
+               "run_id" => run.id,
+               "generation" => generation
+             })
+
+    job = job_for_position!(run.id, generation, 1)
+
+    assert {:error, :invalid_provider_response} =
+             LessonPlanWorker.perform(%{
+               job
+               | attempt: 1,
+                 max_attempts: 4,
+                 state: "executing"
+             })
+
+    assert {:discard, :invalid_provider_response} =
+             LessonPlanWorker.perform(%{
+               job
+               | attempt: 2,
+                 max_attempts: 4,
+                 state: "executing"
+             })
+  end
+
+  @tag capture_log: true
+  test "unknown generation failures stop after one attempt without persisting raw details", %{
+    author: author,
+    run: run
+  } do
+    previous_planner = Application.get_env(:oli, :openstax_course_import_lesson_planner)
+    on_exit(fn -> restore_lesson_planner(previous_planner) end)
+
+    [first_lesson | _] = ordered_lessons(run.id)
+    insert_normalized_source!(run, first_lesson, first_lesson.order)
+
+    Application.put_env(
+      :oli,
+      :openstax_course_import_lesson_planner,
+      fn _source, _position, _opts ->
+        {:error,
+         {:ai_planning_failed,
+          {:unexpected_pipeline_result, "rejected response must not be persisted"}}}
+      end
+    )
+
+    assert {:ok, planning} = CourseImport.approve_outline(run.id, author)
+    generation = planning.lesson_planning_generation
+
+    assert :ok =
+             perform_job(LessonPlanningCoordinatorWorker, %{
+               "run_id" => run.id,
+               "generation" => generation
+             })
+
+    job = job_for_position!(run.id, generation, 1)
+
+    assert {:discard, :unclassified_generation_failure} =
+             LessonPlanWorker.perform(%{
+               job
+               | attempt: 1,
+                 max_attempts: 4,
+                 state: "executing"
+             })
+
+    failed = Repo.get!(Lesson, job.args["lesson_id"])
+    assert failed.planning_state == "failed"
+    assert failed.planning_attempts == 1
+    refute failed.planning_error["retryable"]
+    assert failed.planning_error["details"]["phase"] == "provider_or_response"
+
+    assert failed.planning_error["details"]["reason_code"] ==
+             "unexpected_pipeline_result"
+
+    refute inspect(failed.planning_error) =~ "rejected response"
+  end
+
+  @tag capture_log: true
+  test "post-generation completion failures do not rerun the lesson generator", %{
+    author: author,
+    run: run
+  } do
+    previous_planner = Application.get_env(:oli, :openstax_course_import_lesson_planner)
+    on_exit(fn -> restore_lesson_planner(previous_planner) end)
+    test_pid = self()
+
+    [first_lesson | _] = ordered_lessons(run.id)
+    insert_normalized_source!(run, first_lesson, first_lesson.order)
+
+    Application.put_env(
+      :oli,
+      :openstax_course_import_lesson_planner,
+      fn source, position, _opts ->
+        send(test_pid, :lesson_generator_called)
+        {_mode, payload} = Planner.build_lesson_plan(source, position)
+        {:ok, %{plan_mode: "unsupported", payload: payload, created_by: "ai"}}
+      end
+    )
+
+    assert {:ok, planning} = CourseImport.approve_outline(run.id, author)
+    generation = planning.lesson_planning_generation
+
+    assert :ok =
+             perform_job(LessonPlanningCoordinatorWorker, %{
+               "run_id" => run.id,
+               "generation" => generation
+             })
+
+    job = job_for_position!(run.id, generation, 1)
+
+    assert {:discard, :lesson_plan_persistence_failed} =
+             LessonPlanWorker.perform(%{
+               job
+               | attempt: 1,
+                 max_attempts: 4,
+                 state: "executing"
+             })
+
+    assert_received :lesson_generator_called
+    refute_received :lesson_generator_called
+
+    failed = Repo.get!(Lesson, job.args["lesson_id"])
+    assert failed.planning_state == "failed"
+    assert failed.planning_attempts == 1
+    refute failed.planning_error["retryable"]
+
+    assert failed.planning_error["details"] == %{
+             "phase" => "lesson_plan_persistence",
+             "reason_code" => "invalid_plan_mode"
+           }
+  end
+
+  test "question-agent HTTP 400 fails once with sanitized provider details", %{
+    author: author,
+    run: run
+  } do
+    previous_planner = Application.get_env(:oli, :openstax_course_import_lesson_planner)
+    on_exit(fn -> restore_lesson_planner(previous_planner) end)
+
+    [first_lesson | _] = ordered_lessons(run.id)
+    insert_normalized_source!(run, first_lesson, first_lesson.order)
+
+    Application.put_env(
+      :oli,
+      :openstax_course_import_lesson_planner,
+      fn _source, _position, _opts ->
+        {:error,
+         {:ai_planning_failed,
+          {:provider_failure,
+           %{
+             "category" => "request_rejected",
+             "status_code" => 400,
+             "provider_error_type" => "invalid_request_error",
+             "provider_error_param" => "messages.[3].role",
+             "body" => "do-not-persist"
+           }}}}
+      end
+    )
+
+    assert {:ok, planning} = CourseImport.approve_outline(run.id, author)
+    generation = planning.lesson_planning_generation
+
+    assert :ok =
+             perform_job(LessonPlanningCoordinatorWorker, %{
+               "run_id" => run.id,
+               "generation" => generation
+             })
+
+    job = job_for_position!(run.id, generation, 1)
+
+    assert {:discard, :provider_request_rejected} =
+             LessonPlanWorker.perform(%{
+               job
+               | attempt: 1,
+                 max_attempts: 4,
+                 state: "executing"
+             })
+
+    failed = Repo.get!(Lesson, job.args["lesson_id"])
+    assert failed.planning_state == "failed"
+    assert failed.planning_attempts == 1
+    refute failed.planning_error["retryable"]
+
+    assert failed.planning_error["details"] == %{
+             "phase" => "question_agent_provider",
+             "category" => "request_rejected",
+             "status_code" => 400,
+             "provider_error_type" => "invalid_request_error",
+             "provider_error_param" => "messages.[3].role"
+           }
+
+    refute inspect(failed.planning_error) =~ "do-not-persist"
+  end
+
+  test "Basic content validation exhaustion fails once with sanitized findings", %{
+    author: author,
+    run: run
+  } do
+    previous_planner = Application.get_env(:oli, :openstax_course_import_lesson_planner)
+    on_exit(fn -> restore_lesson_planner(previous_planner) end)
+
+    [first_lesson | _] = ordered_lessons(run.id)
+    insert_normalized_source!(run, first_lesson, first_lesson.order)
+
+    Application.put_env(
+      :oli,
+      :openstax_course_import_lesson_planner,
+      fn _source, _position, _opts ->
+        {:error,
+         {:ai_planning_failed,
+          {:content_validation_exhausted,
+           %{
+             attempts: 3,
+             findings: [
+               %{
+                 "code" => "invalid_instructional_sections",
+                 "path" => "$.content_payload.instructional_sections",
+                 "message" => "do not persist rejected source text secret-source"
+               }
+             ]
+           }}}}
+      end
+    )
+
+    assert {:ok, planning} = CourseImport.approve_outline(run.id, author)
+    generation = planning.lesson_planning_generation
+
+    assert :ok =
+             perform_job(LessonPlanningCoordinatorWorker, %{
+               "run_id" => run.id,
+               "generation" => generation
+             })
+
+    job = job_for_position!(run.id, generation, 1)
+
+    assert {:discard, :content_validation_exhausted} =
+             LessonPlanWorker.perform(%{job | attempt: 1, max_attempts: 4, state: "executing"})
+
+    failed = Repo.get!(Lesson, job.args["lesson_id"])
+    assert failed.planning_state == "failed"
+    assert failed.planning_attempts == 1
+    refute failed.planning_error["retryable"]
+    assert failed.planning_error["details"]["validation_attempts"] == 3
+
+    assert failed.planning_error["details"]["finding_codes"] == [
+             "invalid_instructional_sections"
+           ]
+
+    refute inspect(failed.planning_error) =~ "secret-source"
   end
 
   test "out-of-order completions refill one slot and the last child transitions once", %{
@@ -585,6 +948,98 @@ defmodule Oli.OpenStax.CourseImport.ParallelLessonPlanningTest do
              ),
              :count
            ) == 1
+  end
+
+  test "a valid v5 plan with unresolved semantic repairs completes into author attention", %{
+    author: author,
+    run: run
+  } do
+    run =
+      run
+      |> Run.update_changeset(%{source_schema_version: 3, plan_schema_version: 5})
+      |> Repo.update!()
+
+    [first_lesson | _] = ordered_lessons(run.id)
+    insert_normalized_source!(run, first_lesson, first_lesson.order)
+
+    assert {:ok, planning} = CourseImport.approve_outline(run.id, author)
+    generation = planning.lesson_planning_generation
+
+    assert :ok =
+             perform_job(LessonPlanningCoordinatorWorker, %{
+               "run_id" => run.id,
+               "generation" => generation
+             })
+
+    job = job_for_position!(run.id, generation, 1)
+    assert {:ok, claim} = CourseImport.claim_lesson_plan_job(job.args, 1, job.id)
+
+    source_ids = Enum.map(claim.source["source_blocks"], & &1["id"])
+
+    candidate = %{
+      "title" => claim.source["title"],
+      "orientation" => %{"overview" => "Review the source evidence."},
+      "content_groups" => [
+        %{
+          "id" => "source-evidence",
+          "title" => "Evidence and reasoning",
+          "instructional_purpose" => "evidence",
+          "source_block_ids" => source_ids
+        }
+      ],
+      "question_slots" => [],
+      "synthesis" => %{
+        "summary" => "Connect the source evidence to the lesson model.",
+        "takeaways" => ["Evidence supports the lesson model."]
+      }
+    }
+
+    assert {:ok, content} = BasicPlanV5.build(candidate, claim.source, 1)
+
+    repair = %{
+      "severity" => "repair",
+      "code" => "feedback_consistency",
+      "path" => "$.questions_payload",
+      "message" => "Regenerate the question feedback before approval."
+    }
+
+    result = %{
+      plan_mode: "basic",
+      payload: %{
+        "content_payload" => content,
+        "questions_payload" => %{"items" => []}
+      },
+      created_by: "ai",
+      metadata: %{
+        "pipeline" => "openstax_basic_v5",
+        "quality_gate" => %{
+          "approved" => false,
+          "confidence" => 0.96,
+          "hard_blockers" => [],
+          "repairs" => [repair],
+          "advisories" => [],
+          "outcome" => "needs_attention"
+        }
+      }
+    }
+
+    assert {:ok, lesson, still_planning} =
+             CourseImport.complete_lesson_plan_job(job.args, result)
+
+    assert still_planning.status == :planning_lessons
+    assert lesson.planning_state == "completed"
+    assert lesson.status == "needs_attention"
+    assert lesson.last_plan_version == 1
+
+    plan = Repo.get_by!(LessonPlan, lesson_id: lesson.id, version: 1)
+    assert plan.checks_snapshot["status"] == "failed"
+
+    assert Enum.any?(plan.checks_snapshot["results"], fn check ->
+             check["check_type"] == "pedagogy_assessment" and check["status"] == "failed"
+           end)
+
+    refute plan.generation_metadata["quality_gate"]["approved"]
+    assert plan.generation_metadata["quality_gate"]["repairs"] == [repair]
   end
 
   test "three lesson workers can execute the planner concurrently", %{

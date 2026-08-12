@@ -14,6 +14,9 @@ defmodule Oli.GenAI.Agent.Schema.Run do
              :context_summary,
              :budgets,
              :model,
+             :terminal_status,
+             :terminal_reason,
+             :metadata,
              :cost_cents,
              :tokens_in,
              :tokens_out,
@@ -22,6 +25,7 @@ defmodule Oli.GenAI.Agent.Schema.Run do
            ]}
   schema "agent_runs" do
     field :user_id, :id
+    field :author_id, :id
     field :project_id, :id
     field :section_id, :id
     field :goal, :string
@@ -31,6 +35,9 @@ defmodule Oli.GenAI.Agent.Schema.Run do
     field :context_summary, :string
     field :budgets, :map
     field :model, :string
+    field :terminal_status, :string
+    field :terminal_reason, :string
+    field :metadata, :map, default: %{}
     field :cost_cents, :integer, default: 0
     field :tokens_in, :integer, default: 0
     field :tokens_out, :integer, default: 0
@@ -43,6 +50,10 @@ defmodule Oli.GenAI.Agent.Schema.Run do
     run
     |> cast(attrs, __schema__(:fields))
     |> validate_required([:goal, :run_type, :status])
+    |> foreign_key_constraint(:user_id)
+    |> foreign_key_constraint(:author_id)
+    |> foreign_key_constraint(:project_id)
+    |> foreign_key_constraint(:section_id)
   end
 end
 

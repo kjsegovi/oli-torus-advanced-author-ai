@@ -124,20 +124,21 @@ defmodule Oli.GenAI.Router do
     end
   end
 
-  defp build_plan(request_type, selected, tier, pool_name, reason, admission) do
+  defp build_plan(request_type, selected, tier, pool_name, reason, admission, model_admitted) do
     %RoutingPlan{
       selected_model: selected,
       tier: tier,
       fallback_models: [],
       reason: reason,
       admission: admission,
+      model_admitted: model_admitted,
       request_type: request_type,
       pool_name: pool_name
     }
   end
 
-  defp build_plan(request_type, selected, tier, pool_name, reason) do
-    build_plan(request_type, selected, tier, pool_name, reason, :admit)
+  defp build_plan(request_type, selected, tier, pool_name, reason, admission) do
+    build_plan(request_type, selected, tier, pool_name, reason, admission, false)
   end
 
   defp attempt_primary_only(nil, _request_type), do: {:error, :primary_unavailable}
@@ -176,9 +177,12 @@ defmodule Oli.GenAI.Router do
 
   defp admit_model_if_enabled(model) do
     if model_limit_enabled?(model) do
-      admit_model(model)
+      case admit_model(model) do
+        :ok -> {:ok, true}
+        {:error, _reason} = error -> error
+      end
     else
-      :ok
+      {:ok, false}
     end
   end
 
@@ -229,8 +233,17 @@ defmodule Oli.GenAI.Router do
     case AdmissionControl.try_admit_pool(pool_name, pool_limit) do
       :ok ->
         case admit_model_if_enabled(model) do
-          :ok ->
-            {:ok, build_plan(request_type, model, tier, pool_name, reason)}
+          {:ok, model_admitted} ->
+            {:ok,
+             build_plan(
+               request_type,
+               model,
+               tier,
+               pool_name,
+               reason,
+               :admit,
+               model_admitted
+             )}
 
           {:error, :over_capacity} ->
             AdmissionControl.release_pool(pool_name)

@@ -9,6 +9,7 @@ defmodule Oli.GenAI.RoutingPlan do
     :fallback_models,
     :reason,
     :admission,
+    :model_admitted,
     :request_type,
     :pool_name
   ]

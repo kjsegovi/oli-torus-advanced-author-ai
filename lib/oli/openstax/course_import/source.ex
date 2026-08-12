@@ -1,22 +1,21 @@
 defmodule Oli.OpenStax.CourseImport.Source do
   @moduledoc """
-  Bounded OpenStax source discovery and ingestion.
+  OpenStax source discovery and ingestion.
 
   Only canonical pages belonging to the submitted book are retained. Network
   calls have explicit connect/receive timeouts and response-size ceilings.
   """
 
-  alias Oli.OpenStax.CourseImport.Parser
+  alias Oli.OpenStax.CourseImport.{Parser, SourceAST}
 
   @max_response_bytes 2_000_000
-  @max_sections 120
   @connect_timeout 5_000
   @receive_timeout 15_000
   @fetch_concurrency 8
   @max_fetch_concurrency 12
   # Discovery runs in a short-lived preflight job. A book landing page can
-  # expose every section URL (up to @max_sections), so probing each URL one at
-  # a time would exceed the job budget when OpenStax is slow or unavailable.
+  # expose every section URL, so probing each URL one at a time would exceed
+  # the job budget when OpenStax is slow or unavailable.
   # Keep this fallback deliberately small and parallel; the landing-page links
   # are still sufficient for the non-preloaded-state discovery path.
   @discovery_candidate_limit 12
@@ -45,14 +44,13 @@ defmodule Oli.OpenStax.CourseImport.Source do
                extract_tree_links(book, book_slug),
                first_links ++ extract_links_from_optional_body(expanded_body, book_slug)
              ),
-           :ok <- ensure_source_scope_within_limit(links),
            chapters when chapters != [] <- group_chapters(links, book_slug) do
         {:ok,
          %{
            "book_slug" => book_slug,
            "source_url" => source_url,
            "title" => preloaded_book_title(book) || page_title(document, book_slug),
-           "license" => attribution(book_slug, source_url),
+           "license" => attribution(book_slug, source_url, expanded_body),
            "chapters" => chapters,
            "discovered_at" => DateTime.to_iso8601(DateTime.utc_now())
          }}
@@ -375,6 +373,7 @@ defmodule Oli.OpenStax.CourseImport.Source do
           semantic_block("objectives", attributes, path, %{
             "text" => node_text(node),
             "items" => objective_items(node),
+            "ast" => SourceAST.blocks(node, url),
             "blocks" => semantic_nodes(children, url, path)
           })
         ]
@@ -383,6 +382,7 @@ defmodule Oli.OpenStax.CourseImport.Source do
         [
           semantic_block("footnotes", attributes, path, %{
             "text" => node_text(node),
+            "ast" => SourceAST.blocks(node, url),
             "blocks" => semantic_nodes(children, url, path)
           })
         ]
@@ -394,12 +394,16 @@ defmodule Oli.OpenStax.CourseImport.Source do
             "callout_type" => callout_type(attributes),
             "title" => first_text(node, "h2, h3"),
             "subtitle" => first_text(node, "h4"),
+            "ast" => SourceAST.blocks(node, url),
             "blocks" => semantic_nodes(children, url, path)
           })
         ]
 
       exercise_node?(attributes) ->
-        [exercise_block(node, attributes, path)]
+        [exercise_block(node, attributes, url, path)]
+
+      SourceAST.equation?(tag, attributes) ->
+        [equation_block(node, attributes, url, path)]
 
       figure_node?(tag, attributes) ->
         [figure_block(node, attributes, url, path)]
@@ -410,12 +414,16 @@ defmodule Oli.OpenStax.CourseImport.Source do
           node,
           attributes,
           path,
-          %{"level" => String.to_integer(String.trim_leading(tag, "h"))}
+          %{
+            "level" => String.to_integer(String.trim_leading(tag, "h")),
+            "ast" => SourceAST.blocks(node, url)
+          }
         )
 
       tag == "p" ->
         maybe_text_block("paragraph", node, attributes, path, %{
-          "media" => extract_media(node, url)
+          "media" => extract_media(node, url),
+          "ast" => SourceAST.blocks(node, url)
         })
 
       tag in ~w(ul ol) ->
@@ -423,17 +431,22 @@ defmodule Oli.OpenStax.CourseImport.Source do
 
       tag == "pre" ->
         maybe_text_block("code", node, attributes, path, %{
-          "language" => code_language(node)
+          "language" => code_language(node),
+          "ast" => SourceAST.blocks(node, url)
         })
 
       tag == "table" ->
-        [table_block(node, attributes, path)]
+        [table_block(node, attributes, url, path)]
 
       tag == "blockquote" ->
-        maybe_text_block("quote", node, attributes, path, %{})
+        maybe_text_block("quote", node, attributes, path, %{
+          "ast" => SourceAST.blocks(node, url)
+        })
 
       tag == "figcaption" ->
-        maybe_text_block("caption", node, attributes, path, %{})
+        maybe_text_block("caption", node, attributes, path, %{
+          "ast" => SourceAST.blocks(node, url)
+        })
 
       tag in ~w(img picture video audio) ->
         [media_block(node, attributes, url, path)]
@@ -517,6 +530,7 @@ defmodule Oli.OpenStax.CourseImport.Source do
 
   defp exercise_node?(attributes) do
     attribute(attributes, "data-type") in [
+      "example",
       "exercise",
       "injected-exercise",
       "practice",
@@ -524,7 +538,7 @@ defmodule Oli.OpenStax.CourseImport.Source do
     ] or class_member?(attributes, "os-exercise")
   end
 
-  defp exercise_block(node, attributes, path) do
+  defp exercise_block(node, attributes, url, path) do
     problem =
       first_text(
         node,
@@ -539,13 +553,16 @@ defmodule Oli.OpenStax.CourseImport.Source do
 
     title = first_text(node, "[data-type='title'], h3, h4")
 
+    text = node_text(node)
+
     semantic_block("exercise", attributes, path, %{
       "exercise_type" => attribute(attributes, "data-type") || "exercise",
       "title" => title,
       "problem" => problem,
       "solution" => solution,
+      "ast" => SourceAST.blocks(node, url),
       "text" =>
-        [title, problem, solution]
+        [title, problem, solution, text]
         |> Enum.reject(&(&1 in [nil, ""]))
         |> Enum.uniq()
         |> Enum.join(" ")
@@ -570,6 +587,7 @@ defmodule Oli.OpenStax.CourseImport.Source do
       "caption" => caption,
       "credit" => figure_credit(node, caption),
       "license" => all_text(node, "[data-type='license'], .os-license"),
+      "ast" => SourceAST.blocks(node, url),
       "media" => media
     })
   end
@@ -608,6 +626,7 @@ defmodule Oli.OpenStax.CourseImport.Source do
         |> Enum.map(& &1["alt"])
         |> Enum.reject(&(&1 in [nil, ""]))
         |> Enum.join(" "),
+      "ast" => SourceAST.blocks(node, url),
       "media" => media
     })
   end
@@ -628,6 +647,8 @@ defmodule Oli.OpenStax.CourseImport.Source do
   defp media_descriptor({tag, attributes, _children} = node, url) do
     src =
       attribute(attributes, "src") ||
+        attribute(attributes, "data-src") ||
+        attribute(attributes, "data-original") ||
         node
         |> Floki.find("source[src]")
         |> List.first()
@@ -639,10 +660,29 @@ defmodule Oli.OpenStax.CourseImport.Source do
             nil
         end
 
+    resolved_src = resolve_media_url(src, url)
+
+    alternate_source_urls =
+      [attribute(attributes, "data-src"), attribute(attributes, "data-original")] ++
+        srcset_urls(attribute(attributes, "srcset")) ++
+        (node
+         |> Floki.find("source[src], source[srcset]")
+         |> Enum.flat_map(fn {_tag, source_attributes, _children} ->
+           [attribute(source_attributes, "src")] ++
+             srcset_urls(attribute(source_attributes, "srcset"))
+         end))
+
+    alternate_source_urls =
+      alternate_source_urls
+      |> Enum.map(&resolve_media_url(&1, url))
+      |> Enum.reject(&(&1 in [nil, resolved_src]))
+      |> Enum.uniq()
+
     descriptor =
       %{
         "kind" => tag,
-        "src" => resolve_media_url(src, url),
+        "src" => resolved_src,
+        "alternate_source_urls" => alternate_source_urls,
         "alt" => attribute(attributes, "alt"),
         "title" => attribute(attributes, "title"),
         "width" => attribute(attributes, "width"),
@@ -657,6 +697,20 @@ defmodule Oli.OpenStax.CourseImport.Source do
   end
 
   defp media_descriptor(_, _url), do: nil
+
+  defp srcset_urls(srcset) when is_binary(srcset) do
+    srcset
+    |> String.split(",", trim: true)
+    |> Enum.map(fn candidate ->
+      candidate
+      |> String.trim()
+      |> String.split(~r/\s+/, parts: 2)
+      |> List.first()
+    end)
+    |> Enum.reject(&(&1 in [nil, ""]))
+  end
+
+  defp srcset_urls(_srcset), do: []
 
   defp resolve_media_url(nil, _page_url), do: nil
 
@@ -688,6 +742,7 @@ defmodule Oli.OpenStax.CourseImport.Source do
     semantic_block("list", attributes, path, %{
       "ordered" => tag == "ol",
       "text" => Enum.map_join(items, " ", &Map.get(&1, "text", "")),
+      "ast" => SourceAST.blocks({tag, attributes, children}, url),
       "items" => items
     })
   end
@@ -706,7 +761,7 @@ defmodule Oli.OpenStax.CourseImport.Source do
     |> compact_map()
   end
 
-  defp table_block(node, attributes, path) do
+  defp table_block(node, attributes, url, path) do
     rows =
       node
       |> Floki.find("tr")
@@ -719,7 +774,20 @@ defmodule Oli.OpenStax.CourseImport.Source do
 
     semantic_block("table", attributes, path, %{
       "text" => node_text(node),
+      "ast" => SourceAST.blocks(node, url),
       "rows" => rows
+    })
+  end
+
+  defp equation_block(node, attributes, url, path) do
+    %{"src" => source, "subtype" => subtype} = SourceAST.equation_payload(node)
+
+    semantic_block("equation", attributes, path, %{
+      "text" => source,
+      "latex" => if(subtype == "latex", do: source),
+      "mathml" => if(subtype == "mathml", do: source),
+      "subtype" => subtype,
+      "ast" => SourceAST.blocks(node, url)
     })
   end
 
@@ -1173,66 +1241,62 @@ defmodule Oli.OpenStax.CourseImport.Source do
         instructional ++ assessment
       end)
 
-    if length(work_items) > @max_sections do
-      {:error, {:source_scope_too_large, length(work_items), @max_sections}}
-    else
-      with {:ok, sections} <- ingest_sections(work_items, book_slug, opts) do
-        instructional_by_chapter =
-          sections
-          |> Enum.filter(&(&1.source_role == :instructional))
-          |> Enum.group_by(& &1.chapter_index)
-          |> Map.new(fn {chapter_index, values} ->
-            ordered_sections =
-              values
-              |> Enum.sort_by(& &1.section_index)
-              |> Enum.map(& &1.section)
+    with {:ok, sections} <- ingest_sections(work_items, book_slug, opts) do
+      instructional_by_chapter =
+        sections
+        |> Enum.filter(&(&1.source_role == :instructional))
+        |> Enum.group_by(& &1.chapter_index)
+        |> Map.new(fn {chapter_index, values} ->
+          ordered_sections =
+            values
+            |> Enum.sort_by(& &1.section_index)
+            |> Enum.map(& &1.section)
 
-            {chapter_index, ordered_sections}
-          end)
+          {chapter_index, ordered_sections}
+        end)
 
-        assessment_by_chapter =
-          sections
-          |> Enum.filter(&(&1.source_role == :assessment))
-          |> Enum.group_by(& &1.chapter_index)
-          |> Map.new(fn {chapter_index, values} ->
-            assessment_sources =
-              values
-              |> Enum.sort_by(& &1.section_index)
-              |> Enum.map(& &1.section)
+      assessment_by_chapter =
+        sections
+        |> Enum.filter(&(&1.source_role == :assessment))
+        |> Enum.group_by(& &1.chapter_index)
+        |> Map.new(fn {chapter_index, values} ->
+          assessment_sources =
+            values
+            |> Enum.sort_by(& &1.section_index)
+            |> Enum.map(& &1.section)
 
-            {chapter_index, assessment_sources}
-          end)
+          {chapter_index, assessment_sources}
+        end)
 
-        ingested =
-          chapters
-          |> Enum.with_index()
-          |> Enum.map(fn {chapter, chapter_index} ->
-            instructional_sections = Map.get(instructional_by_chapter, chapter_index, [])
+      ingested =
+        chapters
+        |> Enum.with_index()
+        |> Enum.map(fn {chapter, chapter_index} ->
+          instructional_sections = Map.get(instructional_by_chapter, chapter_index, [])
 
-            assessment_sections =
-              assessment_by_chapter
-              |> Map.get(chapter_index, [])
-              |> Enum.with_index(1)
-              |> Enum.map(fn {section, index} ->
-                section
-                |> Map.put("source_kind", "conceptual_questions")
-                |> Map.put("order", length(instructional_sections) + index)
-              end)
+          assessment_sections =
+            assessment_by_chapter
+            |> Map.get(chapter_index, [])
+            |> Enum.with_index(1)
+            |> Enum.map(fn {section, index} ->
+              section
+              |> Map.put("source_kind", "conceptual_questions")
+              |> Map.put("order", length(instructional_sections) + index)
+            end)
 
-            chapter
-            # Assessment pages share the normalized source-section storage
-            # path, but remain explicitly marked and are removed by Parser
-            # before lesson grouping.
-            |> Map.put("sections", instructional_sections ++ assessment_sections)
-            |> Map.put(
-              "assessment_sources",
-              Enum.map(assessment_sections, &assessment_source_metadata/1)
-            )
-            |> Map.put("selected", true)
-          end)
+          chapter
+          # Assessment pages share the normalized source-section storage
+          # path, but remain explicitly marked and are removed by Parser
+          # before lesson grouping.
+          |> Map.put("sections", instructional_sections ++ assessment_sections)
+          |> Map.put(
+            "assessment_sources",
+            Enum.map(assessment_sections, &assessment_source_metadata/1)
+          )
+          |> Map.put("selected", true)
+        end)
 
-        {:ok, ingested}
-      end
+      {:ok, ingested}
     end
   end
 
@@ -1625,11 +1689,6 @@ defmodule Oli.OpenStax.CourseImport.Source do
     |> Enum.sort_by(& &1["url"])
   end
 
-  defp ensure_source_scope_within_limit(links) when length(links) <= @max_sections, do: :ok
-
-  defp ensure_source_scope_within_limit(links),
-    do: {:error, {:source_scope_too_large, length(links), @max_sections}}
-
   defp extract_preloaded_book(nil, _book_slug), do: nil
 
   defp extract_preloaded_book(body, book_slug) when is_binary(body) do
@@ -1963,13 +2022,33 @@ defmodule Oli.OpenStax.CourseImport.Source do
     |> Enum.map_join(" ", &String.capitalize/1)
   end
 
-  defp attribution(book_slug, source_url) do
+  defp attribution(book_slug, source_url, source_body) do
+    {license, license_type, license_url} = detected_license(source_body)
+
     %{
-      "license_type" => "cc_by_nc_sa",
-      "license_url" => "https://creativecommons.org/licenses/by-nc-sa/4.0/",
+      "license" => license,
+      "license_type" => license_type,
+      "license_url" => license_url,
       "provider" => "OpenStax",
       "source_url" => source_url,
       "book_slug" => book_slug
     }
   end
+
+  defp detected_license(source_body) when is_binary(source_body) do
+    normalized = String.downcase(source_body)
+
+    if String.contains?(normalized, [
+         "creativecommons.org/licenses/by-nc-sa/4.0",
+         "cc by-nc-sa 4.0",
+         "cc by nc-sa 4.0"
+       ]) do
+      {"CC BY-NC-SA 4.0", "cc_by_nc_sa", "https://creativecommons.org/licenses/by-nc-sa/4.0/"}
+    else
+      {"CC BY 4.0", "cc_by", "https://creativecommons.org/licenses/by/4.0/"}
+    end
+  end
+
+  defp detected_license(_source_body),
+    do: {"CC BY 4.0", "cc_by", "https://creativecommons.org/licenses/by/4.0/"}
 end

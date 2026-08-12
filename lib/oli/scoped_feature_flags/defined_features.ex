@@ -67,16 +67,9 @@ defmodule Oli.ScopedFeatureFlags.DefinedFeatures do
   )
 
   deffeature(
-    :openstax_rich_content_v3,
+    :openstax_basic_pages_v5,
     [:authoring],
-    "Enable block-level OpenStax ingestion, LessonPlanV3, and staged source media",
-    rollout_mode: :canary
-  )
-
-  deffeature(
-    :openstax_refined_planning_v4,
-    [:authoring],
-    "Enable full-source OpenStax planning and refined Basic and Advanced lesson flows",
+    "Enable source-faithful, independently reviewed OpenStax Basic page generation",
     rollout_mode: :canary
   )
 
