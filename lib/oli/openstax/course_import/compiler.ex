@@ -19,7 +19,8 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
       |> put_run_plan_schema_version(run)
       |> put_preloaded_enrichments(run)
 
-    with false <- Enum.empty?(units),
+    with :ok <- require_current_run_schema(run),
+         false <- Enum.empty?(units),
          {:ok, compiled_units} <- compile_units(units, opts) do
       {:ok,
        %{
@@ -36,17 +37,22 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
 
   def dry_run(_, _), do: {:error, :invalid_run}
 
+  defp require_current_run_schema(%{plan_schema_version: 6}), do: :ok
+
+  defp require_current_run_schema(%{plan_schema_version: version}),
+    do: {:error, {:unsupported_openstax_plan_schema, version}}
+
+  defp require_current_run_schema(_run), do: {:error, :missing_openstax_plan_schema}
+
   defp compile_units(units, opts) do
     units
     |> Enum.sort_by(& &1.order)
     |> Enum.reduce_while({:ok, []}, fn unit, {:ok, acc} ->
       with true <- unit.selected,
-           {:ok, lessons} <- compile_lessons(unit.lessons, opts),
-           {:ok, assessment} <- compile_assessment(unit, opts) do
+           {:ok, lessons} <- compile_lessons(unit.lessons, opts) do
         compiled = %{
           "unit_id" => unit.id,
           "title" => unit.unit_name,
-          "assessment" => assessment,
           "lessons" => lessons
         }
 
@@ -116,29 +122,25 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
 
   defp inject_approved_enrichments(content, run_id, lesson_id, plan_mode, opts)
        when is_map(content) do
-    case Keyword.get(opts, :plan_schema_version) do
-      version when is_integer(version) and version >= 4 ->
-        if content["schema_version"] == expected_content_schema_version(version, plan_mode) do
-          inject_v4_enrichments(content, run_id, lesson_id, plan_mode, opts)
-        else
-          {:error, :plan_schema_version_mismatch}
-        end
+    case {Keyword.get(opts, :plan_schema_version), plan_mode, content["schema_version"]} do
+      {6, "basic", 5} ->
+        inject_current_enrichments(content, run_id, lesson_id, plan_mode, opts)
 
-      _legacy ->
-        {:ok, content}
+      {6, "advanced", 6} ->
+        inject_current_enrichments(content, run_id, lesson_id, plan_mode, opts)
+
+      {6, _mode, _content_schema} ->
+        {:error, :plan_schema_version_mismatch}
+
+      {version, _mode, _content_schema} ->
+        {:error, {:unsupported_openstax_plan_schema, version}}
     end
   end
 
   defp inject_approved_enrichments(content, _run_id, _lesson_id, _plan_mode, _opts),
     do: {:ok, content}
 
-  defp expected_content_schema_version(run_plan_schema_version, "basic")
-       when run_plan_schema_version >= 5,
-       do: 5
-
-  defp expected_content_schema_version(_run_plan_schema_version, _plan_mode), do: 4
-
-  defp inject_v4_enrichments(content, run_id, lesson_id, plan_mode, opts) do
+  defp inject_current_enrichments(content, run_id, lesson_id, plan_mode, opts) do
     proposals =
       proposals_for_lesson(opts, run_id, lesson_id)
       |> Enum.filter(&(&1.state == "approved"))
@@ -155,8 +157,24 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
           {:error, :generated_enrichment_requires_advanced_authoring}
 
         true ->
-          inject_generated_proposals(content, generated)
+          inject_generated_proposals_v6(content, generated)
       end
+    end
+  end
+
+  defp inject_generated_proposals_v6(content, proposals) do
+    approved_ids = MapSet.new(proposals, & &1.id)
+    references = get_in(content, ["experience_blueprint", "enrichment_references"]) |> List.wrap()
+
+    cond do
+      references == [] ->
+        {:error, :approved_simulation_has_no_declared_v6_slot}
+
+      Enum.any?(references, &(not MapSet.member?(approved_ids, &1["proposal_id"]))) ->
+        {:error, :unapproved_v6_enrichment_reference}
+
+      true ->
+        {:ok, content}
     end
   end
 
@@ -205,31 +223,6 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
     case Keyword.fetch(opts, :enrichment_proposals_by_lesson) do
       {:ok, by_lesson} when is_map(by_lesson) -> Map.get(by_lesson, lesson_id, [])
       _ -> Enrichment.list_proposals(run_id, lesson_id)
-    end
-  end
-
-  defp inject_generated_proposals(content, proposals) do
-    screens = get_in(content, ["advanced_blueprint", "screens"]) |> List.wrap()
-
-    proposals
-    |> Enum.reduce_while({:ok, screens, MapSet.new()}, fn proposal, {:ok, current, occupied} ->
-      placement = proposal.placement["after_section_id"] || proposal.placement[:after_section_id]
-
-      with {:ok, index} <- enrichment_screen_index(current, placement, occupied) do
-        updated =
-          List.update_at(current, index, &Map.put(&1, "enrichment_proposal_id", proposal.id))
-
-        {:cont, {:ok, updated, MapSet.put(occupied, index)}}
-      else
-        {:error, reason} -> {:halt, {:error, reason}}
-      end
-    end)
-    |> case do
-      {:ok, injected, _occupied} ->
-        {:ok, put_in(content, ["advanced_blueprint", "screens"], injected)}
-
-      {:error, reason} ->
-        {:error, reason}
     end
   end
 
@@ -286,80 +279,7 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
 
   defp safe_curated_url(_), do: {:error, :unsafe_curated_resource_url}
 
-  defp enrichment_screen_index(screens, placement, occupied) do
-    preferred_roles = ~w(evidence exploration interpretation transfer)
-
-    candidates =
-      screens
-      |> Enum.with_index()
-      |> Enum.filter(fn {screen, index} ->
-        not MapSet.member?(occupied, index) and
-          screen["placement_after_section_id"] == placement
-      end)
-
-    selected =
-      Enum.find(candidates, fn {screen, _index} -> screen["role"] in preferred_roles end) ||
-        List.first(candidates)
-
-    case selected do
-      {_screen, index} -> {:ok, index}
-      nil -> {:error, {:approved_enrichment_placement_invalid, placement}}
-    end
-  end
-
   defp strip_enrichment_references(content) do
-    content
-    |> Map.delete("curated_enrichments")
-    |> update_in(
-      [Access.key("advanced_blueprint", %{}), Access.key("screens", [])],
-      fn screens ->
-        Enum.map(List.wrap(screens), fn
-          screen when is_map(screen) -> Map.delete(screen, "enrichment_proposal_id")
-          screen -> screen
-        end)
-      end
-    )
-  end
-
-  defp compile_assessment(unit, opts) do
-    assessment = unit.assessment_payload || %{}
-    title = assessment["title"] || "#{unit.unit_name} assessment"
-    mode = assessment["authoring_mode"] || "basic"
-    questions = assessment["questions"] || []
-
-    content = %{
-      "title" => title,
-      "objective" => "Demonstrate mastery of #{unit.unit_name}",
-      "learning_objectives" => ["Demonstrate mastery of #{unit.unit_name}"],
-      "narrative" => "Complete this unit assessment after reviewing the lessons.",
-      "source_evidence_links" => assessment["source_evidence_links"] || [],
-      "authoring_mode" => mode
-    }
-
-    with true <- questions != [],
-         {:ok, artifact} <-
-           AuthoringCompiler.compile(
-             mode,
-             title,
-             content,
-             %{"items" => questions},
-             "#{unit.id}:assessment",
-             opts
-           ) do
-      {:ok,
-       Map.merge(
-         %{
-           "title" => title,
-           "mode" => mode,
-           "questions_payload" => %{"items" => questions},
-           "content_payload" => content,
-           "source_evidence_links" => assessment["source_evidence_links"] || []
-         },
-         artifact
-       )}
-    else
-      false -> {:error, :missing_unit_assessment}
-      {:error, reason} -> {:error, {:unit_assessment_invalid, reason}}
-    end
+    Map.delete(content, "curated_enrichments")
   end
 end

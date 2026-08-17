@@ -309,47 +309,11 @@ defmodule Oli.OpenStax.CourseImport.RichSourceTest do
              run
              |> Run.update_changeset(%{
                status: :planning_outline,
-               source_schema_version: 2,
+               source_schema_version: 3,
                preflight_snapshot: compact,
                scope_manifest: %{"selected_chapter_ids" => ["chapter-1"]}
              })
              |> Repo.update()
-
-    assert :ok = perform_job(OutlineWorker, %{"run_id" => run.id})
-    assert {:ok, resumed} = CourseImport.fetch_run(run.id)
-    assert resumed.status == :awaiting_outline_approval
-  end
-
-  test "legacy schema versions retain the full snapshot and resume without rich tables", %{
-    run: run
-  } do
-    run
-    |> Run.update_changeset(%{
-      status: :ingesting,
-      source_schema_version: 1,
-      plan_schema_version: 2
-    })
-    |> Repo.update!()
-
-    assert {:ok, persisted} =
-             CourseImport.persist_ingested_snapshot(run.id, source_snapshot())
-
-    assert persisted.source_schema_version == 1
-    assert persisted.plan_schema_version == 2
-
-    assert get_in(
-             persisted.preflight_snapshot,
-             ["chapters", Access.at(0), "sections", Access.at(0), "content_blocks"]
-           ) != nil
-
-    assert Repo.aggregate(
-             from(block in SourceBlock, where: block.run_id == ^run.id),
-             :count
-           ) == 0
-
-    persisted
-    |> Run.update_changeset(%{status: :planning_outline})
-    |> Repo.update!()
 
     assert :ok = perform_job(OutlineWorker, %{"run_id" => run.id})
     assert {:ok, resumed} = CourseImport.fetch_run(run.id)

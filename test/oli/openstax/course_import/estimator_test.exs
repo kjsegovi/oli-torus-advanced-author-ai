@@ -135,21 +135,6 @@ defmodule Oli.OpenStax.CourseImport.EstimatorTest do
     assert estimate["upper_seconds"] == 360
   end
 
-  test "keeps serial estimates for legacy runs" do
-    run = %Run{
-      status: :awaiting_outline_approval,
-      lesson_planning_strategy: :serial_v1,
-      lesson_planning_parallelism: 1,
-      units: [unit_with_lessons(3)]
-    }
-
-    estimate = Estimator.estimate(run, now: @now)
-
-    assert estimate["parallelism"] == 1
-    assert estimate["lower_seconds"] == 3 * 45
-    assert estimate["upper_seconds"] == 3 * 240
-  end
-
   test "forecasts lesson generation before outline approval without counting review time" do
     run = %Run{
       status: :awaiting_outline_approval,
@@ -223,7 +208,7 @@ defmodule Oli.OpenStax.CourseImport.EstimatorTest do
     refute Estimator.estimate(run, now: @now)["stalled"]
   end
 
-  test "uses outline approval as the legacy lesson-planning start" do
+  test "infers the current lesson-planning start from outline approval" do
     run = %Run{
       status: :planning_lessons,
       outline_approved_at: DateTime.add(@now, -600, :second),

@@ -144,30 +144,28 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
 
   defp safe_provider_failure(result) do
     result.metadata[:provider_failure] || result.metadata["provider_failure"] ||
-      legacy_provider_failure(result.reason)
+      provider_failure_from_reason(result.reason)
   end
 
-  defp legacy_provider_failure(reason) when is_binary(reason) do
+  defp provider_failure_from_reason(reason) when is_binary(reason) do
     case Regex.run(~r/(?:status_code|status):\s*(\d{3})/, reason, capture: :all_but_first) do
-      [status] -> %{"status_code" => String.to_integer(status), "category" => "legacy"}
+      [status] -> %{"status_code" => String.to_integer(status), "category" => "parsed_reason"}
       _ -> %{"category" => "unknown"}
     end
   end
 
-  defp legacy_provider_failure(_reason), do: %{"category" => "unknown"}
+  defp provider_failure_from_reason(_reason), do: %{"category" => "unknown"}
 
   defp candidate_context(lesson, content_payload, opts) do
-    sections =
+    content_groups =
       content_payload
-      |> Map.get("instructional_sections", [])
-      |> Enum.map(fn section ->
-        Map.take(section, [
+      |> Map.get("content_groups", [])
+      |> Enum.map(fn group ->
+        Map.take(group, [
           "id",
           "title",
-          "heading",
-          "explanation",
-          "examples",
-          "evidence_block_ids"
+          "instructional_purpose",
+          "source_block_ids"
         ])
       end)
 
@@ -180,10 +178,8 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
     Jason.encode!(%{
       "title" => content_payload["title"] || lesson["title"],
       "objective_catalog" => QuestionAgentValidator.objective_catalog(content_payload),
-      "instructional_sections" => sections,
-      "worked_examples" => content_payload["worked_examples"],
-      "application_problems" => content_payload["application_problems"],
-      "key_takeaways" => content_payload["key_takeaways"],
+      "content_groups" => content_groups,
+      "synthesis" => content_payload["synthesis"],
       "question_slots" =>
         Keyword.get(opts, :question_slots, content_payload["question_slots"] || []),
       "approved_prior_objective_ledger" => Keyword.get(opts, :objective_ledger, []),
@@ -226,7 +222,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
     Short-answer items must be reflection or application prompts and include concise
     answer_guidance plus answer_keywords. Copy objective_catalog[].id exactly into each
     question's objective_ids. Never put objective text, evidence IDs, or block IDs in
-    objective_ids. Use only supplied section, objective, media, and evidence identifiers.
+    objective_ids. Use only supplied content-group, objective, media, and evidence identifiers.
     For short answers, answer_keywords are a compact author-review aid, not a complete
     semantic rubric and not an exhaustive synonym list. Put every substantive acceptance
     criterion and relationship in the prompt and answer_guidance. Presentation suggestions

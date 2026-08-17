@@ -40,14 +40,14 @@ runtime_env =
       end
   end
 
-openstax_basic_pages_v5_default =
+openstax_advanced_pages_v6_default =
   if runtime_env == :dev, do: "true", else: "false"
 
 config :oli,
-       :openstax_basic_pages_v5_enabled,
+       :openstax_advanced_pages_v6_enabled,
        get_env_as_boolean.(
-         "OPENSTAX_BASIC_PAGES_V5_ENABLED",
-         openstax_basic_pages_v5_default
+         "OPENSTAX_ADVANCED_PAGES_V6_ENABLED",
+         openstax_advanced_pages_v6_default
        )
 
 config :oli,

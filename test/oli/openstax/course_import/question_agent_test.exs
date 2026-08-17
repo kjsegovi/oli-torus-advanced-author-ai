@@ -345,20 +345,25 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
     }
 
     content = %{
+      "schema_version" => 5,
+      "authoring_mode" => "basic",
       "title" => "Computation models",
       "learning_objectives" => ["Compare algorithms under one computation model"],
-      "instructional_sections" => [
+      "content_groups" => [
         %{
           "id" => "section-models",
-          "heading" => "Use one comparison model",
-          "explanation" =>
-            "A fair comparison holds operation and cost assumptions constant so differences come from the algorithms rather than from changing the model.",
-          "evidence_block_ids" => ["block-models"]
+          "title" => "Use one comparison model",
+          "instructional_purpose" => "evidence",
+          "source_block_ids" => ["block-models"]
         }
       ],
-      "worked_examples" => [],
-      "application_problems" => [],
-      "key_takeaways" => ["Shared assumptions make costs comparable."]
+      "question_slots" => [
+        %{
+          "placement_after_group_id" => "section-models",
+          "placement_after_section_id" => "section-models"
+        }
+      ],
+      "synthesis" => %{"takeaways" => ["Shared assumptions make costs comparable."]}
     }
 
     {lesson, content}

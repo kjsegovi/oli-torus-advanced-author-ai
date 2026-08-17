@@ -2,6 +2,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
   use OliWeb.ConnCase, async: false
   use Oban.Testing, repo: Oli.Repo
 
+  import Ecto.Query
   import Phoenix.LiveViewTest
 
   alias Oli.Authoring.Course
@@ -10,7 +11,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
 
   alias Oli.OpenStax.CourseImport.Worker.{
     ApplyWorker,
-    LessonPlannerWorker,
+    LessonPlanWorker,
     OutlineWorker,
     PreflightWorker
   }
@@ -20,17 +21,51 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
   alias Oli.ScopedFeatureFlags
 
   defmodule DeterministicLessonPlanner do
-    def plan(lesson, index, opts) do
-      {plan_mode, payload} =
-        Oli.OpenStax.CourseImport.Planner.build_lesson_plan(lesson, index, opts)
+    alias Oli.OpenStax.CourseImport.BasicPlanV5
+
+    def plan(lesson, index, _opts) do
+      block_ids = lesson |> BasicPlanV5.source_blocks() |> Enum.map(& &1["id"])
+
+      candidate = %{
+        "title" => lesson["title"],
+        "orientation" => %{"overview" => "Read the complete source evidence."},
+        "content_groups" => [
+          %{
+            "id" => "source-content",
+            "title" => lesson["title"] || "Source content",
+            "instructional_purpose" => "reading",
+            "source_block_ids" => block_ids
+          }
+        ],
+        "question_slots" => [],
+        "synthesis" => %{
+          "heading" => "Synthesis",
+          "summary" => "Connect the evidence to the objectives.",
+          "takeaways" => ["Support conclusions with source evidence."]
+        }
+      }
+
+      {:ok, content} = BasicPlanV5.build(candidate, lesson, index)
 
       {:ok,
        %{
-         plan_mode: plan_mode,
-         payload: payload,
+         plan_mode: "basic",
+         payload: %{
+           "content_payload" => content,
+           "questions_payload" => %{"items" => []}
+         },
          enrichment_proposals: [],
          created_by: "system",
-         metadata: %{strategy: :deterministic_test}
+         metadata: %{
+           "strategy" => "deterministic_current_contract_test",
+           "quality_gate" => %{
+             "approved" => true,
+             "confidence" => 0.99,
+             "hard_blockers" => [],
+             "repairs" => [],
+             "advisories" => []
+           }
+         }
        }}
     end
   end
@@ -556,7 +591,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     end)
   end
 
-  test "shows instructional sections, worked examples, and takeaways in lesson review cards", %{
+  test "shows the schema 6 learner deck and its governed review views", %{
     conn: conn,
     project: project,
     author: author,
@@ -565,81 +600,78 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     review_run = lesson_review_run(project, root, author)
     [lesson | _] = review_run.units |> Enum.flat_map(& &1.lessons)
     plan = List.first(lesson.plans)
-    [section | _] = plan.content_payload["instructional_sections"]
-    [worked_example | _] = plan.content_payload["worked_examples"]
-    [application_problem | _] = plan.content_payload["application_problems"]
-    [takeaway | _] = plan.content_payload["key_takeaways"]
-
-    source_media_url = "https://assets.openstax.org/oscms-prodcms/media/example.png"
+    [group | _] = plan.content_payload["content_groups"]
+    [source_block | _] = group["source_blocks"]
+    activity_id = "source-decision"
 
     lesson
     |> Ecto.Changeset.change(plan_mode: "advanced")
     |> Oli.Repo.update!()
 
-    updated_sections =
-      plan.content_payload["instructional_sections"]
-      |> Enum.with_index(1)
-      |> Enum.map(fn {instructional_section, index} ->
-        Map.put(instructional_section, "evidence_block_ids", ["source-block-#{index}"])
-      end)
-
     plan
     |> Ecto.Changeset.change(
       content_payload:
         plan.content_payload
-        |> Map.put("instructional_sections", updated_sections)
-        |> Map.put("learning_objectives", ["Explain the reviewed OpenStax source"])
-        |> Map.put("media", [
-          %{
-            "source_media_id" => "source-figure-1",
-            "source_url" => source_media_url,
-            "alt" => "A source-grounded computing diagram",
-            "caption" => "Computing connects several disciplines.",
-            "credit" => "OpenStax",
-            "rights_status" => "approved"
-          }
-        ])
-        |> Map.put("coverage_manifest", %{
-          "available_block_ids" => ["source-block-1", "source-block-2", "source-block-3"],
-          "included_block_ids" => ["source-block-1", "source-block-2"],
-          "excluded_blocks" => [
+        |> Map.put("schema_version", 6)
+        |> Map.put("authoring_mode", "advanced")
+        |> Map.put("question_slots", [])
+        |> Map.put("experience_blueprint", %{
+          "driving_question" => "What conclusion is best supported by the source evidence?",
+          "stages" => [
             %{
-              "id" => "source-block-3",
-              "reason" => "This historical aside is supplemental to the lesson objective."
-            }
-          ]
-        })
-        |> Map.put("advanced_blueprint", %{
-          "screens" => [
-            %{
-              "id" => "discipline-decision",
-              "kind" => "decision",
-              "title" => "Choose a computing discipline",
-              "prompt" => "Which discipline best fits this scenario?",
-              "interaction_type" => "dropdown",
-              "choices" => [
-                %{
-                  "id" => "data",
-                  "text" => "Data science",
-                  "correct" => true,
-                  "feedback" => "This choice uses evidence from the data-science section."
-                },
-                %{
-                  "id" => "other",
-                  "text" => "Another discipline",
-                  "correct" => false,
-                  "feedback" => "Review how each discipline uses computing."
-                }
+              "id" => "investigation",
+              "title" => "Investigate the evidence",
+              "roles" => [
+                "orientation",
+                "prediction",
+                "investigation",
+                "evidence",
+                "interpretation",
+                "transfer",
+                "synthesis"
               ],
-              "remediation_section_id" => "source-block-1"
+              "items" => [
+                %{"kind" => "content_group", "ref_id" => group["id"]},
+                %{"kind" => "activity", "ref_id" => activity_id}
+              ]
             }
           ],
+          "activities" => [
+            %{
+              "id" => activity_id,
+              "context" => "Use the evidence you just reviewed before choosing.",
+              "prompt" => "Which conclusion is supported?",
+              "interaction_type" => "multiple_choice",
+              "choices" => [
+                %{
+                  "id" => "supported",
+                  "text" => "The source-supported conclusion",
+                  "correct" => true,
+                  "feedback" => "Correct. This conclusion follows from the cited evidence."
+                },
+                %{
+                  "id" => "unsupported",
+                  "text" => "An unsupported conclusion",
+                  "correct" => false,
+                  "feedback" => "Revisit the evidence and compare what each claim requires."
+                }
+              ],
+              "hint" => "Identify the observation that directly supports each conclusion.",
+              "remediation_content_group_id" => group["id"],
+              "evidence_block_ids" => [source_block["id"]],
+              "objective_ids" => []
+            }
+          ],
+          "activity_slots" => [],
           "remediation_paths" => [
             %{
-              "from_question_id" => "discipline-decision",
-              "to_section_id" => "source-block-1"
+              "from_activity_id" => activity_id,
+              "to_content_group_id" => group["id"]
             }
-          ]
+          ],
+          "duration_manifest" => %{"total_minutes" => 55},
+          "estimated_minutes" => 55,
+          "enrichment_references" => []
         })
     )
     |> Oli.Repo.update!()
@@ -654,46 +686,17 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
 
     assert has_element?(view, "#{material_selector}[open]", "Generated lesson material")
 
-    assert has_element?(
-             view,
-             "#{material_selector} [data-openstax-material-section='instructional'] h6",
-             section["heading"]
-           )
-
-    assert has_element?(
-             view,
-             "#{material_selector} [data-openstax-material-section='worked-example'] h6",
-             worked_example["title"]
-           )
-
-    assert has_element?(
-             view,
-             "#{material_selector} [data-openstax-material-section='takeaways'] li",
-             takeaway
-           )
-
-    assert has_element?(
-             view,
-             "#{material_selector} [data-openstax-material-section='application-problem']",
-             application_problem["prompt"]
-           )
-
-    assert has_element?(view, material_selector, "Mapped learning objectives")
-    assert has_element?(view, material_selector, "Explain the reviewed OpenStax source")
-    assert has_element?(view, material_selector, "source-block-1")
-    assert has_element?(view, "#{material_selector} img[src='#{source_media_url}']")
-    assert has_element?(view, material_selector, "Source content excluded from this lesson")
-    assert has_element?(view, material_selector, "source-block-3")
-    assert has_element?(view, material_selector, "historical aside")
-
-    assert has_element?(
-             view,
-             "#{material_selector} [data-openstax-advanced-screen='discipline-decision']",
-             "Choose a computing discipline"
-           )
-
-    assert has_element?(view, material_selector, "Review how each discipline uses computing")
-    assert has_element?(view, material_selector, "discipline-decision")
+    assert has_element?(view, "#{material_selector} [data-openstax-v6-learner-preview]")
+    assert has_element?(view, material_selector, "Learner Preview")
+    assert has_element?(view, material_selector, "Stage Flow")
+    assert has_element?(view, material_selector, "Activities and Branches")
+    assert has_element?(view, material_selector, "Source Coverage")
+    assert has_element?(view, material_selector, "Quality History")
+    assert has_element?(view, "#{material_selector} [data-openstax-v6-stage='investigation']")
+    assert has_element?(view, material_selector, group["title"])
+    assert has_element?(view, material_selector, "Which conclusion is supported?")
+    assert has_element?(view, material_selector, "Not sure support")
+    assert has_element?(view, material_selector, group["id"])
   end
 
   test "approved lesson cards remain editable until the review stage closes", %{
@@ -739,7 +742,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     assert has_element?(
              view,
              "[data-openstax-author-review-warning]",
-             "You may edit, regenerate, or approve this lesson as-is."
+             "Resolve them or regenerate this lesson before approval."
            )
 
     assert has_element?(
@@ -763,7 +766,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
            )
   end
 
-  test "needs-attention lesson is marked for author review without blocking approval", %{
+  test "needs-attention lesson is blocked until its hard findings are repaired", %{
     conn: conn,
     project: project,
     author: author,
@@ -796,7 +799,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     assert has_element?(
              view,
              "[data-openstax-author-review-warning]",
-             "You may edit, regenerate, or approve this lesson as-is."
+             "Resolve them or regenerate this lesson before approval."
            )
 
     assert has_element?(
@@ -805,26 +808,16 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
              "Approve lesson"
            )
 
-    refute has_element?(
+    assert has_element?(
              view,
              "button[phx-click='approve_lesson'][phx-value-lesson_id='#{lesson.id}'][disabled]"
            )
 
-    view
-    |> element("button[phx-click='approve_lesson'][phx-value-lesson_id='#{lesson.id}']")
-    |> render_click()
+    unchanged_lesson = Oli.Repo.get!(Oli.OpenStax.CourseImport.Lesson, lesson.id)
+    unchanged_plan = Oli.Repo.get!(Oli.OpenStax.CourseImport.LessonPlan, plan.id)
 
-    approved_lesson =
-      Oli.Repo.get!(Oli.OpenStax.CourseImport.Lesson, lesson.id)
-
-    approved_plan =
-      Oli.Repo.get!(Oli.OpenStax.CourseImport.LessonPlan, plan.id)
-
-    assert approved_lesson.status == "approved"
-    assert approved_plan.approved_by_user
-    assert approved_plan.checks_snapshot == failed_checks_snapshot()
-
-    refute render(view) =~ "Changes are needed before approval."
+    assert unchanged_lesson.status == "needs_attention"
+    refute unchanged_plan.approved_by_user
   end
 
   test "shows parallel lesson progress and disables actions for a regenerating lesson", %{
@@ -1057,7 +1050,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     refute has_element?(view, "button[phx-click='approve_all']")
   end
 
-  test "lesson edits preserve structured content and question metadata", %{
+  test "lesson edits preserve the source AST and current Basic v5 contract", %{
     conn: conn,
     project: project,
     author: author,
@@ -1070,32 +1063,15 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     [lesson | _] = review_run.units |> Enum.flat_map(& &1.lessons)
     original_plan = List.first(lesson.plans)
     original_content = original_plan.content_payload
-    original_questions = original_plan.questions_payload["items"]
-
-    assert Enum.all?(original_questions, fn question ->
-             question["answer_keywords"] != [] and
-               is_binary(question["correct_feedback"]) and
-               is_binary(question["incorrect_feedback"]) and
-               is_binary(question["remediation"]) and
-               question["source_evidence_links"] != []
-           end)
+    assert original_plan.questions_payload["items"] == []
+    assert original_content["schema_version"] == 5
+    assert original_content["authoring_mode"] == "basic"
 
     updated_objective =
       "#{original_content["objective"]} for #{lesson.title}"
 
     updated_narrative =
       "#{original_content["narrative"]}\n\n#{lesson.title} connects this source material."
-
-    updated_prompts =
-      original_questions
-      |> Enum.with_index()
-      |> Enum.map(fn
-        {question, 0} ->
-          "#{question["prompt"]} In #{lesson.title}, explain your reasoning."
-
-        {question, _index} ->
-          question["prompt"]
-      end)
 
     {:ok, view, _html} =
       live(
@@ -1113,11 +1089,6 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
       "lesson_plan" => %{
         "learning_objectives" => updated_objective,
         "narrative" => updated_narrative,
-        "question_order" => Enum.map(original_questions, & &1["id"]),
-        "question_prompts" =>
-          original_questions
-          |> Enum.zip(updated_prompts)
-          |> Map.new(fn {question, prompt} -> {question["id"], prompt} end),
         "plan_mode" => lesson.plan_mode
       }
     })
@@ -1139,178 +1110,16 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     assert updated_plan.content_payload["learning_objectives"] == [updated_objective]
     assert updated_plan.content_payload["narrative"] == updated_narrative
 
-    normalized_collection_keys = ["instructional_sections", "worked_examples"]
+    assert updated_plan.questions_payload["items"] == []
 
-    assert Map.drop(updated_plan.content_payload, [
-             "objective",
-             "learning_objectives",
-             "narrative" | normalized_collection_keys
-           ]) ==
-             Map.drop(original_content, [
-               "objective",
-               "learning_objectives",
-               "narrative" | normalized_collection_keys
-             ])
+    assert updated_plan.content_payload["content_groups"] ==
+             original_content["content_groups"]
 
-    Enum.zip(
-      original_content["instructional_sections"],
-      updated_plan.content_payload["instructional_sections"]
-    )
-    |> Enum.each(fn {original, updated} ->
-      assert Map.take(updated, Map.keys(original)) == original
-    end)
+    assert updated_plan.content_payload["coverage_manifest"] ==
+             original_content["coverage_manifest"]
 
-    Enum.zip(
-      original_content["worked_examples"],
-      updated_plan.content_payload["worked_examples"]
-    )
-    |> Enum.each(fn {original, updated} ->
-      assert Map.take(updated, Map.keys(original)) == original
-    end)
-
-    assert Enum.map(updated_plan.questions_payload["items"], & &1["prompt"]) == updated_prompts
-
-    Enum.zip(original_questions, updated_plan.questions_payload["items"])
-    |> Enum.each(fn {original, updated} ->
-      preserved_keys = Map.keys(original) -- ["prompt"]
-      assert Map.take(updated, preserved_keys) == Map.take(original, preserved_keys)
-    end)
-  end
-
-  test "rich section edits preserve evidence ids and sibling lesson material", %{
-    conn: conn,
-    project: project,
-    author: author,
-    root: root
-  } do
-    review_run = lesson_review_run(project, root, author)
-
-    {:ok, review_run} = CourseImport.get_run(project, author, review_run.id)
-
-    lesson =
-      review_run.units
-      |> Enum.flat_map(& &1.lessons)
-      |> Enum.max_by(& &1.source_word_count)
-
-    original_plan = List.first(lesson.plans)
-    [first_section | remaining_sections] = original_plan.content_payload["instructional_sections"]
-
-    assert {:ok, source_corpus} =
-             Oli.OpenStax.CourseImport.RichSource.load_lesson_corpus(lesson.id)
-
-    [source_block | _] = source_corpus["source_blocks"]
-    evidence_id = source_block["id"]
-
-    first_section =
-      first_section
-      |> Map.update("evidence_block_ids", [evidence_id], fn existing_ids ->
-        Enum.uniq(existing_ids ++ [evidence_id])
-      end)
-      |> Map.put("media_refs", ["source-figure-1"])
-
-    original_content =
-      original_plan.content_payload
-      |> Map.put("opening_hook", "What can the Introduction source help us explain?")
-      |> Map.put(
-        "why_this_matters",
-        "The Introduction source supports decisions learners make throughout this lesson."
-      )
-      |> Map.put("instructional_sections", [first_section | remaining_sections])
-      |> Map.put("advanced_blueprint", %{
-        "screens" => [
-          %{
-            "id" => "screen-1",
-            "kind" => "exploration",
-            "evidence_block_ids" => [evidence_id],
-            "rules" => [%{"when" => "incorrect", "then" => "review-section-1"}]
-          }
-        ],
-        "review_metadata" => %{"keep" => true}
-      })
-
-    original_plan =
-      original_plan
-      |> Ecto.Changeset.change(content_payload: original_content)
-      |> Oli.Repo.update!()
-
-    original_questions = original_plan.questions_payload["items"]
-    updated_heading = "Introduction source foundations"
-
-    updated_explanation =
-      "#{first_section["explanation"]} The Introduction source now gives learners one more evidence-based connection to explain."
-
-    {:ok, view, _html} =
-      live(
-        conn,
-        ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax?run_id=#{review_run.id}"
-      )
-
-    view
-    |> element("button[phx-click='edit_lesson'][phx-value-lesson_id='#{lesson.id}']")
-    |> render_click()
-
-    assert has_element?(
-             view,
-             "textarea[name='lesson_plan[instructional_sections][0][explanation]']"
-           )
-
-    view
-    |> form("#edit-openstax-lesson-#{lesson.id}", %{
-      "lesson_id" => lesson.id,
-      "lesson_plan" => %{
-        "learning_objectives" => Enum.join(original_content["learning_objectives"], "\n"),
-        "narrative" => original_content["narrative"],
-        "instructional_sections" => %{
-          "0" => %{
-            "heading" => updated_heading,
-            "explanation" => updated_explanation
-          }
-        },
-        "question_order" => Enum.map(original_questions, & &1["id"]),
-        "question_prompts" => Map.new(original_questions, &{&1["id"], &1["prompt"]}),
-        "plan_mode" => "basic"
-      }
-    })
-    |> render_submit()
-
-    assert {:ok, refreshed} = CourseImport.get_run(project, author, review_run.id)
-
-    updated_lesson =
-      refreshed.units
-      |> Enum.flat_map(& &1.lessons)
-      |> Enum.find(&(&1.id == lesson.id))
-
-    updated_plan = List.first(updated_lesson.plans)
-
-    [updated_section | updated_remaining_sections] =
-      updated_plan.content_payload["instructional_sections"]
-
-    assert Enum.any?(updated_lesson.plans, &(&1.created_by == "author"))
-
-    assert updated_plan.checks_snapshot["status"] == "passed",
-           inspect(updated_plan.checks_snapshot["results"], pretty: true, limit: :infinity)
-
-    assert updated_section["heading"] == updated_heading
-    assert updated_section["explanation"] == updated_explanation
-
-    assert Map.drop(updated_section, ["heading", "explanation"]) ==
-             Map.drop(first_section, ["heading", "explanation"])
-
-    assert updated_remaining_sections == remaining_sections
-
-    sibling_keys = [
-      "opening_hook",
-      "why_this_matters",
-      "worked_examples",
-      "curiosity_prompts",
-      "application_problems",
-      "key_takeaways",
-      "media",
-      "advanced_blueprint"
-    ]
-
-    assert Map.take(updated_plan.content_payload, sibling_keys) ==
-             Map.take(original_content, sibling_keys)
+    assert updated_plan.content_payload["source_block_ids"] ==
+             original_content["source_block_ids"]
   end
 
   test "returns to a renderable curriculum after applying the generated course", %{
@@ -1330,9 +1139,8 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     assert :ok = perform_job(PreflightWorker, %{"run_id" => run.id})
     assert {:ok, _run} = CourseImport.update_scope(run.id, author, ["chapter-1"])
     assert :ok = perform_job(OutlineWorker, %{"run_id" => run.id})
-    use_legacy_serial_lesson_planner(run.id)
     assert {:ok, _run} = CourseImport.approve_outline(run.id, author)
-    assert :ok = perform_job(LessonPlannerWorker, %{"run_id" => run.id})
+    assert :ok = drain_lesson_plan_jobs(run.id)
 
     assert {:ok, lesson_review} = CourseImport.get_run(project, author, run.id)
 
@@ -1378,24 +1186,55 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     :ok = perform_job(PreflightWorker, %{"run_id" => run.id})
     {:ok, _run} = CourseImport.update_scope(run.id, author, ["chapter-1"])
     :ok = perform_job(OutlineWorker, %{"run_id" => run.id})
-    use_legacy_serial_lesson_planner(run.id)
     {:ok, _run} = CourseImport.approve_outline(run.id, author)
-    :ok = perform_job(LessonPlannerWorker, %{"run_id" => run.id})
+    :ok = drain_lesson_plan_jobs(run.id)
     {:ok, review_run} = CourseImport.get_run(project, author, run.id)
     review_run
   end
 
-  # These LiveView examples intentionally exercise the persisted legacy-plan reader
-  # with the deterministic test planner. New production runs remain schema v5.
-  defp use_legacy_serial_lesson_planner(run_id) do
-    Run
-    |> Oli.Repo.get!(run_id)
-    |> Run.update_changeset(%{
-      source_schema_version: 3,
-      plan_schema_version: 4,
-      lesson_planning_strategy: :serial_v1
-    })
-    |> Oli.Repo.update!()
+  defp drain_lesson_plan_jobs(run_id) do
+    run = Oli.Repo.get!(Run, run_id)
+
+    assert {:ok, _run} =
+             CourseImport.initialize_parallel_lesson_planning(
+               run_id,
+               run.lesson_planning_generation
+             )
+
+    drain_queued_lesson_jobs(run_id, 100)
+  end
+
+  defp drain_queued_lesson_jobs(_run_id, 0), do: {:error, :lesson_job_drain_exhausted}
+
+  defp drain_queued_lesson_jobs(run_id, remaining) do
+    run = Oli.Repo.get!(Run, run_id)
+
+    if run.status == :planning_lessons do
+      jobs =
+        Oli.OpenStax.CourseImport.Lesson
+        |> where(
+          [lesson],
+          lesson.run_id == ^run_id and lesson.planning_state == "queued" and
+            not is_nil(lesson.planning_oban_job_id)
+        )
+        |> order_by([lesson], asc: lesson.planning_position)
+        |> Oli.Repo.all()
+        |> Enum.map(&Oli.Repo.get!(Oban.Job, &1.planning_oban_job_id))
+
+      case jobs do
+        [] ->
+          {:error, :no_queued_lesson_jobs}
+
+        jobs ->
+          Enum.each(jobs, fn job ->
+            assert :ok = LessonPlanWorker.perform(%{job | attempt: 1, max_attempts: 4})
+          end)
+
+          drain_queued_lesson_jobs(run_id, remaining - 1)
+      end
+    else
+      :ok
+    end
   end
 
   defp failed_checks_snapshot do

@@ -914,13 +914,17 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
       )
 
     count = fn key, fallback ->
-      direct = map_string_key(progress_planning, key, nil)
-      nested = map_string_key(progress_counts, key, nil)
+      if lessons != [] do
+        fallback
+      else
+        direct = map_string_key(progress_planning, key, nil)
+        nested = map_string_key(progress_counts, key, nil)
 
-      cond do
-        is_integer(direct) and direct >= 0 -> direct
-        is_integer(nested) and nested >= 0 -> nested
-        true -> fallback
+        cond do
+          is_integer(direct) and direct >= 0 -> direct
+          is_integer(nested) and nested >= 0 -> nested
+          true -> fallback
+        end
       end
     end
 
@@ -1046,7 +1050,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
       state when state in ["pending", :pending] ->
         if pending_regeneration?(lesson),
           do: "pending",
-          else: legacy_lesson_planning_state(Map.get(lesson, :status))
+          else: status_derived_lesson_planning_state(Map.get(lesson, :status))
 
       state
       when state in [
@@ -1064,11 +1068,11 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
         Atom.to_string(state)
 
       _ ->
-        legacy_lesson_planning_state(Map.get(lesson, :status))
+        status_derived_lesson_planning_state(Map.get(lesson, :status))
     end
   end
 
-  defp legacy_lesson_planning_state(status)
+  defp status_derived_lesson_planning_state(status)
        when status in [
               "ready_for_review",
               "approved",
@@ -1079,8 +1083,8 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
             ],
        do: "completed"
 
-  defp legacy_lesson_planning_state("failed"), do: "failed"
-  defp legacy_lesson_planning_state(_status), do: "pending"
+  defp status_derived_lesson_planning_state("failed"), do: "failed"
+  defp status_derived_lesson_planning_state(_status), do: "pending"
 
   defp pending_regeneration?(lesson) do
     Map.get(lesson, :planning_operation) in ["regenerate", :regenerate] and
@@ -1410,13 +1414,9 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     end
   end
 
-  defp plan_instructional_sections(lesson) do
-    lesson
-    |> plan_content("instructional_sections", [])
-    |> normalize_plan_maps()
-  end
-
   defp v5_lesson?(lesson), do: plan_content(lesson, "schema_version", 0) == 5
+  defp v6_lesson?(lesson), do: plan_content(lesson, "schema_version", 0) == 6
+  defp current_lesson?(lesson), do: v5_lesson?(lesson) or v6_lesson?(lesson)
 
   defp plan_content_groups(lesson) do
     lesson
@@ -1539,8 +1539,8 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     end)
   end
 
-  defp v5_approvable?(lesson) do
-    if v5_lesson?(lesson) do
+  defp current_lesson_approvable?(lesson) do
+    if current_lesson?(lesson) do
       gate = v5_quality_gate(lesson)
 
       map_string_key(gate, "approved", false) == true and
@@ -1549,20 +1549,8 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
         v5_quality_findings(lesson, "repair") == [] and
         check_status(lesson_checks(lesson)) in ["ok", "passed"]
     else
-      true
+      false
     end
-  end
-
-  defp plan_worked_examples(lesson) do
-    lesson
-    |> plan_content("worked_examples", [])
-    |> normalize_plan_maps()
-  end
-
-  defp plan_callouts(lesson) do
-    lesson
-    |> plan_content("callouts", [])
-    |> normalize_plan_maps()
   end
 
   defp plan_media(lesson) do
@@ -1571,37 +1559,43 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     |> normalize_plan_maps()
   end
 
-  defp plan_curiosity_prompts(lesson) do
+  defp plan_experience_blueprint(lesson), do: plan_content(lesson, "experience_blueprint", %{})
+
+  defp plan_experience_stages(lesson) do
     lesson
-    |> plan_content("curiosity_prompts", [])
+    |> plan_experience_blueprint()
+    |> map_string_key("stages", [])
     |> normalize_plan_maps()
   end
 
-  defp plan_application_problems(lesson) do
+  defp plan_experience_activities(lesson) do
     lesson
-    |> plan_content("application_problems", [])
+    |> plan_experience_blueprint()
+    |> map_string_key("activities", [])
     |> normalize_plan_maps()
   end
 
-  defp plan_key_takeaways(lesson) do
+  defp plan_experience_duration(lesson) do
     lesson
-    |> plan_content("key_takeaways", [])
-    |> normalize_plan_strings()
+    |> plan_experience_blueprint()
+    |> map_string_key("duration_manifest", %{})
   end
 
-  defp plan_advanced_screens(lesson) do
-    lesson
-    |> plan_content("advanced_blueprint", %{})
-    |> map_string_key("screens", [])
-    |> normalize_plan_maps()
+  defp plan_experience_stage_items(stage), do: plan_item_maps(stage, "items")
+
+  defp plan_experience_activity(lesson, activity_id) do
+    Enum.find(
+      plan_experience_activities(lesson),
+      &(plan_item_value(&1, "id") == activity_id)
+    )
   end
 
-  defp plan_advanced_remediation_paths(lesson) do
-    lesson
-    |> plan_content("advanced_blueprint", %{})
-    |> map_string_key("remediation_paths", [])
-    |> normalize_plan_maps()
+  defp plan_experience_content_group(lesson, group_id) do
+    Enum.find(plan_content_groups(lesson), &(plan_item_value(&1, "id") == group_id))
   end
+
+  defp plan_activity_choices(nil), do: []
+  defp plan_activity_choices(activity), do: plan_item_maps(activity, "choices")
 
   defp lesson_learning_objectives(lesson) do
     case plan_content(lesson, "learning_objectives", []) |> normalize_plan_strings() do
@@ -1776,58 +1770,52 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     base =
       [
         if(lesson_learning_objectives(lesson) != [],
-          do: %{"role" => "orientation", "label" => gettext("Objectives")}
-        ),
-        if(plan_content(lesson, "opening_hook") != "",
-          do: %{"role" => "orientation", "label" => gettext("Curiosity hook")}
-        ),
-        if(plan_content(lesson, "why_this_matters") != "",
-          do: %{"role" => "orientation", "label" => gettext("Relevance")}
+          do: %{"role" => "orientation", "label" => gettext("Orientation and objectives")}
         )
       ]
       |> Enum.reject(&is_nil/1)
 
     middle =
-      if lesson.plan_mode == "advanced" do
+      if v6_lesson?(lesson) do
         lesson
-        |> plan_advanced_screens()
-        |> Enum.map(fn screen ->
-          role = plan_item_value(screen, "role", plan_item_value(screen, "kind", "exploration"))
+        |> plan_experience_stages()
+        |> Enum.map(fn stage ->
+          role = stage |> plan_item_strings("roles") |> List.first() || "exploration"
 
           %{
             "role" => role,
-            "label" => plan_item_value(screen, "title", humanize_check_key(role))
+            "label" => plan_item_value(stage, "title", humanize_check_key(role))
           }
         end)
       else
         questions = plan_questions(lesson)
 
-        sections = plan_instructional_sections(lesson)
+        groups = plan_content_groups(lesson)
 
-        section_ids =
-          sections
+        group_ids =
+          groups
           |> Enum.map(&plan_item_value(&1, "id"))
           |> Enum.reject(&(&1 == ""))
           |> MapSet.new()
 
         interleaved =
-          sections
-          |> Enum.flat_map(fn section ->
-            section_id = plan_item_value(section, "id")
+          groups
+          |> Enum.flat_map(fn group ->
+            group_id = plan_item_value(group, "id")
 
             instruction = %{
               "role" => "instruction",
               "label" =>
                 plan_item_value(
-                  section,
-                  "heading",
-                  plan_item_value(section, "title", gettext("Instruction"))
+                  group,
+                  "title",
+                  gettext("Source evidence")
                 )
             }
 
             nearby_practice =
               questions
-              |> Enum.filter(&(plan_item_value(&1, "placement_after_section_id") == section_id))
+              |> Enum.filter(&(plan_item_value(&1, "placement_after_section_id") == group_id))
               |> Enum.map(fn _question ->
                 %{
                   "role" => "practice",
@@ -1842,7 +1830,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
           questions
           |> Enum.reject(fn question ->
             MapSet.member?(
-              section_ids,
+              group_ids,
               plan_item_value(question, "placement_after_section_id")
             )
           end)
@@ -1855,11 +1843,8 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
 
     ending =
       [
-        if(plan_worked_examples(lesson) != [],
-          do: %{"role" => "evidence", "label" => gettext("Worked examples")}
-        ),
-        if(plan_key_takeaways(lesson) != [],
-          do: %{"role" => "synthesis", "label" => gettext("Takeaways")}
+        if(plan_synthesis(lesson) not in [%{}, nil],
+          do: %{"role" => "synthesis", "label" => gettext("Synthesis")}
         ),
         %{"role" => "attribution", "label" => gettext("Attribution")}
       ]
@@ -1868,46 +1853,25 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     base ++ middle ++ ending
   end
 
-  defp plan_item_evidence_ids(item) do
-    item
-    |> plan_item_value("evidence_block_ids", [])
-    |> normalize_plan_strings()
-  end
-
   defp rich_lesson_material?(lesson) do
-    plan_instructional_sections(lesson) != [] or
-      plan_worked_examples(lesson) != [] or
-      plan_callouts(lesson) != [] or
+    plan_content_groups(lesson) != [] or
       plan_media(lesson) != [] or
-      plan_application_problems(lesson) != [] or
-      plan_key_takeaways(lesson) != []
+      plan_synthesis(lesson) not in [%{}, nil] or
+      plan_questions(lesson) != []
   end
 
   defp lesson_instructional_word_count(lesson) do
-    section_text =
+    group_text =
       lesson
-      |> plan_instructional_sections()
-      |> Enum.flat_map(fn section ->
+      |> plan_content_groups()
+      |> Enum.flat_map(fn group ->
         [
-          plan_item_value(section, "heading"),
-          plan_item_value(section, "explanation")
-          | plan_item_strings(section, "examples")
+          plan_item_value(group, "title")
+          | Enum.map(v5_group_source_blocks(group), &v5_source_block_preview_text/1)
         ]
       end)
 
-    example_text =
-      lesson
-      |> plan_worked_examples()
-      |> Enum.flat_map(fn example ->
-        [
-          plan_item_value(example, "title"),
-          plan_item_value(example, "scenario"),
-          plan_item_value(example, "conclusion")
-          | plan_item_strings(example, "steps")
-        ]
-      end)
-
-    (section_text ++ example_text)
+    group_text
     |> Enum.filter(&is_binary/1)
     |> Enum.join(" ")
     |> String.split(~r/\s+/, trim: true)
@@ -2170,9 +2134,13 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     do: if(is_list(lesson.source_evidence_links), do: lesson.source_evidence_links, else: [])
 
   defp question_count(lesson) do
-    lesson
-    |> plan_questions()
-    |> length()
+    if v6_lesson?(lesson) do
+      length(plan_experience_activities(lesson))
+    else
+      lesson
+      |> plan_questions()
+      |> length()
+    end
   end
 
   defp run_recoverable?(run) do
@@ -2209,8 +2177,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
       |> Map.put("objective", List.first(learning_objectives) || "")
       |> Map.put("learning_objectives", learning_objectives)
       |> Map.put("narrative", Map.get(attrs, "narrative", ""))
-      |> merge_rich_text_edits(attrs)
-      |> maybe_update_v5_orientation(Map.get(attrs, "narrative", ""))
+      |> maybe_update_current_orientation(Map.get(attrs, "narrative", ""))
 
     existing_questions = plan_questions(lesson)
 
@@ -2253,90 +2220,16 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     }
   end
 
-  defp merge_rich_text_edits(content, attrs) do
-    content
-    |> maybe_put_plan_text(attrs, "opening_hook")
-    |> maybe_put_plan_text(attrs, "why_this_matters")
-    |> maybe_merge_plan_item_text(
-      attrs,
-      "instructional_sections",
-      ~w(heading explanation)
-    )
-    |> maybe_merge_plan_item_text(attrs, "worked_examples", ~w(title scenario))
-    |> maybe_merge_plan_item_text(attrs, "curiosity_prompts", ~w(prompt))
-    |> maybe_merge_plan_item_text(attrs, "application_problems", ~w(prompt))
-    |> maybe_merge_plan_text_list(attrs, "key_takeaways")
-  end
-
-  defp maybe_update_v5_orientation(%{"schema_version" => 5} = content, overview)
-       when is_binary(overview) do
+  defp maybe_update_current_orientation(%{"schema_version" => schema} = content, overview)
+       when schema in [5, 6] and is_binary(overview) do
     put_in(content, [Access.key("orientation", %{}), "overview"], String.trim(overview))
   end
 
-  defp maybe_update_v5_orientation(content, _overview), do: content
-
-  defp maybe_put_plan_text(content, attrs, key) do
-    case Map.fetch(attrs, key) do
-      {:ok, value} when is_binary(value) -> Map.put(content, key, String.trim(value))
-      _ -> content
-    end
-  end
-
-  defp maybe_merge_plan_item_text(content, attrs, key, editable_fields) do
-    case {map_string_key(content, key, nil), Map.get(attrs, key)} do
-      {items, edits} when is_list(items) and is_map(edits) ->
-        updated_items =
-          items
-          |> Enum.with_index()
-          |> Enum.map(fn {item, index} ->
-            merge_plan_item_text(
-              item,
-              Map.get(edits, Integer.to_string(index)),
-              editable_fields
-            )
-          end)
-
-        Map.put(content, key, updated_items)
-
-      _ ->
-        content
-    end
-  end
-
-  defp merge_plan_item_text(item, edits, editable_fields)
-       when is_map(item) and is_map(edits) do
-    Enum.reduce(editable_fields, item, fn field, updated_item ->
-      case Map.fetch(edits, field) do
-        {:ok, value} when is_binary(value) ->
-          Map.put(updated_item, field, String.trim(value))
-
-        _ ->
-          updated_item
-      end
-    end)
-  end
-
-  defp merge_plan_item_text(item, _edits, _editable_fields), do: item
-
-  defp maybe_merge_plan_text_list(content, attrs, key) do
-    case Map.fetch(attrs, key) do
-      {:ok, values} when is_list(values) ->
-        Map.put(content, key, normalize_plan_strings(values))
-
-      _ ->
-        content
-    end
-  end
+  defp maybe_update_current_orientation(content, _overview), do: content
 
   defp plan_questions(lesson) do
     case latest_plan(lesson) do
       %{questions_payload: %{"items" => questions}} when is_list(questions) ->
-        questions
-
-      %{questions_payload: %{"questions" => questions}} when is_list(questions) ->
-        questions
-
-      %{questions_payload: questions} when is_list(questions) ->
         questions
 
       _ ->

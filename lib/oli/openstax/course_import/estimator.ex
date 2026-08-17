@@ -454,9 +454,7 @@ defmodule Oli.OpenStax.CourseImport.Estimator do
           value
 
         _ ->
-          if Map.get(run, :lesson_planning_strategy) in ["parallel_v1", :parallel_v1],
-            do: 3,
-            else: 1
+          3
       end
 
     case positive_or_zero(remaining) do
@@ -505,7 +503,7 @@ defmodule Oli.OpenStax.CourseImport.Estimator do
       state when state in ["pending", :pending] ->
         if pending_regeneration?(lesson),
           do: "pending",
-          else: legacy_lesson_planning_state(Map.get(lesson, :status))
+          else: status_derived_lesson_planning_state(Map.get(lesson, :status))
 
       state
       when state in [
@@ -523,11 +521,11 @@ defmodule Oli.OpenStax.CourseImport.Estimator do
         Atom.to_string(state)
 
       _ ->
-        legacy_lesson_planning_state(Map.get(lesson, :status))
+        status_derived_lesson_planning_state(Map.get(lesson, :status))
     end
   end
 
-  defp legacy_lesson_planning_state(status)
+  defp status_derived_lesson_planning_state(status)
        when status in [
               "ready_for_review",
               "approved",
@@ -538,8 +536,8 @@ defmodule Oli.OpenStax.CourseImport.Estimator do
             ],
        do: "completed"
 
-  defp legacy_lesson_planning_state("failed"), do: "failed"
-  defp legacy_lesson_planning_state(_status), do: "pending"
+  defp status_derived_lesson_planning_state("failed"), do: "failed"
+  defp status_derived_lesson_planning_state(_status), do: "pending"
 
   defp pending_regeneration?(lesson) do
     Map.get(lesson, :planning_operation) in ["regenerate", :regenerate] and
@@ -661,15 +659,15 @@ defmodule Oli.OpenStax.CourseImport.Estimator do
   defp stall_threshold(:applying), do: 35 * 60
 
   defp stage_started_at(run, timing) do
-    datetime(value(timing, "stage_started_at", nil)) || legacy_stage_started_at(run)
+    datetime(value(timing, "stage_started_at", nil)) || inferred_stage_started_at(run)
   end
 
-  defp legacy_stage_started_at(%Run{status: :preflighting} = run), do: run.started_at
+  defp inferred_stage_started_at(%Run{status: :preflighting} = run), do: run.started_at
 
-  defp legacy_stage_started_at(%Run{status: :planning_lessons} = run),
+  defp inferred_stage_started_at(%Run{status: :planning_lessons} = run),
     do: run.outline_approved_at
 
-  defp legacy_stage_started_at(_run), do: nil
+  defp inferred_stage_started_at(_run), do: nil
 
   defp last_progress_at(run, timing),
     do: datetime(value(timing, "last_progress_at", nil)) || run.updated_at || run.started_at

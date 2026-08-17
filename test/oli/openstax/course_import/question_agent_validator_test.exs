@@ -132,8 +132,10 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentValidatorTest do
   defp context do
     %{
       content_payload: %{
+        "schema_version" => 5,
+        "authoring_mode" => "basic",
         "learning_objectives" => objectives(),
-        "instructional_sections" => [
+        "content_groups" => [
           %{"id" => "section-models"},
           %{"id" => "section-growth"}
         ]

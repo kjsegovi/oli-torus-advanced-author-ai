@@ -67,9 +67,9 @@ defmodule Oli.ScopedFeatureFlags.DefinedFeatures do
   )
 
   deffeature(
-    :openstax_basic_pages_v5,
+    :openstax_advanced_pages_v6,
     [:authoring],
-    "Enable source-faithful, independently reviewed OpenStax Basic page generation",
+    "Enable source-fit, independently reviewed OpenStax Advanced Exploration generation",
     rollout_mode: :canary
   )
 

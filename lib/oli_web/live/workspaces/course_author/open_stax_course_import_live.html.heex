@@ -464,7 +464,7 @@
           <h3 class="text-lg font-semibold text-gray-900">{gettext("Review lesson plans")}</h3>
           <p class="mt-1 text-sm text-gray-600">
             {gettext(
-              "Basic v5 plans preserve the complete source AST and show independent critic evidence. Advanced Author generation remains on its existing workflow."
+              "Every lesson uses the hard-cutover source contract: Basic v5 or a reviewed Advanced v6 REAL CHEM-style Exploration."
             )}
           </p>
         </div>
@@ -627,7 +627,7 @@
                       size={:sm}
                       phx-click="approve_lesson"
                       phx-value-lesson_id={lesson.id}
-                      disabled={lesson_busy?(lesson) or not v5_approvable?(lesson)}
+                      disabled={lesson_busy?(lesson) or not current_lesson_approvable?(lesson)}
                     >
                       {gettext("Approve lesson")}
                     </.button>
@@ -676,31 +676,6 @@
                         </li>
                       </ol>
                     </section>
-
-                    <div class="grid gap-3 sm:grid-cols-2">
-                      <div
-                        :if={plan_content(lesson, "opening_hook") != ""}
-                        class="rounded border border-amber-200 bg-amber-50 p-3"
-                      >
-                        <p class="text-xs font-semibold uppercase tracking-wide text-amber-800">
-                          {gettext("Curiosity hook")}
-                        </p>
-                        <p class="mt-2 text-sm leading-6 text-amber-950">
-                          {plan_content(lesson, "opening_hook")}
-                        </p>
-                      </div>
-                      <div
-                        :if={plan_content(lesson, "why_this_matters") != ""}
-                        class="rounded border border-blue-200 bg-blue-50 p-3"
-                      >
-                        <p class="text-xs font-semibold uppercase tracking-wide text-blue-800">
-                          {gettext("Why this matters")}
-                        </p>
-                        <p class="mt-2 text-sm leading-6 text-blue-950">
-                          {plan_content(lesson, "why_this_matters")}
-                        </p>
-                      </div>
-                    </div>
 
                     <div :if={plan_content(lesson, "narrative") != ""}>
                       <p class="text-xs font-semibold uppercase tracking-wide text-gray-600">
@@ -833,175 +808,275 @@
                       </div>
                     </section>
 
-                    <section :if={
-                      !v5_lesson?(lesson) && plan_instructional_sections(lesson) != []
-                    }>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Instructional sections")}
-                      </h5>
-                      <div class="mt-3 space-y-4">
-                        <article
-                          :for={section <- plan_instructional_sections(lesson)}
-                          data-openstax-material-section="instructional"
-                          class="rounded border border-gray-200 bg-gray-50 p-3"
-                        >
-                          <h6 class="font-semibold text-gray-900">
-                            {plan_item_value(
-                              section,
-                              "heading",
-                              gettext("Lesson explanation")
-                            )}
-                          </h6>
-                          <p class="mt-2 whitespace-pre-line text-sm leading-6 text-gray-700">
-                            {plan_item_value(section, "explanation")}
-                          </p>
-                          <ul
-                            :if={plan_item_strings(section, "examples") != []}
-                            class="mt-3 list-disc space-y-1 pl-5 text-sm text-gray-700"
-                          >
-                            <li :for={example <- plan_item_strings(section, "examples")}>
-                              {example}
-                            </li>
-                          </ul>
-                          <p
-                            :if={plan_item_evidence_ids(section) != []}
-                            class="mt-3 break-words text-xs text-gray-500"
-                          >
-                            <span class="font-semibold">{gettext("Source blocks")}:</span>
-                            {Enum.join(plan_item_evidence_ids(section), ", ")}
-                          </p>
-                        </article>
-                      </div>
-                    </section>
-
-                    <section :if={!v5_lesson?(lesson) && plan_media(lesson) != []}>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Source figures")}
-                      </h5>
-                      <div class="mt-3 grid gap-4 md:grid-cols-2">
-                        <figure
-                          :for={media <- plan_media(lesson)}
-                          class="overflow-hidden rounded border border-gray-200 bg-white"
-                        >
-                          <img
-                            :if={media_preview_url(media)}
-                            src={media_preview_url(media)}
-                            alt={plan_item_value(media, "alt")}
-                            loading="lazy"
-                            class="max-h-72 w-full object-contain bg-slate-50"
-                          />
-                          <figcaption class="space-y-1 border-t border-gray-200 p-3 text-xs text-gray-700">
-                            <p>{plan_item_value(media, "caption")}</p>
-                            <p
-                              :if={plan_item_value(media, "credit") != ""}
-                              class="text-gray-500"
-                            >
-                              {plan_item_value(media, "credit")}
+                    <section
+                      :if={v6_lesson?(lesson)}
+                      id={"openstax-v6-preview-#{lesson.id}"}
+                      data-openstax-v6-learner-preview
+                      class="overflow-hidden rounded-xl border border-purple-200 bg-slate-100"
+                    >
+                      <header class="bg-purple-950 px-5 py-5 text-white">
+                        <div class="flex flex-wrap items-start justify-between gap-3">
+                          <div>
+                            <p class="text-xs font-semibold uppercase tracking-wide text-purple-200">
+                              {gettext("Learner Preview · Advanced v6 Exploration")}
                             </p>
-                            <p class="font-medium text-gray-500">
-                              {gettext("Rights")}: {plan_item_value(
-                                media,
-                                "rights_status",
-                                gettext("Requires review")
+                            <h5 class="mt-1 text-xl font-semibold">
+                              {plan_content(lesson, "title", lesson.title)}
+                            </h5>
+                            <p class="mt-3 max-w-3xl text-sm leading-6 text-purple-50">
+                              {map_string_key(
+                                plan_experience_blueprint(lesson),
+                                "driving_question",
+                                gettext(
+                                  "Investigate the source evidence and defend a conclusion."
+                                )
                               )}
                             </p>
-                          </figcaption>
-                        </figure>
-                      </div>
-                    </section>
-
-                    <section :if={plan_callouts(lesson) != []}>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Real-world connections")}
-                      </h5>
-                      <div class="mt-3 space-y-3">
-                        <aside
-                          :for={callout <- plan_callouts(lesson)}
-                          class="rounded border-l-4 border-cyan-500 bg-cyan-50 p-3 text-cyan-950"
-                        >
-                          <p class="text-xs font-semibold uppercase tracking-wide text-cyan-800">
-                            {plan_item_value(
-                              callout,
-                              "type",
-                              gettext("Source connection")
-                            )}
-                          </p>
-                          <h6 class="mt-1 font-semibold">
-                            {plan_item_value(callout, "title", gettext("Source connection"))}
-                          </h6>
-                          <p class="mt-2 whitespace-pre-line text-sm leading-6">
-                            {plan_item_value(callout, "body")}
-                          </p>
-                        </aside>
-                      </div>
-                    </section>
-
-                    <section :if={
-                      lesson.plan_mode == "advanced" && plan_advanced_screens(lesson) != []
-                    }>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Advanced interaction and rule preview")}
-                      </h5>
-                      <div class="mt-3 space-y-3">
-                        <article
-                          :for={screen <- plan_advanced_screens(lesson)}
-                          data-openstax-advanced-screen={plan_item_value(screen, "id")}
-                          class="rounded border border-purple-200 bg-purple-50 p-3 text-purple-950"
-                        >
-                          <div class="flex flex-wrap items-center justify-between gap-2">
-                            <h6 class="font-semibold">
-                              {plan_item_value(screen, "title", gettext("Adaptive screen"))}
-                            </h6>
-                            <span class="rounded bg-white px-2 py-0.5 text-xs font-semibold text-purple-800">
-                              {plan_item_value(screen, "role", gettext("exploration"))} · {plan_item_value(
-                                screen,
-                                "interaction_type",
-                                plan_item_value(screen, "kind", gettext("content"))
-                              )}
-                            </span>
                           </div>
-                          <p class="mt-2 text-sm">{plan_item_value(screen, "prompt")}</p>
-                          <ul
-                            :if={plan_item_maps(screen, "choices") != []}
-                            class="mt-3 space-y-2 text-xs"
-                          >
-                            <li
-                              :for={choice <- plan_item_maps(screen, "choices")}
-                              class="rounded border border-purple-100 bg-white p-2"
+                          <span class="rounded-full bg-white/15 px-3 py-1 text-xs font-semibold">
+                            {map_string_key(plan_experience_duration(lesson), "total_minutes", 0)} {gettext(
+                              "minutes"
+                            )}
+                          </span>
+                        </div>
+                      </header>
+
+                      <nav
+                        class="flex flex-wrap gap-2 border-b border-purple-200 bg-white px-4 py-3 text-xs font-semibold text-purple-900"
+                        aria-label={gettext("Advanced lesson review views")}
+                      >
+                        <a
+                          href={"#openstax-v6-preview-#{lesson.id}"}
+                          class="rounded-full bg-purple-100 px-3 py-1"
+                        >
+                          {gettext("Learner Preview")}
+                        </a>
+                        <a
+                          href={"#openstax-v6-stage-flow-#{lesson.id}"}
+                          class="rounded-full bg-slate-100 px-3 py-1"
+                        >
+                          {gettext("Stage Flow")}
+                        </a>
+                        <a
+                          href={"#openstax-v6-activities-#{lesson.id}"}
+                          class="rounded-full bg-slate-100 px-3 py-1"
+                        >
+                          {gettext("Activities and Branches")}
+                        </a>
+                        <a
+                          href={"#openstax-v6-coverage-#{lesson.id}"}
+                          class="rounded-full bg-slate-100 px-3 py-1"
+                        >
+                          {gettext("Source Coverage")}
+                        </a>
+                        <a
+                          href={"#openstax-v6-quality-#{lesson.id}"}
+                          class="rounded-full bg-slate-100 px-3 py-1"
+                        >
+                          {gettext("Quality History")}
+                        </a>
+                      </nav>
+
+                      <div class="mx-auto max-w-4xl space-y-6 p-4 sm:p-6">
+                        <section
+                          :for={
+                            {stage, stage_index} <-
+                              Enum.with_index(plan_experience_stages(lesson), 1)
+                          }
+                          data-openstax-v6-stage={plan_item_value(stage, "id")}
+                          class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6"
+                        >
+                          <div class="flex flex-wrap items-start justify-between gap-2">
+                            <div>
+                              <p class="text-xs font-semibold uppercase tracking-wide text-purple-700">
+                                {gettext("Stage %{number}", number: stage_index)} · {Enum.join(
+                                  plan_item_strings(stage, "roles"),
+                                  " / "
+                                )}
+                              </p>
+                              <h6 class="mt-1 text-lg font-semibold text-slate-950">
+                                {plan_item_value(stage, "title", gettext("Exploration stage"))}
+                              </h6>
+                            </div>
+                          </div>
+
+                          <div class="mt-5 space-y-5">
+                            <article
+                              :for={item <- plan_experience_stage_items(stage)}
+                              :if={plan_item_value(item, "kind") == "content_group"}
+                              class="rounded-lg border border-slate-200 bg-slate-50 p-4"
                             >
-                              <p class="font-medium">{plan_item_value(choice, "text")}</p>
-                              <p :if={plan_item_value(choice, "feedback") != ""} class="mt-1">
-                                <span class="font-semibold">{gettext("Feedback")}:</span>
-                                {plan_item_value(choice, "feedback")}
+                              <% group =
+                                plan_experience_content_group(
+                                  lesson,
+                                  plan_item_value(item, "ref_id")
+                                ) %>
+                              <h6 class="font-semibold text-slate-950">
+                                {plan_item_value(group, "title", gettext("Source evidence"))}
+                              </h6>
+                              <div class="mt-3 space-y-4">
+                                <div
+                                  :for={block <- v5_group_source_blocks(group || %{})}
+                                  class="border-l-2 border-purple-200 pl-4"
+                                >
+                                  <p class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
+                                    {humanize_check_key(plan_item_value(block, "kind", "source"))}
+                                  </p>
+                                  <p class="mt-1 whitespace-pre-line text-sm leading-7 text-slate-800">
+                                    {v5_source_block_preview_text(block)}
+                                  </p>
+                                </div>
+                              </div>
+                            </article>
+
+                            <article
+                              :for={item <- plan_experience_stage_items(stage)}
+                              :if={plan_item_value(item, "kind") == "activity"}
+                              class="rounded-lg border border-purple-200 bg-purple-50 p-4"
+                            >
+                              <% activity =
+                                plan_experience_activity(
+                                  lesson,
+                                  plan_item_value(item, "ref_id")
+                                ) %>
+                              <div class="flex flex-wrap items-center justify-between gap-2">
+                                <p class="text-xs font-semibold uppercase tracking-wide text-purple-800">
+                                  {humanize_check_key(
+                                    plan_item_value(activity, "interaction_type", "interaction")
+                                  )}
+                                </p>
+                                <span class="rounded bg-white px-2 py-0.5 text-xs font-semibold text-purple-800">
+                                  {gettext("Adaptive checkpoint")}
+                                </span>
+                              </div>
+                              <p class="mt-3 text-sm leading-6 text-purple-950">
+                                {plan_item_value(activity, "context")}
+                              </p>
+                              <p class="mt-2 font-semibold text-purple-950">
+                                {plan_item_value(activity, "prompt")}
+                              </p>
+                              <ul
+                                :if={plan_activity_choices(activity) != []}
+                                class="mt-3 space-y-2"
+                              >
+                                <li
+                                  :for={choice <- plan_activity_choices(activity)}
+                                  class="rounded border border-purple-100 bg-white p-3 text-sm"
+                                >
+                                  <p>{plan_item_value(choice, "text")}</p>
+                                  <p
+                                    :if={plan_item_value(choice, "feedback") != ""}
+                                    class="mt-1 text-xs text-slate-600"
+                                  >
+                                    <span class="font-semibold">{gettext("Feedback")}:</span>
+                                    {plan_item_value(choice, "feedback")}
+                                  </p>
+                                </li>
+                              </ul>
+                              <div class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+                                <p class="rounded bg-white p-2 text-purple-950">
+                                  <span class="font-semibold">
+                                    {gettext("Not sure support")}:
+                                  </span>
+                                  {plan_item_value(activity, "hint")}
+                                </p>
+                                <p class="rounded bg-white p-2 text-purple-950">
+                                  <span class="font-semibold">{gettext("Remediation")}:</span>
+                                  {plan_item_value(activity, "remediation_content_group_id")}
+                                </p>
+                              </div>
+                            </article>
+                          </div>
+                        </section>
+
+                        <details
+                          id={"openstax-v6-stage-flow-#{lesson.id}"}
+                          class="rounded-xl border border-slate-200 bg-white shadow-sm"
+                        >
+                          <summary class="cursor-pointer px-4 py-3 font-semibold text-slate-950">
+                            {gettext("Stage Flow")}
+                          </summary>
+                          <ol class="space-y-3 border-t border-slate-200 p-4 text-sm">
+                            <li
+                              :for={stage <- plan_experience_stages(lesson)}
+                              class="rounded-lg bg-slate-50 p-3"
+                            >
+                              <p class="font-semibold text-slate-950">
+                                {plan_item_value(stage, "title", gettext("Exploration stage"))}
+                              </p>
+                              <p class="mt-1 text-xs text-slate-600">
+                                {Enum.join(plan_item_strings(stage, "roles"), " · ")} · {ngettext(
+                                  "%{count} learner-deck item",
+                                  "%{count} learner-deck items",
+                                  length(plan_experience_stage_items(stage)),
+                                  count: length(plan_experience_stage_items(stage))
+                                )}
                               </p>
                             </li>
-                          </ul>
-                          <p
-                            :if={
-                              plan_item_value(screen, "remediation") != "" ||
-                                plan_item_value(screen, "remediation_section_id") != ""
-                            }
-                            class="mt-3 text-xs"
-                          >
-                            <span class="font-semibold">{gettext("Remediation")}:</span>
-                            {plan_item_value(
-                              screen,
-                              "remediation",
-                              plan_item_value(screen, "remediation_section_id")
-                            )}
-                          </p>
-                        </article>
+                          </ol>
+                        </details>
+
+                        <details
+                          id={"openstax-v6-activities-#{lesson.id}"}
+                          class="rounded-xl border border-purple-200 bg-white shadow-sm"
+                        >
+                          <summary class="cursor-pointer px-4 py-3 font-semibold text-purple-950">
+                            {gettext("Activities and Branches")}
+                          </summary>
+                          <div class="space-y-4 border-t border-purple-100 p-4">
+                            <article
+                              :for={activity <- plan_experience_activities(lesson)}
+                              class="rounded-lg border border-purple-100 bg-purple-50 p-4 text-sm"
+                            >
+                              <p class="text-xs font-semibold uppercase tracking-wide text-purple-700">
+                                {humanize_check_key(
+                                  plan_item_value(activity, "interaction_type", "interaction")
+                                )}
+                              </p>
+                              <h6 class="mt-1 font-semibold text-purple-950">
+                                {plan_item_value(activity, "prompt")}
+                              </h6>
+                              <dl class="mt-3 grid gap-3 text-xs sm:grid-cols-2">
+                                <div>
+                                  <dt class="font-semibold">{gettext("Objectives")}</dt>
+                                  <dd>
+                                    {Enum.join(plan_item_strings(activity, "objective_ids"), ", ")}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">{gettext("Source evidence")}</dt>
+                                  <dd>
+                                    {Enum.join(
+                                      plan_item_strings(activity, "evidence_block_ids"),
+                                      ", "
+                                    )}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">{gettext("Correct feedback")}</dt>
+                                  <dd>{plan_item_value(activity, "correct_feedback")}</dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">
+                                    {gettext("Default incorrect feedback")}
+                                  </dt>
+                                  <dd>{plan_item_value(activity, "incorrect_feedback")}</dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">{gettext("Not sure support")}</dt>
+                                  <dd>{plan_item_value(activity, "hint")}</dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">{gettext("Remediation branch")}</dt>
+                                  <dd>
+                                    {plan_item_value(activity, "remediation_content_group_id")}
+                                  </dd>
+                                </div>
+                              </dl>
+                            </article>
+                          </div>
+                        </details>
                       </div>
-                      <ul
-                        :if={plan_advanced_remediation_paths(lesson) != []}
-                        class="mt-3 list-disc space-y-1 pl-5 text-xs text-purple-900"
-                      >
-                        <li :for={path <- plan_advanced_remediation_paths(lesson)}>
-                          {plan_item_value(path, "from_question_id", gettext("Interaction"))}
-                          <span aria-hidden="true"> → </span>
-                          {plan_item_value(path, "to_section_id", gettext("review section"))}
-                        </li>
-                      </ul>
                     </section>
 
                     <section :if={lesson_enrichment_proposals(@run, lesson) != []}>
@@ -1333,55 +1408,6 @@
                       </div>
                     </section>
 
-                    <section :if={plan_worked_examples(lesson) != []}>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Worked examples")}
-                      </h5>
-                      <div class="mt-3 space-y-4">
-                        <article
-                          :for={example <- plan_worked_examples(lesson)}
-                          data-openstax-material-section="worked-example"
-                          class="rounded border border-indigo-200 bg-indigo-50 p-3 text-indigo-950"
-                        >
-                          <h6 class="font-semibold">
-                            {plan_item_value(
-                              example,
-                              "title",
-                              gettext("Guided example")
-                            )}
-                          </h6>
-                          <p class="mt-2 text-sm leading-6">
-                            {plan_item_value(example, "scenario")}
-                          </p>
-                          <ol
-                            :if={plan_item_strings(example, "steps") != []}
-                            class="mt-3 list-decimal space-y-1 pl-5 text-sm"
-                          >
-                            <li :for={step <- plan_item_strings(example, "steps")}>
-                              {step}
-                            </li>
-                          </ol>
-                          <p
-                            :if={plan_item_value(example, "conclusion") != ""}
-                            class="mt-3 text-sm font-medium"
-                          >
-                            {plan_item_value(example, "conclusion")}
-                          </p>
-                        </article>
-                      </div>
-                    </section>
-
-                    <section :if={plan_curiosity_prompts(lesson) != []}>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Curiosity and prediction prompts")}
-                      </h5>
-                      <ol class="mt-2 list-decimal space-y-2 pl-5 text-sm text-gray-700">
-                        <li :for={prompt <- plan_curiosity_prompts(lesson)}>
-                          {plan_item_value(prompt, "prompt")}
-                        </li>
-                      </ol>
-                    </section>
-
                     <section :if={plan_questions(lesson) != []}>
                       <h5 class="text-sm font-semibold text-gray-900">
                         {gettext("Interleaved formative activities")}
@@ -1448,40 +1474,6 @@
                       </div>
                     </section>
 
-                    <section :if={plan_application_problems(lesson) != []}>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Application problem set")}
-                      </h5>
-                      <ol class="mt-3 space-y-3">
-                        <li
-                          :for={problem <- plan_application_problems(lesson)}
-                          data-openstax-material-section="application-problem"
-                          class="rounded border border-violet-200 bg-violet-50 p-3 text-sm text-violet-950"
-                        >
-                          <p class="font-medium">{plan_item_value(problem, "prompt")}</p>
-                          <p
-                            :if={plan_item_value(problem, "guidance") != ""}
-                            class="mt-2 text-xs text-violet-800"
-                          >
-                            <span class="font-semibold">{gettext("Guidance")}:</span>
-                            {plan_item_value(problem, "guidance")}
-                          </p>
-                        </li>
-                      </ol>
-                    </section>
-
-                    <section
-                      :if={plan_key_takeaways(lesson) != []}
-                      data-openstax-material-section="takeaways"
-                    >
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Key takeaways")}
-                      </h5>
-                      <ul class="mt-2 list-disc space-y-1 pl-5 text-sm text-gray-700">
-                        <li :for={takeaway <- plan_key_takeaways(lesson)}>{takeaway}</li>
-                      </ul>
-                    </section>
-
                     <section :if={lesson_excluded_blocks(lesson) != []}>
                       <h5 class="text-sm font-semibold text-gray-900">
                         {gettext("Source content excluded from this lesson")}
@@ -1531,6 +1523,12 @@
 
                     <details
                       :if={lesson_coverage_rows(lesson) != []}
+                      id={
+                        if(v6_lesson?(lesson),
+                          do: "openstax-v6-coverage-#{lesson.id}",
+                          else: "openstax-v5-coverage-#{lesson.id}"
+                        )
+                      }
                       class="rounded border border-slate-200 bg-slate-50"
                     >
                       <summary class="cursor-pointer px-3 py-2 text-sm font-semibold text-slate-900">
@@ -1562,7 +1560,13 @@
                     </details>
 
                     <section
-                      :if={v5_lesson?(lesson)}
+                      :if={current_lesson?(lesson)}
+                      id={
+                        if(v6_lesson?(lesson),
+                          do: "openstax-v6-quality-#{lesson.id}",
+                          else: "openstax-v5-quality-#{lesson.id}"
+                        )
+                      }
                       data-openstax-v5-quality-review
                       class="rounded-lg border border-indigo-200 bg-indigo-50 p-4"
                     >
@@ -1572,7 +1576,7 @@
                             {gettext("Independent critic review")}
                           </p>
                           <h5 class="mt-1 font-semibold text-indigo-950">
-                            {if v5_approvable?(lesson),
+                            {if current_lesson_approvable?(lesson),
                               do: gettext("Quality gate passed"),
                               else: gettext("Approval blocked")}
                           </h5>
@@ -1667,7 +1671,7 @@
                     </section>
 
                     <p
-                      :if={!v5_lesson?(lesson) && !rich_lesson_material?(lesson)}
+                      :if={!current_lesson?(lesson) || !rich_lesson_material?(lesson)}
                       class="rounded bg-yellow-50 p-3 text-sm text-yellow-900"
                     >
                       {gettext(
@@ -1691,9 +1695,6 @@
                     </span>
                     <span class="rounded bg-slate-100 px-2 py-1 font-medium text-slate-700">
                       {length(plan_media(lesson))} {gettext("figures")}
-                    </span>
-                    <span class="rounded bg-slate-100 px-2 py-1 font-medium text-slate-700">
-                      {length(plan_application_problems(lesson))} {gettext("application problems")}
                     </span>
                   </div>
                   <p class="text-xs font-semibold uppercase tracking-wide text-gray-600">
@@ -1741,15 +1742,9 @@
                       data-openstax-author-review-warning
                       class="font-medium text-yellow-900"
                     >
-                      {if v5_lesson?(lesson),
-                        do:
-                          gettext(
-                            "Automated checks found blocking items. Resolve them or regenerate this lesson before approval."
-                          ),
-                        else:
-                          gettext(
-                            "Automated checks found items for author review. You may edit, regenerate, or approve this lesson as-is."
-                          )}
+                      {gettext(
+                        "Automated checks found blocking items. Resolve them or regenerate this lesson before approval."
+                      )}
                     </span>
                   </div>
                   <div
@@ -1823,197 +1818,6 @@
                       class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
                     >{plan_content(lesson, "narrative", source_excerpt(lesson))}</textarea>
                   </div>
-                  <fieldset class="space-y-4 rounded border border-slate-200 bg-slate-50 p-4">
-                    <legend class="px-1 text-sm font-semibold text-gray-900">
-                      {gettext("Lesson material")}
-                    </legend>
-                    <p class="text-xs text-gray-600">
-                      {gettext(
-                        "Edit the learner-facing text below. Source evidence, media, worked-example steps, and adaptive metadata stay attached."
-                      )}
-                    </p>
-
-                    <div>
-                      <label
-                        class="block text-sm font-semibold text-gray-800"
-                        for={"opening-hook-#{lesson.id}"}
-                      >
-                        {gettext("Opening hook")}
-                      </label>
-                      <textarea
-                        id={"opening-hook-#{lesson.id}"}
-                        name="lesson_plan[opening_hook]"
-                        rows="3"
-                        class="mt-1 block w-full rounded border-gray-300 bg-white text-sm focus:border-primary focus:ring-primary"
-                      >{plan_content(lesson, "opening_hook")}</textarea>
-                    </div>
-
-                    <div>
-                      <label
-                        class="block text-sm font-semibold text-gray-800"
-                        for={"why-this-matters-#{lesson.id}"}
-                      >
-                        {gettext("Why this matters")}
-                      </label>
-                      <textarea
-                        id={"why-this-matters-#{lesson.id}"}
-                        name="lesson_plan[why_this_matters]"
-                        rows="3"
-                        class="mt-1 block w-full rounded border-gray-300 bg-white text-sm focus:border-primary focus:ring-primary"
-                      >{plan_content(lesson, "why_this_matters")}</textarea>
-                    </div>
-
-                    <section :if={plan_instructional_sections(lesson) != []}>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Instructional sections")}
-                      </h5>
-                      <div class="mt-2 space-y-3">
-                        <div
-                          :for={
-                            {section, index} <-
-                              Enum.with_index(plan_instructional_sections(lesson))
-                          }
-                          class="rounded border border-gray-200 bg-white p-3"
-                        >
-                          <label
-                            class="block text-xs font-semibold text-gray-700"
-                            for={"instructional-section-heading-#{lesson.id}-#{index}"}
-                          >
-                            {gettext("Section heading")}
-                          </label>
-                          <input
-                            type="text"
-                            id={"instructional-section-heading-#{lesson.id}-#{index}"}
-                            name={"lesson_plan[instructional_sections][#{index}][heading]"}
-                            value={plan_item_value(section, "heading")}
-                            class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
-                          />
-                          <label
-                            class="mt-3 block text-xs font-semibold text-gray-700"
-                            for={"instructional-section-explanation-#{lesson.id}-#{index}"}
-                          >
-                            {gettext("Explanation")}
-                          </label>
-                          <textarea
-                            id={"instructional-section-explanation-#{lesson.id}-#{index}"}
-                            name={"lesson_plan[instructional_sections][#{index}][explanation]"}
-                            rows="5"
-                            class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
-                          >{plan_item_value(section, "explanation")}</textarea>
-                        </div>
-                      </div>
-                    </section>
-
-                    <section :if={plan_worked_examples(lesson) != []}>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Worked examples")}
-                      </h5>
-                      <div class="mt-2 space-y-3">
-                        <div
-                          :for={{example, index} <- Enum.with_index(plan_worked_examples(lesson))}
-                          class="rounded border border-gray-200 bg-white p-3"
-                        >
-                          <label
-                            class="block text-xs font-semibold text-gray-700"
-                            for={"worked-example-title-#{lesson.id}-#{index}"}
-                          >
-                            {gettext("Example title")}
-                          </label>
-                          <input
-                            type="text"
-                            id={"worked-example-title-#{lesson.id}-#{index}"}
-                            name={"lesson_plan[worked_examples][#{index}][title]"}
-                            value={plan_item_value(example, "title")}
-                            class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
-                          />
-                          <label
-                            class="mt-3 block text-xs font-semibold text-gray-700"
-                            for={"worked-example-body-#{lesson.id}-#{index}"}
-                          >
-                            {gettext("Example body")}
-                          </label>
-                          <textarea
-                            id={"worked-example-body-#{lesson.id}-#{index}"}
-                            name={"lesson_plan[worked_examples][#{index}][scenario]"}
-                            rows="4"
-                            class="mt-1 block w-full rounded border-gray-300 text-sm focus:border-primary focus:ring-primary"
-                          >{plan_item_value(example, "scenario")}</textarea>
-                        </div>
-                      </div>
-                    </section>
-
-                    <section :if={plan_curiosity_prompts(lesson) != []}>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Curiosity prompts")}
-                      </h5>
-                      <div class="mt-2 space-y-3">
-                        <div :for={
-                          {prompt, index} <- Enum.with_index(plan_curiosity_prompts(lesson))
-                        }>
-                          <label
-                            class="block text-xs font-semibold text-gray-700"
-                            for={"curiosity-prompt-#{lesson.id}-#{index}"}
-                          >
-                            {gettext("Prompt %{number}", number: index + 1)}
-                          </label>
-                          <textarea
-                            id={"curiosity-prompt-#{lesson.id}-#{index}"}
-                            name={"lesson_plan[curiosity_prompts][#{index}][prompt]"}
-                            rows="2"
-                            class="mt-1 block w-full rounded border-gray-300 bg-white text-sm focus:border-primary focus:ring-primary"
-                          >{plan_item_value(prompt, "prompt")}</textarea>
-                        </div>
-                      </div>
-                    </section>
-
-                    <section :if={plan_application_problems(lesson) != []}>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Application problems")}
-                      </h5>
-                      <div class="mt-2 space-y-3">
-                        <div :for={
-                          {problem, index} <- Enum.with_index(plan_application_problems(lesson))
-                        }>
-                          <label
-                            class="block text-xs font-semibold text-gray-700"
-                            for={"application-problem-#{lesson.id}-#{index}"}
-                          >
-                            {gettext("Problem %{number}", number: index + 1)}
-                          </label>
-                          <textarea
-                            id={"application-problem-#{lesson.id}-#{index}"}
-                            name={"lesson_plan[application_problems][#{index}][prompt]"}
-                            rows="3"
-                            class="mt-1 block w-full rounded border-gray-300 bg-white text-sm focus:border-primary focus:ring-primary"
-                          >{plan_item_value(problem, "prompt")}</textarea>
-                        </div>
-                      </div>
-                    </section>
-
-                    <section :if={plan_key_takeaways(lesson) != []}>
-                      <h5 class="text-sm font-semibold text-gray-900">
-                        {gettext("Key takeaways")}
-                      </h5>
-                      <div class="mt-2 space-y-3">
-                        <div :for={
-                          {takeaway, index} <- Enum.with_index(plan_key_takeaways(lesson))
-                        }>
-                          <label
-                            class="block text-xs font-semibold text-gray-700"
-                            for={"key-takeaway-#{lesson.id}-#{index}"}
-                          >
-                            {gettext("Takeaway %{number}", number: index + 1)}
-                          </label>
-                          <textarea
-                            id={"key-takeaway-#{lesson.id}-#{index}"}
-                            name="lesson_plan[key_takeaways][]"
-                            rows="2"
-                            class="mt-1 block w-full rounded border-gray-300 bg-white text-sm focus:border-primary focus:ring-primary"
-                          >{takeaway}</textarea>
-                        </div>
-                      </div>
-                    </section>
-                  </fieldset>
                   <div>
                     <p class="block text-sm font-semibold text-gray-800">
                       {gettext("Formative questions")}
@@ -2066,10 +1870,19 @@
                       <option value="basic" selected={lesson.plan_mode == "basic"}>
                         {gettext("Basic Author")}
                       </option>
-                      <option value="advanced" selected={lesson.plan_mode == "advanced"}>
+                      <option
+                        :if={lesson.plan_mode == "advanced"}
+                        value="advanced"
+                        selected
+                      >
                         {gettext("Advanced Author")}
                       </option>
                     </select>
+                    <p :if={lesson.plan_mode == "basic"} class="mt-1 text-xs text-gray-500">
+                      {gettext(
+                        "Advanced Author requires a fresh schema 6 generation; editing cannot synthesize an Exploration."
+                      )}
+                    </p>
                   </div>
                   <div class="flex gap-3">
                     <.button type="submit" variant={:primary} size={:sm}>

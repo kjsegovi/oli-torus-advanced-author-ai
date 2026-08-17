@@ -5,6 +5,7 @@ defmodule Oli.OpenStax.CourseImport.MediaWorkerTest do
   alias Oli.OpenStax.CourseImport
 
   alias Oli.OpenStax.CourseImport.{
+    BasicPlanV5,
     Lesson,
     LessonPlan,
     RichSource,
@@ -13,7 +14,8 @@ defmodule Oli.OpenStax.CourseImport.MediaWorkerTest do
     Unit
   }
 
-  alias Oli.OpenStax.CourseImport.Worker.MediaWorker
+  alias Oli.OpenStax.CourseImport.Worker.{ApplyWorker, MediaWorker}
+  alias Oli.Publishing.AuthoringResolver
   alias Oli.Repo
   alias Oli.ScopedFeatureFlags
 
@@ -112,9 +114,7 @@ defmodule Oli.OpenStax.CourseImport.MediaWorkerTest do
 
     run
     |> Run.update_changeset(%{
-      status: :compiling,
-      source_schema_version: 2,
-      plan_schema_version: 3
+      status: :compiling
     })
     |> Repo.update!()
 
@@ -154,6 +154,15 @@ defmodule Oli.OpenStax.CourseImport.MediaWorkerTest do
 
     assert inspect(compiled_lesson["page_content_template"]) =~ "https://media.example/"
     refute inspect(compiled_lesson["page_content_template"]) =~ source_url
+
+    assert :ok = perform_job(ApplyWorker, %{"run_id" => run.id})
+    assert {:ok, completed} = CourseImport.fetch_run(run.id)
+
+    [lesson_resource_id] = completed.result["lesson_resource_ids"]
+    persisted = AuthoringResolver.from_resource_id(project.slug, lesson_resource_id)
+
+    assert inspect(persisted.content) =~ "https://media.example/"
+    refute inspect(persisted.content) =~ source_url
   end
 
   defp create_approved_plan(run, asset) do
@@ -164,11 +173,7 @@ defmodule Oli.OpenStax.CourseImport.MediaWorkerTest do
         unit_name: "Unit 1",
         order: 1,
         status: "approved",
-        assessment_payload: %{
-          "title" => "Unit 1 assessment",
-          "authoring_mode" => "basic",
-          "questions" => questions()
-        }
+        assessment_payload: %{"questions" => []}
       })
       |> Repo.insert!()
 
@@ -186,32 +191,96 @@ defmodule Oli.OpenStax.CourseImport.MediaWorkerTest do
       })
       |> Repo.insert!()
 
+    source_lesson = %{
+      "title" => "Media lesson",
+      "source_objectives" => ["Interpret the selected diagram"],
+      "source_blocks" => [
+        %{
+          "id" => "block-1",
+          "kind" => "paragraph",
+          "text" => "A source-grounded explanation accompanies the selected diagram.",
+          "ast" => [
+            %{
+              "type" => "p",
+              "children" => [
+                %{
+                  "text" => "A source-grounded explanation accompanies the selected diagram."
+                }
+              ]
+            },
+            %{
+              "type" => "img",
+              "src" => asset.source_url,
+              "alt" => asset.alt_text
+            }
+          ]
+        }
+      ],
+      "source_media" => [
+        %{
+          "id" => asset.source_key,
+          "source_block_id" => "block-1",
+          "source_url" => asset.source_url,
+          "src" => asset.source_url,
+          "alt" => asset.alt_text,
+          "caption" => "Selected OpenStax diagram",
+          "status" => "ready",
+          "rights_status" => "approved"
+        }
+      ]
+    }
+
+    {:ok, content} =
+      BasicPlanV5.build(
+        %{
+          "title" => "Media lesson",
+          "orientation" => %{"overview" => "Interpret the selected source diagram."},
+          "content_groups" => [
+            %{
+              "id" => "diagram-evidence",
+              "title" => "Read the diagram",
+              "instructional_purpose" => "evidence",
+              "source_block_ids" => ["block-1"]
+            }
+          ],
+          "question_slots" => [],
+          "synthesis" => %{
+            "heading" => "Synthesis",
+            "summary" => "Use the diagram as evidence.",
+            "takeaways" => ["Connect the diagram to the explanation."]
+          }
+        },
+        source_lesson,
+        1
+      )
+
+    content =
+      Map.put(content, "media", [
+        %{
+          "id" => asset.source_key,
+          "source_media_id" => asset.source_key,
+          "source_block_id" => "block-1",
+          "source_url" => asset.source_url,
+          "src" => asset.source_url,
+          "alt" => asset.alt_text,
+          "caption" => "Selected OpenStax diagram"
+        }
+      ])
+
     %LessonPlan{}
     |> LessonPlan.changeset(%{
       lesson_id: lesson.id,
       version: 1,
-      content_payload: %{
-        "title" => "Media lesson",
-        "objective" => "Interpret the selected diagram",
-        "narrative" =>
-          "Use the diagram and source-grounded explanation to compare the represented ideas.",
-        "instructional_sections" => [
-          %{
-            "id" => "section-1",
-            "title" => "Read the diagram",
-            "explanation" =>
-              "The diagram provides evidence that students can connect to the lesson objective."
-          }
-        ],
-        "media" => [
-          %{
-            "source_media_id" => asset.source_key,
-            "alt" => asset.alt_text,
-            "caption" => "Selected OpenStax diagram"
-          }
-        ]
+      content_payload: content,
+      questions_payload: %{"items" => []},
+      generation_metadata: %{
+        "quality_gate" => %{
+          "approved" => true,
+          "confidence" => 0.99,
+          "hard_blockers" => [],
+          "repairs" => []
+        }
       },
-      questions_payload: %{"items" => questions()},
       checks_snapshot: %{
         "status" => "passed",
         "results" => [
@@ -228,13 +297,6 @@ defmodule Oli.OpenStax.CourseImport.MediaWorkerTest do
       approved_at: DateTime.utc_now()
     })
     |> Repo.insert!()
-  end
-
-  defp questions do
-    [
-      %{"id" => "q1", "type" => "short_answer", "prompt" => "Explain the diagram."},
-      %{"id" => "q2", "type" => "short_answer", "prompt" => "Apply the main idea."}
-    ]
   end
 
   defp source_snapshot(source_url) do

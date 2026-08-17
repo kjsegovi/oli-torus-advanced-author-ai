@@ -70,7 +70,7 @@ end
 config :oli,
   logger_truncation_enabled: get_env_as_boolean.("LOGGER_TRUNCATION_ENABLED", "true"),
   logger_truncation_length: get_env_as_integer.("LOGGER_TRUNCATION_LENGTH", "5000"),
-  openstax_basic_pages_v5_enabled: false,
+  openstax_advanced_pages_v6_enabled: false,
   openstax_generated_enrichment_enabled: false,
   openstax_enrichment_generator: Oli.OpenStax.CourseImport.Enrichment.Generator.Disabled,
   openstax_enrichment_research: Oli.OpenStax.CourseImport.Enrichment.Research.Disabled,

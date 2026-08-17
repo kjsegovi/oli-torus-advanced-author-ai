@@ -1,12 +1,12 @@
 defmodule Oli.OpenStax.CourseImport.QualityCritic do
   @moduledoc """
-  Independent v5 content and question criticism. A review passes only with an
+  Independent current-schema content and activity criticism. A review passes only with an
   explicit approval, confidence of at least 0.90, and no hard blockers.
   """
 
   alias Oli.GenAI.Completions.Message
   alias Oli.GenAI.Execution
-  alias Oli.OpenStax.CourseImport.BasicPlanV5
+  alias Oli.OpenStax.CourseImport.{AdvancedPlanV6, BasicPlanV5}
 
   @feature :openstax_course_import
   @confidence_threshold 0.90
@@ -40,6 +40,39 @@ defmodule Oli.OpenStax.CourseImport.QualityCritic do
           ),
         "questions_payload" => questions,
         "approved_prior_objective_ledger" => objective_ledger
+      },
+      service_config,
+      opts
+    )
+  end
+
+  @spec review_advanced_content(map(), map(), struct(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def review_advanced_content(lesson, content, service_config, opts \\ []) do
+    review(
+      :advanced_content,
+      %{
+        "source_contract" => AdvancedPlanV6.prompt_contract(lesson),
+        "experience_blueprint" => content["experience_blueprint"],
+        "content_groups" => content["content_groups"],
+        "coverage_manifest" => content["coverage_manifest"],
+        "media" => content["media"]
+      },
+      service_config,
+      opts
+    )
+  end
+
+  @spec review_advanced_activities(map(), map(), struct(), keyword()) ::
+          {:ok, map()} | {:error, term()}
+  def review_advanced_activities(lesson, content, service_config, opts \\ []) do
+    review(
+      :advanced_activities,
+      %{
+        "source_contract" => AdvancedPlanV6.prompt_contract(lesson),
+        "objective_catalog" => content["objective_catalog"],
+        "content_groups" => content["content_groups"],
+        "experience_blueprint" => content["experience_blueprint"]
       },
       service_config,
       opts
@@ -288,6 +321,44 @@ defmodule Oli.OpenStax.CourseImport.QualityCritic do
     "summary": string, "findings": [{"severity":"hard_blocker|repair|advisory",
     "code":string,"path":string,"message":string}]}. Never approve with a hard
     blocker or confidence below 0.90.
+    """
+  end
+
+  defp system_prompt(:advanced_content) do
+    """
+    You are the independent Sol experience critic for an OpenStax schema 6
+    Advanced Exploration. The deterministic source contract and hydrated source
+    groups are authoritative. Review complete source disposition, the driving
+    investigation, stage coherence, evidence and figure placement, accessibility,
+    objective alignment, and whether the source honestly supports 45–75 minutes of
+    substantive learner work. Generic padding, invented evidence, missing source,
+    duplicate group references, prerequisite violations, inaccessible required
+    media, or a merely decorative investigation are hard_blocker findings. Repairable
+    ordering, transition, pacing, or activity-slot placement issues are repair.
+
+    Return JSON only: {"approved": boolean, "confidence": 0.0..1.0,
+    "summary": string, "findings": [{"severity":"hard_blocker|repair|advisory",
+    "code":string,"path":string,"message":string}]}. Never approve with a hard
+    blocker, a repair finding, or confidence below 0.90.
+    """
+  end
+
+  defp system_prompt(:advanced_activities) do
+    """
+    You are the independent Sol activity critic for an OpenStax schema 6 Advanced
+    Exploration. Review every activity for correctness, source answerability,
+    meaningful context, exactly one correct response where scorable, a default
+    incorrect response, misconception-specific feedback, Not sure support, useful
+    hints, deterministic response-model compatibility, objective alignment, and
+    remediation to the exact relevant content group. Reject duplicate, generic,
+    context-free, future-content, or prerequisite-violating work. An incorrect or
+    unanswerable response contract is a hard_blocker; weak feedback or remediation is
+    repair. Models do not author Torus rule JSON, URLs, storage keys, or navigation ids.
+
+    Return JSON only: {"approved": boolean, "confidence": 0.0..1.0,
+    "summary": string, "findings": [{"severity":"hard_blocker|repair|advisory",
+    "code":string,"path":string,"message":string}]}. Never approve with a hard
+    blocker, a repair finding, or confidence below 0.90.
     """
   end
 

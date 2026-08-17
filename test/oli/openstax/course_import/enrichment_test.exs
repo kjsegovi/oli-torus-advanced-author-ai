@@ -52,7 +52,7 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
         source_url: "https://openstax.org/details/books/chemistry-2e",
         book_slug: "chemistry-2e",
         status: :awaiting_lesson_approval,
-        plan_schema_version: 4
+        plan_schema_version: 6
       })
       |> Repo.insert()
 
@@ -75,11 +75,11 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
     {:ok, author: author, project: project, run: run, lesson: lesson}
   end
 
-  test "v4 author updates cannot downgrade or stringify system schema metadata", %{
+  test "current author updates cannot downgrade or stringify system schema metadata", %{
     author: author,
     lesson: lesson
   } do
-    for schema_version <- [3, "4"] do
+    for schema_version <- [4, "5"] do
       assert {:error, :plan_schema_version_immutable} =
                CourseImport.update_lesson_plan(
                  lesson.id,
@@ -96,24 +96,23 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
     end
   end
 
-  test "v4 approval rejects a persisted schema downgrade", %{
-    author: author,
-    run: run,
-    lesson: lesson
-  } do
-    {:ok, _plan} =
-      %LessonPlan{}
-      |> LessonPlan.changeset(%{
+  test "plan persistence rejects a schema downgrade", %{lesson: lesson} do
+    changeset =
+      LessonPlan.changeset(%LessonPlan{}, %{
         lesson_id: lesson.id,
         version: 1,
-        content_payload: %{"schema_version" => 3, "coverage_manifest" => %{}},
+        content_payload: %{
+          "schema_version" => 4,
+          "authoring_mode" => "advanced",
+          "coverage_manifest" => %{}
+        },
         questions_payload: %{"items" => []},
         created_by: "author"
       })
-      |> Repo.insert()
 
-    assert {:error, :plan_schema_version_mismatch} =
-             CourseImport.approve_lesson(run.id, lesson.id, author)
+    refute changeset.valid?
+    assert {message, _} = changeset.errors[:content_payload]
+    assert message =~ "Basic schema 5 or Advanced schema 6"
   end
 
   test "proposal decisions cannot commit after the run leaves review", %{

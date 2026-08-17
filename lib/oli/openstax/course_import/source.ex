@@ -137,7 +137,7 @@ defmodule Oli.OpenStax.CourseImport.Source do
 
       media = collect_media(content_blocks)
       word_count = semantic_word_count(content_blocks)
-      excerpt = render_legacy_excerpt(content_blocks)
+      excerpt = render_source_preview(content_blocks)
 
       {:ok,
        %{
@@ -1131,47 +1131,47 @@ defmodule Oli.OpenStax.CourseImport.Source do
 
   defp drop_generated_identity(value), do: value
 
-  defp render_legacy_excerpt(blocks) do
+  defp render_source_preview(blocks) do
     blocks
-    |> Enum.flat_map(&legacy_excerpt_parts/1)
+    |> Enum.flat_map(&source_preview_parts/1)
     |> Enum.reject(&(&1 in [nil, ""]))
     |> Enum.join("\n\n")
   end
 
-  defp legacy_excerpt_parts(%{"kind" => "heading", "text" => text}),
+  defp source_preview_parts(%{"kind" => "heading", "text" => text}),
     do: ["### #{text}"]
 
-  defp legacy_excerpt_parts(%{"kind" => "objectives"} = block) do
+  defp source_preview_parts(%{"kind" => "objectives"} = block) do
     ["### Learning Objectives" | Enum.map(Map.get(block, "items", []), &"- #{&1}")]
   end
 
-  defp legacy_excerpt_parts(%{"kind" => "callout"} = block) do
+  defp source_preview_parts(%{"kind" => "callout"} = block) do
     marker =
       ["Callout: #{block["callout_type"]}", block["title"], block["subtitle"]]
       |> Enum.reject(&(&1 in [nil, ""]))
       |> Enum.join(" — ")
 
-    [marker | Enum.flat_map(Map.get(block, "blocks", []), &legacy_excerpt_parts/1)]
+    [marker | Enum.flat_map(Map.get(block, "blocks", []), &source_preview_parts/1)]
   end
 
-  defp legacy_excerpt_parts(%{"kind" => "footnotes"} = block),
-    do: ["Footnotes:" | Enum.flat_map(Map.get(block, "blocks", []), &legacy_excerpt_parts/1)]
+  defp source_preview_parts(%{"kind" => "footnotes"} = block),
+    do: ["Footnotes:" | Enum.flat_map(Map.get(block, "blocks", []), &source_preview_parts/1)]
 
-  defp legacy_excerpt_parts(%{"kind" => "list"} = block) do
+  defp source_preview_parts(%{"kind" => "list"} = block) do
     block
     |> Map.get("items", [])
     |> Enum.flat_map(fn item ->
       [
         "- #{item["text"]}"
-        | Enum.flat_map(Map.get(item, "children", []), &legacy_excerpt_parts/1)
+        | Enum.flat_map(Map.get(item, "children", []), &source_preview_parts/1)
       ]
     end)
   end
 
-  defp legacy_excerpt_parts(%{"kind" => "code", "text" => text}),
+  defp source_preview_parts(%{"kind" => "code", "text" => text}),
     do: ["Code example:\n#{text}"]
 
-  defp legacy_excerpt_parts(%{"kind" => "figure"} = block) do
+  defp source_preview_parts(%{"kind" => "figure"} = block) do
     caption = block["caption"] || block["text"]
 
     alt =
@@ -1184,20 +1184,20 @@ defmodule Oli.OpenStax.CourseImport.Source do
     ["Figure context: #{caption}", if(alt == "", do: nil, else: "Alt text: #{alt}")]
   end
 
-  defp legacy_excerpt_parts(%{"kind" => "media"} = block),
+  defp source_preview_parts(%{"kind" => "media"} = block),
     do: ["Media context: #{block["text"]}"]
 
-  defp legacy_excerpt_parts(%{"kind" => "table", "text" => text}),
+  defp source_preview_parts(%{"kind" => "table", "text" => text}),
     do: ["Table: #{text}"]
 
-  defp legacy_excerpt_parts(%{"kind" => "quote", "text" => text}),
+  defp source_preview_parts(%{"kind" => "quote", "text" => text}),
     do: ["Note: #{text}"]
 
-  defp legacy_excerpt_parts(%{"kind" => "caption", "text" => text}),
+  defp source_preview_parts(%{"kind" => "caption", "text" => text}),
     do: ["Figure context: #{text}"]
 
-  defp legacy_excerpt_parts(%{"text" => text}), do: [text]
-  defp legacy_excerpt_parts(_), do: []
+  defp source_preview_parts(%{"text" => text}), do: [text]
+  defp source_preview_parts(_), do: []
 
   defp attribute(attributes, name) when is_list(attributes) do
     Enum.find_value(attributes, fn

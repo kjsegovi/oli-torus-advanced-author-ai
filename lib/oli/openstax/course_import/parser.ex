@@ -5,18 +5,11 @@ defmodule Oli.OpenStax.CourseImport.Parser do
   """
 
   @details_path ~r{\A/details/books/(?<slug>[a-z0-9]+(?:-[a-z0-9]+)*)/?\z}
-  @default_bundle_size 2
-  @standalone_word_threshold 1_200
-  @standalone_block_threshold 24
-  @standalone_major_feature_threshold 4
-  @merge_objective_limit 3
   @exceptional_word_threshold 3_000
   @exceptional_average_chunk_word_threshold 900
   @exceptional_chunk_threshold 10
   @max_pedagogical_chunks_per_lesson 4
-  @compatibility_excerpt_block_limit 24
-  @compatibility_excerpt_char_limit 10_000
-  @full_source_plan_schema_version 4
+  @current_plan_schema_version 6
   @deterministically_omittable_block_kinds ~w(
     navigation duplicated_boilerplate boilerplate unsafe_media
   )
@@ -45,68 +38,69 @@ defmodule Oli.OpenStax.CourseImport.Parser do
   def verify_book_url(url), do: parse_openstax_url(url)
 
   @doc """
-  Builds the legacy adaptive outline used by plan schemas v1-v3.
-
-  Use `build_outline/2` with `plan_schema_version: 4` for the refined import
-  contract, where source sections are never merged and only an exceptional
-  section may be split at an existing pedagogical boundary.
+  Builds the schema 6 run outline. Source sections are never merged; only an
+  exceptional section may be split at an existing pedagogical boundary.
   """
   @spec build_outline(map()) :: {:ok, outline()} | {:error, term()}
-  def build_outline(snapshot), do: build_outline(snapshot, [])
+  def build_outline(snapshot), do: build_outline(snapshot, plan_schema_version: 6)
 
   @spec build_outline(map(), keyword()) :: {:ok, outline()} | {:error, term()}
   def build_outline(%{"book_slug" => book_slug, "chapters" => chapters} = snapshot, opts)
       when is_list(opts) and is_binary(book_slug) and is_list(chapters) do
-    selected_chapters = Enum.filter(chapters, &Map.get(&1, "selected", true))
+    if Keyword.get(opts, :plan_schema_version) == @current_plan_schema_version do
+      selected_chapters = Enum.filter(chapters, &Map.get(&1, "selected", true))
 
-    case selected_chapters do
-      [] ->
-        {:error, :no_chapters_selected}
+      case selected_chapters do
+        [] ->
+          {:error, :no_chapters_selected}
 
-      chapters ->
-        units =
-          chapters
-          |> Enum.sort_by(&Map.get(&1, "order", 0))
-          |> Enum.with_index(1)
-          |> Enum.map(fn {chapter, unit_order} ->
-            {assessment_sources, sections} =
-              chapter
-              |> Map.get("sections", [])
-              |> Enum.filter(&valid_section?/1)
-              |> Enum.split_with(&assessment_source?/1)
+        chapters ->
+          units =
+            chapters
+            |> Enum.sort_by(&Map.get(&1, "order", 0))
+            |> Enum.with_index(1)
+            |> Enum.map(fn {chapter, unit_order} ->
+              {assessment_sources, sections} =
+                chapter
+                |> Map.get("sections", [])
+                |> Enum.filter(&valid_section?/1)
+                |> Enum.split_with(&assessment_source?/1)
 
-            lessons =
-              sections
-              |> section_groups(opts)
-              |> Enum.with_index(1)
-              |> Enum.map(fn {lesson_sections, lesson_order} ->
-                build_lesson(lesson_sections, lesson_order, opts)
-              end)
+              lessons =
+                sections
+                |> section_groups()
+                |> Enum.with_index(1)
+                |> Enum.map(fn {lesson_sections, lesson_order} ->
+                  build_lesson(lesson_sections, lesson_order)
+                end)
 
-            %{
-              "unit_name" => Map.get(chapter, "title", "Unit #{unit_order}"),
-              "order" => unit_order,
-              "source_reference" => %{
-                "chapter_id" => chapter["id"],
-                "source_url" => chapter["url"],
-                "assessment_source_urls" => Enum.map(assessment_sources, & &1["url"])
-              },
-              "assessment_evidence" => assessment_evidence(assessment_sources),
-              "lessons" => lessons
-            }
-          end)
+              %{
+                "unit_name" => Map.get(chapter, "title", "Unit #{unit_order}"),
+                "order" => unit_order,
+                "source_reference" => %{
+                  "chapter_id" => chapter["id"],
+                  "source_url" => chapter["url"],
+                  "assessment_source_urls" => Enum.map(assessment_sources, & &1["url"])
+                },
+                "assessment_evidence" => assessment_evidence(assessment_sources),
+                "lessons" => lessons
+              }
+            end)
 
-        if Enum.any?(units, &(Map.get(&1, "lessons", []) == [])) do
-          {:error, :selected_chapter_has_no_sections}
-        else
-          {:ok,
-           %{
-             "book_slug" => book_slug,
-             "title" => snapshot["title"] || format_book_title(book_slug),
-             "license" => snapshot["license"] || %{},
-             "units" => units
-           }}
-        end
+          if Enum.any?(units, &(Map.get(&1, "lessons", []) == [])) do
+            {:error, :selected_chapter_has_no_sections}
+          else
+            {:ok,
+             %{
+               "book_slug" => book_slug,
+               "title" => snapshot["title"] || format_book_title(book_slug),
+               "license" => snapshot["license"] || %{},
+               "units" => units
+             }}
+          end
+      end
+    else
+      {:error, {:unsupported_openstax_plan_schema, Keyword.get(opts, :plan_schema_version)}}
     end
   end
 
@@ -225,34 +219,8 @@ defmodule Oli.OpenStax.CourseImport.Parser do
         block["normalized_text"] ||
         get_in(block, ["metadata", "semantic_payload", "text"])
 
-  defp section_groups(sections, opts) do
-    if plan_schema_version(opts) >= @full_source_plan_schema_version do
-      sections
-      |> Enum.flat_map(&split_exceptional_section/1)
-      |> Enum.map(&[&1])
-    else
-      adaptive_section_groups(sections)
-    end
-  end
-
-  defp adaptive_section_groups(sections) do
-    {opening_hook, numbered_sections} = chapter_opening(sections)
-
-    {groups, pending} =
-      numbered_sections
-      |> Enum.flat_map(&split_exceptional_section/1)
-      |> Enum.reduce({[], []}, fn section, {groups, pending} ->
-        if standalone_section?(section) do
-          {groups ++ light_section_groups(pending) ++ [[section]], []}
-        else
-          {groups, pending ++ [section]}
-        end
-      end)
-
-    groups
-    |> Kernel.++(light_section_groups(pending))
-    |> merge_chapter_opening(opening_hook)
-  end
+  defp section_groups(sections),
+    do: sections |> Enum.flat_map(&split_exceptional_section/1) |> Enum.map(&[&1])
 
   defp split_exceptional_section(section) do
     blocks = section_content_blocks(section)
@@ -482,77 +450,6 @@ defmodule Oli.OpenStax.CourseImport.Parser do
        when is_integer(value) and value >= 0 and is_integer(divisor) and divisor > 0,
        do: div(value + divisor - 1, divisor)
 
-  defp light_section_groups([]), do: []
-
-  defp light_section_groups(sections) do
-    {groups, pending} =
-      Enum.reduce(sections, {[], []}, fn section, {groups, pending} ->
-        candidate = pending ++ [section]
-
-        cond do
-          pending == [] ->
-            {groups, candidate}
-
-          length(candidate) <= @default_bundle_size and mergeable_group?(candidate) ->
-            {groups, candidate}
-
-          true ->
-            {groups ++ [pending], [section]}
-        end
-      end)
-
-    if pending == [], do: groups, else: groups ++ [pending]
-  end
-
-  defp mergeable_group?(sections) do
-    Enum.reduce(sections, 0, &(&2 + section_word_count(&1))) < @standalone_word_threshold and
-      sections
-      |> Enum.flat_map(&section_objectives/1)
-      |> Enum.uniq()
-      |> length() < @merge_objective_limit
-  end
-
-  defp chapter_opening([section | rest]) do
-    if chapter_intro?(section) and section_objectives(section) == [],
-      do: {section, rest},
-      else: {nil, [section | rest]}
-  end
-
-  defp chapter_opening([]), do: {nil, []}
-
-  defp merge_chapter_opening([], nil), do: []
-  defp merge_chapter_opening([], opening), do: [[opening]]
-  defp merge_chapter_opening(groups, nil), do: groups
-
-  defp merge_chapter_opening([first | rest], opening),
-    do: [[opening | first] | rest]
-
-  defp standalone_section?(section) do
-    blocks = section_content_blocks(section)
-
-    major_features =
-      recursive_kind_count(blocks, "heading", &major_heading?/1) +
-        recursive_kind_count(blocks, "callout")
-
-    is_map(section["source_fragment"]) or
-      (chapter_intro?(section) and section_objectives(section) != []) or
-      section_word_count(section) >= @standalone_word_threshold or
-      length(section_objectives(section)) >= 2 or
-      recursive_block_count(blocks) >= @standalone_block_threshold or
-      major_features >= @standalone_major_feature_threshold or
-      Enum.any?(section_media(section), &meaningful_figure?/1)
-  end
-
-  defp major_heading?(%{"level" => level}) when is_integer(level), do: level in 2..4
-  defp major_heading?(_), do: false
-
-  defp meaningful_figure?(media) when is_map(media) do
-    is_binary(media["src"] || media["source_url"] || media["url"]) and
-      is_binary(media["alt"] || media["alt_text"])
-  end
-
-  defp meaningful_figure?(_), do: false
-
   defp section_objectives(section),
     do:
       section
@@ -562,22 +459,7 @@ defmodule Oli.OpenStax.CourseImport.Parser do
       |> Enum.map(&String.trim/1)
       |> Enum.reject(&(&1 == ""))
 
-  defp chapter_intro?(section) do
-    section["order"] == 0 or
-      case section["url"] do
-        url when is_binary(url) ->
-          url
-          |> URI.parse()
-          |> Map.get(:path)
-          |> to_string()
-          |> String.ends_with?("-introduction")
-
-        _ ->
-          false
-      end
-  end
-
-  defp build_lesson(sections, lesson_order, opts) do
+  defp build_lesson(sections, lesson_order) do
     source_blocks = lesson_source_blocks(sections)
     source_media = lesson_source_media(sections)
     source_block_ids = recursive_source_block_ids(source_blocks)
@@ -632,36 +514,30 @@ defmodule Oli.OpenStax.CourseImport.Parser do
           "excerpt_block_ids" => excerpt_coverage.block_ids,
           "excerpt_truncated" => excerpt_coverage.truncated
         }
-        |> maybe_add_full_source_coverage(
-          opts,
+        |> add_current_source_coverage(
           substantive_block_ids,
           deterministically_omittable_block_ids
         )
     }
   end
 
-  defp maybe_add_full_source_coverage(
+  defp add_current_source_coverage(
          coverage,
-         opts,
          substantive_block_ids,
          deterministically_omittable_block_ids
        ) do
-    if plan_schema_version(opts) >= @full_source_plan_schema_version do
-      coverage
-      |> Map.put("policy", "full_substantive_source")
-      |> Map.put("policy_schema_version", @full_source_plan_schema_version)
-      |> Map.put("substantive_block_ids", substantive_block_ids)
-      |> Map.put(
-        "deterministically_omittable_block_ids",
-        deterministically_omittable_block_ids
-      )
-      |> Map.put(
-        "deterministically_omittable_kinds",
-        @deterministically_omittable_block_kinds
-      )
-    else
-      coverage
-    end
+    coverage
+    |> Map.put("policy", "exact_ast_source")
+    |> Map.put("policy_schema_version", @current_plan_schema_version)
+    |> Map.put("substantive_block_ids", substantive_block_ids)
+    |> Map.put(
+      "deterministically_omittable_block_ids",
+      deterministically_omittable_block_ids
+    )
+    |> Map.put(
+      "deterministically_omittable_kinds",
+      @deterministically_omittable_block_kinds
+    )
   end
 
   defp recursive_source_blocks(blocks) do
@@ -690,13 +566,6 @@ defmodule Oli.OpenStax.CourseImport.Parser do
 
   defp substantive_source_block?(block) do
     block_kind(block) not in @deterministically_omittable_block_kinds
-  end
-
-  defp plan_schema_version(opts) do
-    case Keyword.get(opts, :plan_schema_version, 3) do
-      version when is_integer(version) -> version
-      _ -> 3
-    end
   end
 
   defp recursive_source_block_ids(blocks) do
@@ -771,35 +640,7 @@ defmodule Oli.OpenStax.CourseImport.Parser do
     end)
   end
 
-  defp section_content_blocks(section) do
-    case Map.get(section, "excerpt") do
-      excerpt when is_binary(excerpt) and excerpt != "" ->
-        url = Map.get(section, "url", "")
-
-        [
-          %{
-            "id" => legacy_block_id(url),
-            "kind" => "paragraph",
-            "order" => 1,
-            "heading_path" => [],
-            "text" => excerpt,
-            "source_locator" => %{"legacy_excerpt" => true}
-          }
-        ]
-
-      _ ->
-        []
-    end
-  end
-
-  defp legacy_block_id(url) do
-    digest =
-      :crypto.hash(:sha256, "#{url}|legacy-excerpt")
-      |> Base.encode16(case: :lower)
-      |> String.slice(0, 24)
-
-    "openstax-block-#{digest}"
-  end
+  defp section_content_blocks(_section), do: []
 
   defp lesson_source_media(sections) do
     sections
@@ -862,154 +703,26 @@ defmodule Oli.OpenStax.CourseImport.Parser do
   defp lesson_title(_, lesson_order), do: "Lesson #{lesson_order}"
 
   defp lesson_excerpt(source_blocks) do
-    selected_blocks = select_excerpt_blocks(source_blocks)
+    preview_limit = 2_000
+    block_ids = recursive_source_block_ids(source_blocks)
 
-    header_budget =
-      selected_blocks
-      |> Enum.uniq_by(& &1["source_section_url"])
-      |> Enum.reduce(0, fn block, size ->
-        size + String.length(block["source_section_title"] || "OpenStax section") + 5
-      end)
-
-    block_budget =
-      case length(selected_blocks) do
-        0 ->
-          @compatibility_excerpt_char_limit
-
-        count ->
-          max(div(@compatibility_excerpt_char_limit - header_budget, count), 120)
-      end
-
-    {parts, _current_section, clipped?} =
-      Enum.reduce(selected_blocks, {[], nil, false}, fn block,
-                                                        {parts, current_section, clipped?} ->
-        section_url = block["source_section_url"]
-        section_title = block["source_section_title"] || "OpenStax section"
-        {snippet, snippet_clipped?} = compatibility_block_text(block, block_budget)
-
-        section_parts =
-          if section_url == current_section,
-            do: [snippet],
-            else: ["## #{section_title}", snippet]
-
-        {parts ++ section_parts, section_url, clipped? or snippet_clipped?}
-      end)
-
-    excerpt =
-      parts
-      |> Enum.reject(&(&1 in [nil, ""]))
+    text =
+      source_blocks
+      |> recursive_source_blocks()
+      |> Enum.map(&block_text/1)
+      |> Enum.filter(&is_binary/1)
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
       |> Enum.join("\n\n")
 
-    coverage = %{
-      block_count: length(selected_blocks),
-      block_ids: Enum.map(selected_blocks, & &1["id"]),
-      truncated: length(selected_blocks) < length(source_blocks) or clipped?
-    }
+    preview = String.slice(text, 0, preview_limit)
 
-    {excerpt, coverage}
-  end
-
-  defp select_excerpt_blocks(blocks)
-       when length(blocks) <= @compatibility_excerpt_block_limit,
-       do: blocks
-
-  defp select_excerpt_blocks(blocks) do
-    first_per_section = Enum.uniq_by(blocks, & &1["source_section_url"])
-
-    structural =
-      Enum.filter(blocks, fn block ->
-        block["kind"] in ~w(heading objectives callout figure table code footnotes)
-      end)
-
-    required =
-      (first_per_section ++ structural)
-      |> Enum.uniq_by(& &1["id"])
-
-    cond do
-      length(required) >= @compatibility_excerpt_block_limit ->
-        evenly_spaced(required, @compatibility_excerpt_block_limit)
-        |> restore_source_order(blocks)
-
-      true ->
-        remaining_slots = @compatibility_excerpt_block_limit - length(required)
-        required_ids = MapSet.new(required, & &1["id"])
-        remaining = Enum.reject(blocks, &MapSet.member?(required_ids, &1["id"]))
-
-        (required ++ evenly_spaced(remaining, remaining_slots))
-        |> Enum.uniq_by(& &1["id"])
-        |> restore_source_order(blocks)
-    end
-  end
-
-  defp evenly_spaced(_items, count) when count <= 0, do: []
-
-  defp evenly_spaced(items, count) when count >= length(items), do: items
-
-  defp evenly_spaced(items, 1), do: [List.first(items)]
-
-  defp evenly_spaced(items, count) do
-    last_index = length(items) - 1
-
-    0..(count - 1)
-    |> Enum.map(fn index ->
-      source_index = round(index * last_index / (count - 1))
-      Enum.at(items, source_index)
-    end)
-    |> Enum.uniq()
-  end
-
-  defp restore_source_order(selected, source_blocks) do
-    selected_ids = MapSet.new(selected, & &1["id"])
-    Enum.filter(source_blocks, &MapSet.member?(selected_ids, &1["id"]))
-  end
-
-  defp compatibility_block_text(block, budget) do
-    text =
-      case block do
-        %{"kind" => "heading", "text" => text} ->
-          "### #{text}"
-
-        %{"kind" => "objectives", "items" => items} ->
-          "Learning Objectives:\n" <> Enum.map_join(items, "\n", &"- #{&1}")
-
-        %{"kind" => "callout"} ->
-          callout_label =
-            [block["title"], block["subtitle"]]
-            |> Enum.reject(&(&1 in [nil, ""]))
-            |> Enum.join(": ")
-
-          "Callout (#{block["callout_type"]}): #{callout_label}\n#{block["text"]}"
-
-        %{"kind" => "figure"} ->
-          "Figure: #{block["caption"] || block["text"]}"
-
-        %{"kind" => "table"} ->
-          "Table: #{block["text"]}"
-
-        %{"kind" => "code"} ->
-          "Code example:\n#{block["text"]}"
-
-        %{"kind" => "footnotes"} ->
-          "Footnotes: #{block["text"]}"
-
-        %{"kind" => "list"} ->
-          block
-          |> Map.get("items", [])
-          |> Enum.map_join("\n", fn item -> "- #{item["text"]}" end)
-
-        %{"text" => text} ->
-          text
-
-        _ ->
-          ""
-      end
-      |> String.trim()
-
-    if String.length(text) > budget do
-      {String.slice(text, 0, max(budget - 1, 0)) <> "…", true}
-    else
-      {text, false}
-    end
+    {preview,
+     %{
+       block_count: length(block_ids),
+       block_ids: block_ids,
+       truncated: String.length(text) > String.length(preview)
+     }}
   end
 
   defp block_kind_counts(blocks) do
@@ -1032,28 +745,6 @@ defmodule Oli.OpenStax.CourseImport.Parser do
     |> Enum.reduce(0, fn
       %{} = item, count -> count + recursive_block_count(Map.get(item, "children", []))
       _item, count -> count
-    end)
-  end
-
-  defp recursive_kind_count(blocks, kind, predicate \\ fn _ -> true end) do
-    Enum.reduce(blocks, 0, fn block, count ->
-      matching = if block["kind"] == kind and predicate.(block), do: 1, else: 0
-
-      count + matching +
-        recursive_kind_count(Map.get(block, "blocks", []), kind, predicate) +
-        list_child_kind_count(Map.get(block, "items", []), kind, predicate)
-    end)
-  end
-
-  defp list_child_kind_count(items, kind, predicate) do
-    items
-    |> List.wrap()
-    |> Enum.reduce(0, fn
-      %{} = item, count ->
-        count + recursive_kind_count(Map.get(item, "children", []), kind, predicate)
-
-      _item, count ->
-        count
     end)
   end
 

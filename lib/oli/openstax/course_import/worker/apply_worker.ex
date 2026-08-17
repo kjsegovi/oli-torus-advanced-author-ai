@@ -2,7 +2,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.ApplyWorker do
   @moduledoc """
   Atomically applies the dry-run-compiled OpenStax course hierarchy.
 
-  Units, lesson pages, formative activities, unit assessments, the root
+  Units, source-faithful lesson pages, embedded activities, the root
   revision, project attribution, lesson statuses, and run completion all commit
   in one database transaction.
   """
@@ -215,12 +215,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.ApplyWorker do
         lesson_results =
           Enum.map(unit["lessons"], &create_lesson_page(project, author, &1))
 
-        assessment =
-          create_assessment_page(project, author, unit["title"], unit["assessment"])
-
-        children =
-          Enum.map(lesson_results, & &1.page.resource_id) ++
-            [assessment.page.resource_id]
+        children = Enum.map(lesson_results, & &1.page.resource_id)
 
         unit_revision =
           create_container(project, author, unit["title"], children)
@@ -228,10 +223,10 @@ defmodule Oli.OpenStax.CourseImport.Worker.ApplyWorker do
         %{
           units: acc.units ++ [%{unit_id: unit["unit_id"], revision: unit_revision}],
           lesson_pages: acc.lesson_pages ++ Enum.map(lesson_results, & &1.page),
-          assessment_pages: acc.assessment_pages ++ [assessment.page],
+          assessment_pages: acc.assessment_pages,
           activity_revisions:
             acc.activity_revisions ++
-              Enum.flat_map(lesson_results, & &1.activities) ++ assessment.activities
+              Enum.flat_map(lesson_results, & &1.activities)
         }
       end
     )
@@ -260,26 +255,6 @@ defmodule Oli.OpenStax.CourseImport.Worker.ApplyWorker do
         false
       )
 
-    %{page: page, activities: Enum.map(activities, & &1.revision)}
-  end
-
-  defp create_assessment_page(project, author, unit_title, assessment) do
-    title = assessment["title"] || "#{unit_title} assessment"
-
-    activities =
-      create_compiled_activities(
-        assessment["activities"],
-        project,
-        author,
-        title
-      )
-
-    content =
-      assessment["page_content_template"]
-      |> AuthoringCompiler.realize_page(activity_ids(activities))
-      |> unwrap()
-
-    page = create_page(project, author, title, content, true)
     %{page: page, activities: Enum.map(activities, & &1.revision)}
   end
 

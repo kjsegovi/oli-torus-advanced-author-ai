@@ -17,8 +17,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
   @default_width 1200
   @default_height 540
-  @narrative_words_per_screen 80
-  @minimum_reflection_length 40
   @screen_bottom_padding 48
   @maximum_media_height 420
 
@@ -37,7 +35,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
              is_binary(stable_key) and is_list(opts) do
     questions = questions(questions_payload)
 
-    with {:ok, normalized_questions} <- validate_questions(questions, mode, content_payload),
+    with :ok <- validate_current_content_contract(mode, content_payload),
+         {:ok, normalized_questions} <- validate_questions(questions, mode, content_payload),
          {:ok, media_assets} <- resolve_media_assets(content_payload, opts),
          attribution <- normalize_attribution(content_payload, opts),
          {:ok, artifact} <-
@@ -58,21 +57,36 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
   def compile(_, _, _, _, _, _), do: {:error, :invalid_authoring_artifact}
 
+  defp validate_current_content_contract("basic", %{
+         "schema_version" => 5,
+         "authoring_mode" => "basic"
+       }),
+       do: :ok
+
+  defp validate_current_content_contract("advanced", %{
+         "schema_version" => 6,
+         "authoring_mode" => "advanced",
+         "experience_blueprint" => %{}
+       }),
+       do: :ok
+
+  defp validate_current_content_contract(mode, content),
+    do: {:error, {:unsupported_openstax_content_contract, mode, content["schema_version"]}}
+
   defp compile_mode(
          "advanced",
          title,
-         content,
-         questions,
+         %{"schema_version" => 6} = content,
+         [],
          stable_key,
          media_assets,
          attribution,
          opts
        ),
        do:
-         compile_advanced(
+         compile_advanced_v6(
            title,
            content,
-           questions,
            stable_key,
            media_assets,
            attribution,
@@ -82,7 +96,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   defp compile_mode(
          "basic",
          title,
-         content,
+         %{"schema_version" => 5} = content,
          questions,
          stable_key,
          media_assets,
@@ -98,6 +112,9 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
            media_assets,
            attribution
          )
+
+  defp compile_mode(mode, _title, content, _questions, _stable_key, _media, _attribution, _opts),
+    do: {:error, {:unsupported_openstax_content_contract, mode, content["schema_version"]}}
 
   @doc """
   Replaces compiler-only activity keys with persisted resource ids.
@@ -153,7 +170,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
       section_ids =
         content
-        |> instructional_sections()
+        |> Map.get("content_groups", [])
+        |> List.wrap()
         |> Enum.map(& &1["id"])
         |> MapSet.new()
 
@@ -206,67 +224,13 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
          attribution,
          references_by_section
        ) do
-    if content["schema_version"] == 5 do
-      basic_v5_instructional_blocks(
-        content,
-        stable_key,
-        media_assets,
-        attribution,
-        references_by_section
-      )
-    else
-      basic_legacy_instructional_blocks(
-        content,
-        stable_key,
-        media_assets,
-        attribution,
-        references_by_section
-      )
-    end
-  end
-
-  defp basic_legacy_instructional_blocks(
-         content,
-         stable_key,
-         media_assets,
-         attribution,
-         references_by_section
-       ) do
-    objectives = learning_objectives(content)
-    sections = instructional_sections(content)
-    curated = normalize_curated_enrichments(content["curated_enrichments"])
-    section_ids = MapSet.new(sections, & &1["id"])
-
-    unplaced_curated =
-      Enum.reject(curated, fn enrichment ->
-        placement = enrichment["placement_after_section_id"]
-        is_binary(placement) and MapSet.member?(section_ids, placement)
-      end)
-
-    [
-      lesson_overview_block(content, objectives, sections, stable_key)
-    ] ++
-      why_this_matters_blocks(content, stable_key) ++
-      rich_callout_blocks(content["callouts"], "#{stable_key}:source-callouts") ++
-      media_blocks(media_assets, nil, "#{stable_key}:opening-media") ++
-      (sections
-       |> Enum.with_index(1)
-       |> Enum.flat_map(fn {section, index} ->
-         instructional_section_blocks(
-           section,
-           index,
-           stable_key,
-           media_assets,
-           Map.get(references_by_section, section["id"], []),
-           curated_for_placement(curated, section["id"])
-         )
-       end)) ++
-      worked_example_blocks(content["worked_examples"], stable_key) ++
-      application_problem_blocks(content["application_problems"], stable_key) ++
-      curated_enrichment_blocks(unplaced_curated, "#{stable_key}:curated") ++
-      key_takeaways_block(content, stable_key) ++
-      source_evidence_block(content["source_evidence_links"], stable_key) ++
-      attribution_blocks(attribution, stable_key)
+    basic_v5_instructional_blocks(
+      content,
+      stable_key,
+      media_assets,
+      attribution,
+      references_by_section
+    )
   end
 
   defp basic_v5_instructional_blocks(
@@ -541,342 +505,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
   defp resolve_v5_ast_media(node, _media_lookup), do: node
 
-  defp lesson_overview_block(content, objectives, sections, stable_key) do
-    introduction =
-      first_present([
-        content["introduction"],
-        content["overview"],
-        if(explicit_instructional_sections?(content), do: content["narrative"]),
-        if(sections == [], do: content["narrative"])
-      ])
-
-    children =
-      [
-        text_element("h2", "Learning Objectives", "#{stable_key}:objectives-heading"),
-        string_list_element("ul", objectives, "#{stable_key}:objectives")
-      ] ++ paragraph_elements(introduction, "#{stable_key}:introduction")
-
-    content_block(children, "#{stable_key}:overview")
-  end
-
-  defp explicit_instructional_sections?(content) do
-    [
-      content["instructional_sections"],
-      content["lesson_sections"],
-      content["sections"]
-    ]
-    |> Enum.any?(fn sections ->
-      is_list(sections) and Enum.any?(sections)
-    end)
-  end
-
-  defp why_this_matters_blocks(content, stable_key) do
-    callout_blocks(
-      content["why_this_matters"],
-      "learnmore",
-      "Why this matters",
-      "#{stable_key}:why-this-matters"
-    )
-  end
-
-  defp rich_callout_blocks(callouts, stable_key) do
-    callouts
-    |> List.wrap()
-    |> Enum.reject(&curiosity_callout?/1)
-    |> Enum.with_index(1)
-    |> Enum.flat_map(fn {callout, index} ->
-      callout_blocks(
-        [callout],
-        callout_purpose(callout),
-        "Source connection",
-        "#{stable_key}:#{index}"
-      )
-    end)
-  end
-
-  defp callout_purpose(%{"type" => type})
-       when type in ["example", "concepts_in_practice"],
-       do: "example"
-
-  defp callout_purpose(_), do: "learnmore"
-
-  defp curiosity_callout?(%{"type" => "curiosity"}), do: true
-  defp curiosity_callout?(_), do: false
-
-  defp instructional_section_blocks(
-         section,
-         index,
-         stable_key,
-         media_assets,
-         references,
-         curated
-       ) do
-    section_key = "#{stable_key}:section:#{section["id"] || index}"
-
-    section_children =
-      [text_element("h2", section["title"], "#{section_key}:heading")] ++
-        paragraph_elements(section["explanation"], "#{section_key}:explanation") ++
-        section_takeaway_elements(section["key_takeaways"], section_key) ++
-        source_evidence_elements(section["source_evidence_links"], section_key)
-
-    [content_block(section_children, section_key)] ++
-      callout_blocks(
-        section["callouts"] |> List.wrap() |> Enum.reject(&curiosity_callout?/1),
-        "learnmore",
-        "Go deeper",
-        "#{section_key}:callouts"
-      ) ++
-      media_blocks(media_assets, section["id"], "#{section_key}:media") ++
-      worked_example_blocks(section["examples"], "#{section_key}:examples") ++
-      curated_enrichment_blocks(curated, "#{section_key}:curated") ++
-      practice_group(references, "#{section_key}:practice")
-  end
-
-  defp curated_enrichment_blocks(enrichments, stable_key) do
-    enrichments
-    |> Enum.with_index(1)
-    |> Enum.map(fn {enrichment, index} ->
-      key = "#{stable_key}:#{index}"
-      title = enrichment["title"]
-
-      children =
-        [text_element("h3", title, "#{key}:heading")] ++
-          paragraph_elements(enrichment["annotation"], "#{key}:annotation") ++
-          [text_element("h4", "Try this resource", "#{key}:task-heading")] ++
-          paragraph_elements(enrichment["learner_task"], "#{key}:task") ++
-          [
-            source_link_list(
-              [%{url: enrichment["url"], label: "Open #{title}"}],
-              "#{key}:link"
-            )
-          ]
-
-      %{
-        "id" => stable_id("curated-group", key),
-        "type" => "group",
-        "layout" => "vertical",
-        "purpose" => "learnmore",
-        "children" => [content_block(children, "#{key}:content")]
-      }
-    end)
-  end
-
-  defp worked_example_blocks(examples, stable_key) do
-    examples
-    |> normalize_examples()
-    |> Enum.with_index(1)
-    |> Enum.map(fn {example, index} ->
-      example_key = "#{stable_key}:example:#{index}"
-
-      children =
-        [
-          text_element(
-            "h3",
-            example["title"] || "Worked Example #{index}",
-            "#{example_key}:heading"
-          )
-        ] ++
-          paragraph_elements(example["scenario"], "#{example_key}:scenario") ++
-          paragraph_elements(example["explanation"], "#{example_key}:explanation") ++
-          ordered_step_elements(example["steps"], example_key) ++
-          paragraph_elements(example["conclusion"], "#{example_key}:conclusion") ++
-          source_evidence_elements(example["source_evidence_links"], example_key)
-
-      %{
-        "id" => stable_id("example-group", example_key),
-        "type" => "group",
-        "layout" => "vertical",
-        "purpose" => "example",
-        "children" => [content_block(children, "#{example_key}:content")]
-      }
-    end)
-  end
-
-  defp key_takeaways_block(content, stable_key) do
-    takeaways = normalize_strings(content["key_takeaways"])
-
-    case takeaways do
-      [] ->
-        []
-
-      _ ->
-        [
-          content_block(
-            [
-              text_element("h2", "Key Takeaways", "#{stable_key}:takeaways-heading"),
-              string_list_element("ul", takeaways, "#{stable_key}:takeaways")
-            ],
-            "#{stable_key}:takeaways"
-          )
-        ]
-    end
-  end
-
-  defp application_problem_blocks(problems, stable_key) do
-    problems
-    |> List.wrap()
-    |> Enum.with_index(1)
-    |> Enum.flat_map(fn {problem, index} ->
-      problem_key = "#{stable_key}:application:#{index}"
-
-      {title, prompt, guidance} =
-        case problem do
-          value when is_binary(value) ->
-            {"Apply what you learned #{index}", present_string(value), nil}
-
-          value when is_map(value) ->
-            {
-              first_present([
-                value["title"],
-                value["heading"],
-                "Apply what you learned #{index}"
-              ]),
-              first_present([
-                value["prompt"],
-                value["problem"],
-                value["scenario"],
-                value["body"],
-                value["text"]
-              ]),
-              first_present([
-                value["guidance"],
-                value["hint"],
-                value["instructions"]
-              ])
-            }
-
-          _ ->
-            {nil, nil, nil}
-        end
-
-      if present_text?(prompt) do
-        children =
-          [
-            text_element("h3", title, "#{problem_key}:heading")
-          ] ++
-            paragraph_elements(prompt, "#{problem_key}:prompt") ++
-            paragraph_elements(guidance, "#{problem_key}:guidance")
-
-        [
-          %{
-            "id" => stable_id("application-group", problem_key),
-            "type" => "group",
-            "layout" => "vertical",
-            "purpose" => "learnbydoing",
-            "children" => [content_block(children, "#{problem_key}:content")]
-          }
-        ]
-      else
-        []
-      end
-    end)
-  end
-
-  defp callout_blocks(value, purpose, default_title, stable_key)
-       when purpose in ["learnmore", "learnbydoing", "example"] do
-    value
-    |> normalize_callouts(default_title)
-    |> Enum.with_index(1)
-    |> Enum.map(fn {callout, index} ->
-      callout_key = "#{stable_key}:#{index}"
-
-      %{
-        "id" => stable_id("callout-group", callout_key),
-        "type" => "group",
-        "layout" => "vertical",
-        "purpose" => purpose,
-        "children" => [
-          content_block(
-            [
-              text_element("h3", callout["title"], "#{callout_key}:heading")
-              | paragraph_elements(callout["body"], "#{callout_key}:body")
-            ],
-            "#{callout_key}:content"
-          )
-        ]
-      }
-    end)
-  end
-
-  defp normalize_callouts(value, default_title) do
-    value
-    |> List.wrap()
-    |> Enum.with_index(1)
-    |> Enum.flat_map(fn
-      {entry, index} when is_binary(entry) ->
-        case present_string(entry) do
-          nil ->
-            []
-
-          body ->
-            [
-              %{
-                "title" => callout_title(default_title, index),
-                "body" => body
-              }
-            ]
-        end
-
-      {entry, index} when is_map(entry) ->
-        body =
-          first_present([
-            entry["body"],
-            entry["content"],
-            entry["text"],
-            entry["prompt"],
-            entry["question"],
-            entry["description"]
-          ])
-
-        if present_text?(body) do
-          [
-            %{
-              "title" =>
-                first_present([
-                  entry["title"],
-                  entry["heading"],
-                  callout_title(default_title, index)
-                ]),
-              "body" => body
-            }
-          ]
-        else
-          []
-        end
-
-      _entry ->
-        []
-    end)
-  end
-
-  defp callout_title(default_title, 1), do: default_title
-  defp callout_title(default_title, index), do: "#{default_title} #{index}"
-
-  defp media_blocks(media_assets, placement, stable_key) do
-    media_assets
-    |> media_for_placement(placement)
-    |> Enum.with_index(1)
-    |> Enum.map(fn {asset, index} ->
-      media_key = "#{stable_key}:#{index}"
-      caption = Enum.filter([asset.caption, asset.credit], &present_text?/1) |> Enum.join(" — ")
-
-      image =
-        %{
-          "id" => stable_id("image", media_key),
-          "type" => "img",
-          "src" => asset.url,
-          "alt" => asset.alt,
-          "display" => "block",
-          "height" => asset.height,
-          "width" => "100%",
-          "children" => [%{"text" => ""}]
-        }
-        |> maybe_put_present("caption", caption)
-
-      content_block([image], "#{media_key}:content")
-    end)
-  end
-
   defp attribution_blocks(attribution, stable_key) do
     lines = attribution_lines(attribution)
 
@@ -894,24 +522,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
             )
 
         [content_block(children, "#{stable_key}:attribution")]
-    end
-  end
-
-  defp source_evidence_block(links, stable_key) do
-    case normalize_source_links(links) do
-      [] ->
-        []
-
-      source_links ->
-        [
-          content_block(
-            [
-              text_element("h2", "Sources", "#{stable_key}:sources-heading"),
-              source_link_list(source_links, "#{stable_key}:sources")
-            ],
-            "#{stable_key}:sources"
-          )
-        ]
     end
   end
 
@@ -1104,25 +714,9 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     |> String.trim()
   end
 
-  defp compile_advanced(
-         title,
-         content,
-         questions,
-         stable_key,
-         media_assets,
-         attribution,
-         opts
-       ) do
+  defp compile_advanced_v6(title, content, stable_key, media_assets, attribution, opts) do
     with {:ok, screens} <-
-           advanced_screens(
-             title,
-             content,
-             questions,
-             stable_key,
-             media_assets,
-             attribution,
-             opts
-           ),
+           advanced_v6_screens(title, content, stable_key, media_assets, attribution, opts),
          :ok <- validate_unique_advanced_activity_keys(screens),
          {:ok, activity_specs} <- compile_advanced_screens(screens) do
       {:ok,
@@ -1136,9 +730,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
            "advancedAuthoring" => true,
            "displayApplicationChrome" => false,
            "custom" => page_custom(),
-           "additionalStylesheets" => [
-             "/css/delivery_adaptive_themes_default_light.css"
-           ],
+           "additionalStylesheets" => ["/css/delivery_adaptive_themes_default_light.css"],
            "customCss" => "",
            "model" => [
              %{
@@ -1163,318 +755,283 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end
   end
 
-  defp advanced_screens(
-         title,
-         content,
-         questions,
-         stable_key,
-         media_assets,
-         attribution,
-         opts
-       ) do
-    objective =
-      content["objective"] ||
-        List.first(content["learning_objectives"] || []) ||
-        "Lesson objective"
+  defp validate_unique_advanced_activity_keys(screens) do
+    keys = Enum.map(screens, & &1.key)
 
-    base_content_screens =
-      advanced_content_screens(
-        title,
-        content,
-        objective,
-        stable_key,
+    if length(keys) == length(Enum.uniq(keys)),
+      do: :ok,
+      else: {:error, :duplicate_advanced_activity_key}
+  end
+
+  defp advanced_v6_screens(title, content, stable_key, media_assets, attribution, opts) do
+    blueprint = content["experience_blueprint"] || %{}
+    groups = Map.new(List.wrap(content["content_groups"]), &{&1["id"], &1})
+    activities = Map.new(List.wrap(blueprint["activities"]), &{&1["id"], &1})
+    stages = List.wrap(blueprint["stages"])
+
+    orientation = advanced_v6_orientation_screen(title, content, blueprint, stable_key)
+
+    content_screens_by_group =
+      Map.new(groups, fn {group_id, group} ->
+        {group_id, advanced_v6_group_screens(group, stable_key, media_assets)}
+      end)
+
+    all_content_screens = content_screens_by_group |> Map.values() |> List.flatten()
+
+    with {:ok, stage_screens} <-
+           stages
+           |> Enum.with_index(1)
+           |> Enum.reduce_while({:ok, []}, fn {stage, stage_index}, {:ok, compiled} ->
+             stage["items"]
+             |> List.wrap()
+             |> Enum.with_index(1)
+             |> Enum.reduce_while({:ok, []}, fn {item, item_index}, {:ok, stage_items} ->
+               case item do
+                 %{"kind" => "content_group", "ref_id" => group_id} ->
+                   case Map.fetch(content_screens_by_group, group_id) do
+                     {:ok, screens} -> {:cont, {:ok, stage_items ++ screens}}
+                     :error -> {:halt, {:error, {:unknown_v6_content_group, group_id}}}
+                   end
+
+                 %{"kind" => "activity", "ref_id" => activity_id} ->
+                   with {:ok, activity} <- Map.fetch(activities, activity_id),
+                        {:ok, screen} <-
+                          advanced_v6_activity_screen(
+                            activity,
+                            stage,
+                            stage_index,
+                            item_index,
+                            stable_key,
+                            all_content_screens,
+                            opts
+                          ) do
+                     {:cont, {:ok, stage_items ++ [screen]}}
+                   else
+                     :error -> {:halt, {:error, {:unknown_v6_activity, activity_id}}}
+                     {:error, reason} -> {:halt, {:error, reason}}
+                   end
+
+                 _ ->
+                   {:halt, {:error, :invalid_v6_stage_item}}
+               end
+             end)
+             |> case do
+               {:ok, screens} -> {:cont, {:ok, compiled ++ screens}}
+               {:error, reason} -> {:halt, {:error, reason}}
+             end
+           end) do
+      synthesis = advanced_v6_synthesis_screen(content, stable_key)
+
+      attribution_screens =
+        advanced_attribution_screens(content, attribution, "#{stable_key}:v6:attribution")
+
+      {:ok, [orientation] ++ stage_screens ++ List.wrap(synthesis) ++ attribution_screens}
+    end
+  end
+
+  defp advanced_v6_orientation_screen(title, content, blueprint, stable_key) do
+    key = "#{stable_key}:v6:orientation"
+    duration = get_in(blueprint, ["duration_manifest", "total_minutes"])
+    overview = get_in(content, ["orientation", "overview"]) || content["narrative"] || ""
+    driving_question = blueprint["driving_question"]
+
+    parts =
+      [
+        title
+        |> PartBuilders.text_flow(:h2, y: 0)
+        |> Map.put("id", stable_id("title", key)),
+        "Driving question"
+        |> PartBuilders.text_flow(:h3, y: 52)
+        |> Map.put("id", stable_id("driving-question-heading", key)),
+        driving_question
+        |> PartBuilders.text_flow(:p, y: 92)
+        |> Map.put("id", stable_id("driving-question", key)),
+        "About #{duration} minutes"
+        |> PartBuilders.text_flow(:p, y: 146)
+        |> Map.put("id", stable_id("duration", key)),
+        "Learning objectives"
+        |> PartBuilders.text_flow(:h3, y: 190)
+        |> Map.put("id", stable_id("objectives-heading", key)),
+        learning_objectives(content)
+        |> PartBuilders.list_flow(:ul, y: 230)
+        |> Map.put("id", stable_id("objectives", key)),
+        overview
+        |> PartBuilders.text_flow(:p, y: 310)
+        |> Map.put("id", stable_id("overview", key))
+      ]
+
+    content_screen(key, title, parts)
+  end
+
+  defp advanced_v6_group_screens(group, stable_key, media_assets) do
+    group_id = group["id"]
+
+    source_screens =
+      group
+      |> Map.get("source_blocks", [])
+      |> List.wrap()
+      |> Enum.reject(&(&1["rendering"] == "lesson_title"))
+      |> Enum.with_index(1)
+      |> Enum.map(fn {block, index} ->
+        key = "#{stable_key}:v6:group:#{group_id}:block:#{block["id"] || index}"
+
+        title =
+          if(index == 1, do: group["title"], else: advanced_v6_block_title(block, group["title"]))
+
+        body = advanced_v6_block_markdown(block)
+
+        content_screen(key, title, titled_content_parts(title, body, key))
+        |> Map.put(:section_id, group_id)
+      end)
+
+    media_screens =
+      advanced_media_screens(
         media_assets,
-        attribution
+        group_id,
+        "#{stable_key}:v6:group:#{group_id}:media",
+        group_id
       )
 
-    with {:ok, blueprint_screens} <-
-           advanced_blueprint_screens(content, stable_key, base_content_screens, opts) do
-      content_screens =
-        interleave_blueprint_screens(base_content_screens, blueprint_screens)
+    source_screens ++ media_screens
+  end
 
-      content_screen_count = length(content_screens)
-      question_count = length(questions)
-      interleave? = content_screen_count >= question_count
-
-      question_screens =
-        questions
-        |> Enum.with_index(1)
-        |> Enum.map(fn {question, index} ->
-          key = "#{stable_key}:question:#{index}"
-          reminder = remediation_excerpt(question, content, objective, index)
-          parts = question_screen_parts(question, reminder, key, index)
-          scorable_part = List.last(parts)
-
-          anchor_index =
-            question_anchor_index(
-              question,
-              index,
-              question_count,
-              content_screens
-            )
-
-          remediation_screen = Enum.at(content_screens, anchor_index - 1)
-
-          rules =
-            question
-            |> adaptivity_config(reminder)
-            |> TrapStateRulesBuilder.build_rules(scorable_part, parts, [scorable_part])
-            |> add_remediation_navigation(remediation_screen, not is_nil(remediation_screen))
-            |> stabilize_rules(key)
-
-          %{
-            key: key,
-            title: "#{title} — Check #{index}",
-            kind: :question,
-            parts: parts,
-            rules: rules,
-            anchor_index: anchor_index
-          }
-        end)
-
-      screens =
-        if interleave? do
-          interleave_question_screens(content_screens, question_screens)
-        else
-          content_screens ++ question_screens
-        end
-
-      {:ok, screens}
+  defp advanced_v6_block_title(block, fallback) do
+    case block["kind"] do
+      "equation" -> "Work with the relationship"
+      "table" -> "Analyze the source table"
+      "figure" -> "Examine the source figure"
+      "exercise" -> "Use the source evidence"
+      "callout" -> "Connect the idea"
+      _ -> fallback
     end
   end
 
-  defp question_anchor_index(question, index, question_count, content_screens) do
-    placement = present_string(question["placement_after_section_id"])
-
-    placed_index =
-      if is_binary(placement) do
-        content_screens
-        |> Enum.with_index(1)
-        |> Enum.filter(fn {screen, _index} -> screen[:section_id] == placement end)
-        |> List.last()
-        |> case do
-          {_screen, placed_index} -> placed_index
-          nil -> nil
-        end
-      end
-
-    placed_index ||
-      index
-      |> Kernel.*(length(content_screens))
-      |> Kernel.+(question_count - 1)
-      |> div(question_count)
-      |> max(1)
-      |> min(length(content_screens))
-  end
-
-  defp interleave_question_screens(content_screens, question_screens) do
-    content_screens
-    |> Enum.with_index(1)
-    |> Enum.flat_map(fn {content_screen, index} ->
-      anchored_questions =
-        Enum.filter(question_screens, &(&1.anchor_index == index))
-
-      [content_screen | anchored_questions]
-    end)
-  end
-
-  defp interleave_blueprint_screens(content_screens, blueprint_screens) do
-    {placed, unplaced} =
-      Enum.split_with(blueprint_screens, fn blueprint ->
-        present_text?(blueprint[:placement]) and
-          Enum.any?(content_screens, &(&1[:section_id] == blueprint[:placement]))
-      end)
-
-    final_section_screen_indexes =
-      content_screens
-      |> Enum.with_index()
-      |> Enum.reduce(%{}, fn {screen, index}, indexes ->
-        case screen[:section_id] do
-          section_id when is_binary(section_id) -> Map.put(indexes, section_id, index)
-          _section_id -> indexes
-        end
-      end)
-
-    content_screens
-    |> Enum.with_index()
-    |> Enum.flat_map(fn {content_screen, index} ->
-      matching =
-        if present_text?(content_screen[:section_id]) and
-             final_section_screen_indexes[content_screen[:section_id]] == index do
-          Enum.filter(placed, &(&1[:placement] == content_screen[:section_id]))
-        else
-          []
-        end
-
-      [content_screen | matching]
-    end)
-    |> Kernel.++(unplaced)
-  end
-
-  defp advanced_blueprint_screens(content, stable_key, content_screens, opts) do
-    blueprint = content["advanced_blueprint"] || %{}
-    screens = List.wrap(blueprint["screens"])
-
-    cond do
-      content["schema_version"] in [3, 4] and screens == [] ->
-        {:error, :missing_advanced_blueprint}
-
-      true ->
-        remediation_paths = List.wrap(blueprint["remediation_paths"])
-
-        with :ok <-
-               validate_advanced_remediation_integrity(
-                 content,
-                 screens,
-                 remediation_paths,
-                 content_screens
-               ) do
-          screens
-          |> Enum.with_index(1)
-          |> Enum.reduce_while({:ok, []}, fn {screen, index}, {:ok, compiled} ->
-            case advanced_blueprint_screen(
-                   screen,
-                   index,
-                   stable_key,
-                   remediation_paths,
-                   content_screens,
-                   opts
-                 ) do
-              {:ok, built} -> {:cont, {:ok, compiled ++ [built]}}
-              {:error, reason} -> {:halt, {:error, {:invalid_advanced_blueprint, index, reason}}}
-            end
-          end)
-        end
-    end
-  end
-
-  defp validate_advanced_remediation_integrity(
-         %{"schema_version" => schema_version},
-         screens,
-         remediation_paths,
-         content_screens
-       )
-       when schema_version in [3, 4] do
-    section_ids =
-      content_screens
-      |> Enum.map(& &1[:section_id])
-      |> Enum.filter(&present_text?/1)
-      |> MapSet.new()
-
-    interaction_ids =
-      screens
-      |> Enum.reject(&(&1["kind"] == "content"))
-      |> Enum.map(&present_string(&1["id"]))
-      |> Enum.reject(&is_nil/1)
-      |> MapSet.new()
-
-    with :ok <- validate_unique_advanced_screen_ids(screens),
-         :ok <-
-           validate_declared_remediation_paths(
-             remediation_paths,
-             interaction_ids,
-             section_ids
-           ),
-         :ok <-
-           validate_interaction_remediation_targets(screens, remediation_paths, section_ids) do
-      :ok
-    end
-  end
-
-  defp validate_advanced_remediation_integrity(
-         _content,
-         _screens,
-         _remediation_paths,
-         _content_screens
-       ),
-       do: :ok
-
-  defp validate_unique_advanced_screen_ids(screens) do
-    screen_ids = screens |> Enum.map(&present_string(&1["id"])) |> Enum.reject(&is_nil/1)
-
-    case first_duplicate(screen_ids) do
-      nil -> :ok
-      duplicate -> {:error, {:duplicate_advanced_screen_id, duplicate}}
-    end
-  end
-
-  defp validate_unique_advanced_activity_keys(screens) do
-    case screens |> Enum.map(& &1.key) |> first_duplicate() do
-      nil -> :ok
-      duplicate -> {:error, {:duplicate_advanced_activity_key, duplicate}}
-    end
-  end
-
-  defp first_duplicate(values) do
-    values
-    |> Enum.reduce_while(MapSet.new(), fn value, seen ->
-      if MapSet.member?(seen, value),
-        do: {:halt, value},
-        else: {:cont, MapSet.put(seen, value)}
-    end)
+  defp advanced_v6_block_markdown(block) do
+    block
+    |> Map.get("ast", [])
+    |> List.wrap()
+    |> Enum.map_join("\n\n", &advanced_v6_ast_markdown/1)
+    |> present_string()
     |> case do
-      %MapSet{} -> nil
-      duplicate -> duplicate
+      nil -> present_string(block["text"]) || "Source content retained for this stage."
+      markdown -> markdown
     end
   end
 
-  defp validate_declared_remediation_paths(paths, interaction_ids, section_ids) do
-    paths
+  defp advanced_v6_ast_markdown(%{"type" => type, "src" => source})
+       when type in ["formula", "formula_inline"] and is_binary(source) do
+    if type == "formula", do: "\\[#{source}\\]", else: "\\(#{source}\\)"
+  end
+
+  defp advanced_v6_ast_markdown(%{"type" => "img"}), do: ""
+
+  defp advanced_v6_ast_markdown(%{"type" => type, "children" => children})
+       when type in ["ul", "ol"] do
+    children
+    |> List.wrap()
     |> Enum.with_index(1)
-    |> Enum.reduce_while(:ok, fn
-      {%{"from_question_id" => from, "to_section_id" => target}, index}, :ok ->
-        cond do
-          not MapSet.member?(interaction_ids, from) ->
-            {:halt, {:error, {:invalid_advanced_remediation_path, index, :missing_interaction}}}
-
-          not MapSet.member?(section_ids, target) ->
-            {:halt, {:error, {:invalid_advanced_remediation_path, index, :missing_section}}}
-
-          true ->
-            {:cont, :ok}
-        end
-
-      {_path, index}, :ok ->
-        {:halt, {:error, {:invalid_advanced_remediation_path, index, :invalid_reference}}}
+    |> Enum.map_join("\n", fn {child, index} ->
+      marker = if(type == "ol", do: "#{index}.", else: "-")
+      "#{marker} #{advanced_v6_ast_markdown(child)}"
     end)
   end
 
-  defp validate_interaction_remediation_targets(screens, remediation_paths, section_ids) do
-    screens
-    |> Enum.reject(&(&1["kind"] == "content"))
-    |> Enum.with_index(1)
-    |> Enum.reduce_while(:ok, fn {screen, index}, :ok ->
-      screen_id = present_string(screen["id"])
-
-      targets =
-        [present_string(screen["remediation_section_id"])] ++
-          Enum.flat_map(remediation_paths, fn
-            %{"from_question_id" => ^screen_id, "to_section_id" => target} ->
-              [present_string(target)]
-
-            _path ->
-              []
-          end)
-
-      targets = targets |> Enum.reject(&is_nil/1) |> Enum.uniq()
-
-      cond do
-        targets == [] ->
-          {:halt, {:error, {:missing_advanced_remediation_target, index}}}
-
-        length(targets) > 1 ->
-          {:halt, {:error, {:conflicting_advanced_remediation_targets, index}}}
-
-        not MapSet.member?(section_ids, List.first(targets)) ->
-          {:halt, {:error, {:invalid_advanced_remediation_target, index}}}
-
-        true ->
-          {:cont, :ok}
-      end
+  defp advanced_v6_ast_markdown(%{"type" => "table", "children" => rows}) do
+    rows
+    |> List.wrap()
+    |> Enum.map_join("\n", fn row ->
+      cells = row |> Map.get("children", []) |> Enum.map(&advanced_v6_ast_markdown/1)
+      "| #{Enum.join(cells, " | ")} |"
     end)
   end
 
-  defp advanced_blueprint_screen(
+  defp advanced_v6_ast_markdown(%{"type" => type, "children" => children})
+       when type in ["h1", "h2", "h3", "h4", "h5", "h6"] do
+    "### #{Enum.map_join(List.wrap(children), "", &advanced_v6_ast_markdown/1)}"
+  end
+
+  defp advanced_v6_ast_markdown(%{"type" => "a", "href" => href, "children" => children}) do
+    label = Enum.map_join(List.wrap(children), "", &advanced_v6_ast_markdown/1)
+    if present_text?(href), do: "[#{label}](#{href})", else: label
+  end
+
+  defp advanced_v6_ast_markdown(%{"children" => children}),
+    do: Enum.map_join(List.wrap(children), "", &advanced_v6_ast_markdown/1)
+
+  defp advanced_v6_ast_markdown(%{"text" => text} = leaf) when is_binary(text) do
+    cond do
+      leaf["bold"] == true -> "**#{text}**"
+      leaf["italic"] == true -> "*#{text}*"
+      leaf["code"] == true -> "`#{text}`"
+      true -> text
+    end
+  end
+
+  defp advanced_v6_ast_markdown(_node), do: ""
+
+  defp advanced_v6_activity_screen(
+         activity,
+         stage,
+         stage_index,
+         item_index,
+         stable_key,
+         content_screens,
+         opts
+       ) do
+    activity = advanced_v6_activity_as_internal_screen(activity, stage)
+
+    adaptive_activity_screen(
+      activity,
+      stage_index * 100 + item_index,
+      "#{stable_key}:v6",
+      [],
+      content_screens,
+      opts
+    )
+  end
+
+  defp advanced_v6_activity_as_internal_screen(activity, stage) do
+    type = activity["interaction_type"]
+    interaction_type = if(type in ["short_answer", "reflection"], do: "text", else: type)
+    context = present_string(activity["context"])
+    prompt = present_string(activity["prompt"])
+    hint = present_string(activity["hint"])
+
+    activity
+    |> Map.put("kind", if(type == "reflection", do: "reflection", else: "decision"))
+    |> Map.put("title", activity["title"] || stage["title"] || "Investigate the evidence")
+    |> Map.put("interaction_type", interaction_type)
+    |> Map.put(
+      "prompt",
+      Enum.filter([context, prompt, "Not sure? #{hint}"], &present_text?/1) |> Enum.join("\n\n")
+    )
+    |> Map.put("remediation_section_id", activity["remediation_content_group_id"])
+  end
+
+  defp advanced_v6_synthesis_screen(content, stable_key) do
+    synthesis = content["synthesis"] || %{}
+    takeaways = normalize_strings(synthesis["takeaways"])
+    key = "#{stable_key}:v6:synthesis"
+
+    parts =
+      titled_content_parts(
+        synthesis["heading"] || "Synthesize the investigation",
+        synthesis["summary"] || "Connect the evidence to the driving question.",
+        key
+      ) ++
+        if(takeaways == [],
+          do: [],
+          else: [
+            takeaways
+            |> PartBuilders.list_flow(:ul, y: 150)
+            |> Map.put("id", stable_id("takeaways", key))
+          ]
+        )
+
+    content_screen(key, synthesis["heading"] || "Synthesize the investigation", parts)
+  end
+
+  defp adaptive_activity_screen(
          %{"kind" => "content"} = screen,
          index,
          stable_key,
@@ -1511,7 +1068,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end
   end
 
-  defp advanced_blueprint_screen(
+  defp adaptive_activity_screen(
          %{} = screen,
          index,
          stable_key,
@@ -1572,7 +1129,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end
   end
 
-  defp advanced_blueprint_screen(_, _index, _stable_key, _paths, _content_screens, _opts),
+  defp adaptive_activity_screen(_, _index, _stable_key, _paths, _content_screens, _opts),
     do: {:error, :invalid_screen}
 
   defp maybe_inject_generated_simulation(parts, screen, stable_key, screen_kind, opts) do
@@ -1963,7 +1520,10 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     target_section_id =
       present_string(screen["remediation_section_id"]) ||
         Enum.find_value(remediation_paths, fn
-          %{"from_question_id" => ^screen_id, "to_section_id" => target} ->
+          %{
+            "from_activity_id" => ^screen_id,
+            "to_content_group_id" => target
+          } ->
             present_string(target)
 
           _ ->
@@ -2012,285 +1572,11 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
   defp add_remediation_navigation(rules, _screen, _interleave?), do: rules
 
-  defp advanced_content_screens(
-         title,
-         content,
-         objective,
-         stable_key,
-         media_assets,
-         attribution
-       ) do
-    sections = instructional_sections(content)
-    curated = normalize_curated_enrichments(content["curated_enrichments"])
-    section_ids = MapSet.new(sections, & &1["id"])
-
-    overview_screens =
-      content
-      |> Map.get(
-        "narrative",
-        first_present([
-          content["introduction"],
-          content["overview"],
-          content["why_this_matters"]
-        ]) || ""
-      )
-      |> narrative_segments()
-      |> Enum.with_index(1)
-      |> Enum.map(fn {segment, index} ->
-        key = "#{stable_key}:overview:#{index}"
-
-        content_screen(
-          key,
-          content_screen_title(title, index),
-          content_screen_parts(
-            title,
-            objective,
-            content["learning_objectives"] || [],
-            segment,
-            key,
-            index
-          )
-        )
-      end)
-
-    opening_screens =
-      advanced_callout_screens(
-        content["opening_hook"],
-        "Start here",
-        "#{stable_key}:opening-hook"
-      ) ++
-        advanced_callout_screens(
-          content["why_this_matters"],
-          "Why this matters",
-          "#{stable_key}:why-this-matters"
-        ) ++
-        advanced_callout_screens(
-          content["callouts"],
-          "Source connection",
-          "#{stable_key}:source-callouts"
-        ) ++
-        advanced_callout_screens(
-          content["curiosity_prompts"],
-          "Think about it",
-          "#{stable_key}:curiosity"
-        ) ++
-        advanced_media_screens(media_assets, nil, "#{stable_key}:opening-media")
-
-    instruction_screens =
-      sections
-      |> Enum.with_index(1)
-      |> Enum.flat_map(fn {section, index} ->
-        explanation_screens =
-          section["explanation"]
-          |> narrative_segments()
-          |> Enum.with_index(1)
-          |> Enum.map(fn {segment, segment_index} ->
-            key = "#{stable_key}:instruction:#{index}:#{segment_index}"
-            suffix = if segment_index == 1, do: "", else: " — Part #{segment_index}"
-
-            content_screen(
-              key,
-              "#{section["title"]}#{suffix}",
-              titled_content_parts("#{section["title"]}#{suffix}", segment, key)
-            )
-            |> Map.put(:section_id, section["id"])
-          end)
-
-        callout_screens =
-          advanced_callout_screens(
-            section["callouts"],
-            "#{section["title"]} — Go deeper",
-            "#{stable_key}:instruction:#{index}:callouts",
-            section["id"]
-          ) ++
-            advanced_callout_screens(
-              section["curiosity_prompts"],
-              "#{section["title"]} — Think about it",
-              "#{stable_key}:instruction:#{index}:curiosity",
-              section["id"]
-            )
-
-        section_media_screens =
-          advanced_media_screens(
-            media_assets,
-            section["id"],
-            "#{stable_key}:instruction:#{index}:media",
-            section["id"]
-          )
-
-        example_screens =
-          section["examples"]
-          |> normalize_examples()
-          |> Enum.with_index(1)
-          |> Enum.map(fn {example, example_index} ->
-            key = "#{stable_key}:instruction:#{index}:example:#{example_index}"
-
-            content_screen(
-              key,
-              worked_example_title(example, example_index),
-              worked_example_parts(example, example_index, key)
-            )
-            |> Map.put(:section_id, section["id"])
-          end)
-
-        curated_screens =
-          curated
-          |> curated_for_placement(section["id"])
-          |> advanced_curated_screens(
-            "#{stable_key}:instruction:#{index}:curated",
-            section["id"]
-          )
-
-        explanation_screens ++
-          callout_screens ++ section_media_screens ++ example_screens ++ curated_screens
-      end)
-
-    unplaced_curated_screens =
-      curated
-      |> Enum.reject(fn enrichment ->
-        placement = enrichment["placement_after_section_id"]
-        is_binary(placement) and MapSet.member?(section_ids, placement)
-      end)
-      |> advanced_curated_screens("#{stable_key}:curated", nil)
-
-    example_screens =
-      content
-      |> Map.get("worked_examples", [])
-      |> List.wrap()
-      |> Enum.with_index(1)
-      |> Enum.map(fn {example, index} ->
-        key = "#{stable_key}:example:#{index}"
-
-        content_screen(
-          key,
-          worked_example_title(example, index),
-          worked_example_parts(example, index, key)
-        )
-      end)
-
-    takeaway_screens =
-      content
-      |> Map.get("key_takeaways", [])
-      |> takeaway_items()
-      |> case do
-        [] -> []
-        takeaways -> [takeaway_screen(title, takeaways, stable_key)]
-      end
-
-    application_screens =
-      advanced_application_screens(
-        content["application_problems"],
-        "#{stable_key}:application"
-      )
-
-    attribution_screens =
-      advanced_attribution_screens(content, attribution, "#{stable_key}:attribution")
-
-    screens =
-      overview_screens ++
-        opening_screens ++
-        instruction_screens ++
-        unplaced_curated_screens ++
-        example_screens ++
-        application_screens ++ takeaway_screens ++ attribution_screens
-
-    case screens do
-      [only_screen] ->
-        only_screen
-        |> then(fn screen ->
-          [
-            screen,
-            takeaway_screen(
-              title,
-              fallback_takeaways(content, objective),
-              "#{stable_key}:fallback"
-            )
-          ]
-        end)
-
-      screens ->
-        screens
-    end
-  end
-
-  defp advanced_curated_screens(enrichments, stable_key, section_id) do
-    enrichments
-    |> Enum.with_index(1)
-    |> Enum.map(fn {enrichment, index} ->
-      key = "#{stable_key}:#{index}"
-      title = enrichment["title"]
-
-      parts =
-        [
-          title
-          |> PartBuilders.text_flow(:h3, y: 0)
-          |> Map.put("id", stable_id("heading", key)),
-          enrichment["annotation"]
-          |> PartBuilders.text_flow(:p, y: 52)
-          |> Map.put("id", stable_id("annotation", key)),
-          "Try this resource"
-          |> PartBuilders.text_flow(:h4, y: 156)
-          |> Map.put("id", stable_id("task-heading", key)),
-          enrichment["learner_task"]
-          |> PartBuilders.text_flow(:p, y: 196)
-          |> Map.put("id", stable_id("task", key)),
-          advanced_external_link_part(
-            "Open #{title}",
-            enrichment["url"],
-            "#{key}:link",
-            300
-          )
-        ]
-
-      content_screen(key, title, parts)
-      |> Map.put(:section_id, section_id)
-    end)
-  end
-
-  defp advanced_external_link_part(label, url, stable_key, y) do
-    label
-    |> PartBuilders.text_flow(:p, y: y)
-    |> Map.put("id", stable_id("link", stable_key))
-    |> put_in(
-      ["custom", "nodes"],
-      [
-        %{
-          "tag" => "a",
-          "href" => url,
-          "target" => "_blank",
-          "children" => [%{"tag" => "text", "text" => label, "children" => []}]
-        }
-      ]
-    )
-  end
-
-  defp advanced_callout_screens(value, default_title, stable_key, section_id \\ nil) do
-    value
-    |> normalize_callouts(default_title)
-    |> Enum.with_index(1)
-    |> Enum.flat_map(fn {callout, index} ->
-      callout["body"]
-      |> narrative_segments()
-      |> Enum.with_index(1)
-      |> Enum.map(fn {segment, segment_index} ->
-        key = "#{stable_key}:#{index}:#{segment_index}"
-
-        title =
-          if segment_index == 1,
-            do: callout["title"],
-            else: "#{callout["title"]} — Part #{segment_index}"
-
-        content_screen(key, title, titled_content_parts(title, segment, key))
-        |> Map.put(:section_id, section_id)
-      end)
-    end)
-  end
-
   defp advanced_media_screens(
          media_assets,
          placement,
          stable_key,
-         section_id \\ nil
+         section_id
        ) do
     media_assets
     |> media_for_placement(placement)
@@ -2328,67 +1614,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
       content_screen(key, title, parts)
       |> Map.put(:section_id, section_id)
-    end)
-  end
-
-  defp advanced_application_screens(problems, stable_key) do
-    problems
-    |> List.wrap()
-    |> Enum.with_index(1)
-    |> Enum.flat_map(fn {problem, index} ->
-      {title, body} =
-        case problem do
-          value when is_binary(value) ->
-            {"Apply what you learned #{index}", present_string(value)}
-
-          value when is_map(value) ->
-            {
-              first_present([
-                value["title"],
-                value["heading"],
-                "Apply what you learned #{index}"
-              ]),
-              [
-                first_present([
-                  value["prompt"],
-                  value["problem"],
-                  value["scenario"],
-                  value["body"],
-                  value["text"]
-                ]),
-                first_present([
-                  value["guidance"],
-                  value["hint"],
-                  value["instructions"]
-                ])
-              ]
-              |> Enum.filter(&present_text?/1)
-              |> Enum.join("\n\n")
-            }
-
-          _ ->
-            {nil, nil}
-        end
-
-      if present_text?(body) do
-        body
-        |> narrative_segments()
-        |> Enum.with_index(1)
-        |> Enum.map(fn {segment, segment_index} ->
-          key = "#{stable_key}:#{index}:#{segment_index}"
-
-          screen_title =
-            if segment_index == 1, do: title, else: "#{title} — Part #{segment_index}"
-
-          content_screen(
-            key,
-            screen_title,
-            titled_content_parts(screen_title, segment, key)
-          )
-        end)
-      else
-        []
-      end
     end)
   end
 
@@ -2454,45 +1679,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end)
   end
 
-  defp content_screen_parts(title, objective, objectives, segment, stable_key, 1) do
-    normalized_objectives =
-      objectives
-      |> Enum.filter(&present_text?/1)
-      |> Enum.uniq()
-      |> case do
-        [] -> [objective]
-        values -> values
-      end
-
-    objective_height = max(length(normalized_objectives) * 28, 48)
-
-    [
-      title
-      |> PartBuilders.text_flow(:h2, y: 0)
-      |> Map.put("id", stable_id("title", stable_key)),
-      "Learning objectives"
-      |> PartBuilders.text_flow(:h3, y: 48)
-      |> Map.put("id", stable_id("objectives-heading", stable_key)),
-      normalized_objectives
-      |> PartBuilders.list_flow(:ul, y: 88)
-      |> Map.put("id", stable_id("objectives", stable_key)),
-      segment
-      |> PartBuilders.text_flow(:p, y: 110 + objective_height)
-      |> Map.put("id", stable_id("narrative", stable_key))
-    ]
-  end
-
-  defp content_screen_parts(_title, _objective, _objectives, segment, stable_key, index) do
-    [
-      "Explore the concept — Part #{index}"
-      |> PartBuilders.text_flow(:h3, y: 0)
-      |> Map.put("id", stable_id("heading", stable_key)),
-      segment
-      |> PartBuilders.text_flow(:p, y: 52)
-      |> Map.put("id", stable_id("narrative", stable_key))
-    ]
-  end
-
   defp titled_content_parts(title, body, stable_key) do
     [
       title
@@ -2514,418 +1700,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       |> Map.put("id", stable_id("items", stable_key))
     ]
   end
-
-  defp normalize_content_entries(entries, default_title) do
-    entries
-    |> List.wrap()
-    |> Enum.with_index(1)
-    |> Enum.flat_map(fn
-      {entry, index} when is_binary(entry) ->
-        if present_text?(entry),
-          do: [%{title: "#{default_title} #{index}", body: String.trim(entry), examples: []}],
-          else: []
-
-      {entry, index} when is_map(entry) ->
-        title =
-          first_present([
-            entry["title"],
-            entry["heading"],
-            entry["name"],
-            "#{default_title} #{index}"
-          ])
-
-        body =
-          first_present([
-            entry["content"],
-            entry["body"],
-            entry["explanation"],
-            entry["narrative"],
-            entry["text"]
-          ])
-
-        examples = takeaway_items(entry["examples"])
-
-        if present_text?(body),
-          do: [%{title: title, body: body, examples: examples}],
-          else: []
-
-      {_entry, _index} ->
-        []
-    end)
-  end
-
-  defp worked_example_parts(example, index, stable_key) when is_map(example) do
-    title = worked_example_title(example, index)
-
-    scenario =
-      first_present([
-        example["problem"],
-        example["prompt"],
-        example["scenario"]
-      ])
-
-    explanation =
-      first_present([
-        example["content"],
-        example["body"],
-        example["explanation"],
-        example["walkthrough"]
-      ])
-
-    steps =
-      example
-      |> Map.get("steps", [])
-      |> List.wrap()
-      |> Enum.map(&content_entry_text/1)
-      |> Enum.filter(&present_text?/1)
-
-    solution =
-      first_present([
-        example["solution"],
-        example["result"],
-        example["answer"],
-        example["conclusion"],
-        example["takeaway"]
-      ])
-
-    {parts, next_y} =
-      [
-        title
-        |> PartBuilders.text_flow(:h3, y: 0)
-        |> Map.put("id", stable_id("heading", stable_key))
-      ]
-      |> maybe_append_text(scenario, :p, 52, "scenario", stable_key)
-
-    {parts, next_y} =
-      maybe_append_text(parts, explanation, :p, next_y, "explanation", stable_key)
-
-    {parts, next_y} =
-      if steps == [] do
-        {parts, next_y}
-      else
-        steps_part =
-          steps
-          |> PartBuilders.list_flow(:ol, y: next_y)
-          |> Map.put("id", stable_id("steps", stable_key))
-
-        {parts ++ [steps_part], next_y + max(length(steps) * 28, 48) + 12}
-      end
-
-    {parts, _next_y} =
-      maybe_append_text(parts, solution, :p, next_y, "solution", stable_key)
-
-    parts
-  end
-
-  defp worked_example_parts(example, index, stable_key) do
-    titled_content_parts(
-      worked_example_title(example, index),
-      content_entry_text(example),
-      stable_key
-    )
-  end
-
-  defp maybe_append_text(parts, text, tag, y, id_prefix, stable_key) do
-    if present_text?(text) do
-      part =
-        text
-        |> PartBuilders.text_flow(tag, y: y)
-        |> Map.put("id", stable_id(id_prefix, stable_key))
-
-      {parts ++ [part], y + 108}
-    else
-      {parts, y}
-    end
-  end
-
-  defp worked_example_title(example, index) when is_map(example) do
-    first_present([
-      example["title"],
-      example["heading"],
-      "Worked example #{index}"
-    ])
-  end
-
-  defp worked_example_title(_example, index), do: "Worked example #{index}"
-
-  defp takeaway_screen(title, takeaways, stable_key) do
-    key = "#{stable_key}:takeaways"
-
-    content_screen(
-      key,
-      "#{title} — Key takeaways",
-      [
-        "Key takeaways"
-        |> PartBuilders.text_flow(:h3, y: 0)
-        |> Map.put("id", stable_id("heading", key)),
-        takeaways
-        |> PartBuilders.list_flow(:ul, y: 52)
-        |> Map.put("id", stable_id("takeaways", key))
-      ]
-    )
-  end
-
-  defp takeaway_items(items) do
-    items
-    |> List.wrap()
-    |> Enum.map(&content_entry_text/1)
-    |> Enum.filter(&present_text?/1)
-    |> Enum.uniq()
-    |> Enum.take(8)
-  end
-
-  defp fallback_takeaways(content, objective) do
-    content
-    |> Map.get("learning_objectives", [])
-    |> takeaway_items()
-    |> case do
-      [] -> [objective]
-      items -> items
-    end
-  end
-
-  defp content_entry_text(value) when is_binary(value), do: String.trim(value)
-
-  defp content_entry_text(value) when is_map(value) do
-    first_present([
-      value["text"],
-      value["content"],
-      value["body"],
-      value["takeaway"],
-      value["description"],
-      value["title"]
-    ])
-  end
-
-  defp content_entry_text(_value), do: ""
-
-  defp question_screen_parts(question, reminder, stable_key, index) do
-    prompt =
-      "Check your understanding — Question #{index}"
-      |> PartBuilders.text_flow(:h3, y: 0)
-      |> Map.put("id", stable_id("prompt", stable_key))
-
-    guidance =
-      question_guidance(question)
-      |> PartBuilders.text_flow(:p, y: 54)
-      |> Map.put("id", stable_id("guidance", stable_key))
-
-    interaction = question_interaction_part(question, reminder, stable_key, index)
-
-    [prompt, guidance, interaction]
-  end
-
-  defp question_guidance(%{"type" => "multiple_choice"}) do
-    "Choose the response best supported by the lesson. Feedback will guide you back to the relevant explanation when needed."
-  end
-
-  defp question_guidance(_question) do
-    "Use the lesson evidence to explain your reasoning. A short or incomplete response will open a review prompt."
-  end
-
-  defp question_interaction_part(
-         %{"type" => "short_answer"} = question,
-         reminder,
-         stable_key,
-         index
-       ) do
-    %{
-      "label" => "Your response",
-      "prompt" => question_prompt(question),
-      "correctAnswer" => %{
-        "minimumLength" => question_minimum_length(question),
-        "mustContain" => question_required_terms(question),
-        "mustNotContain" => question_forbidden_terms(question)
-      },
-      "correctFeedback" =>
-        question_feedback(
-          question,
-          "correct",
-          "Your response addresses the prompt. Continue when you are ready."
-        ),
-      "incorrectFeedback" =>
-        question_feedback(question, "incorrect", "Revisit this idea: #{reminder}")
-    }
-    |> PartBuilders.input_text_part(y: 164)
-    |> Map.put("id", stable_id("question", "#{stable_key}:#{index}"))
-  end
-
-  defp question_interaction_part(
-         %{"type" => "multiple_choice"} = question,
-         reminder,
-         stable_key,
-         index
-       ) do
-    %{
-      "label" => question_prompt(question),
-      "choices" =>
-        Enum.map(question["normalized_choices"], & &1["text"]) ++
-          if(question["allow_not_sure"] == true, do: ["Not sure"], else: []),
-      "correct" => question["correct_index"],
-      "correctFeedback" =>
-        question_feedback(question, "correct", "Correct. Continue when you are ready."),
-      "incorrectFeedback" =>
-        first_present([
-          question["hint"],
-          question_feedback(question, "incorrect", "Revisit this idea: #{reminder}")
-        ])
-    }
-    |> PartBuilders.mcq_part(y: 164)
-    |> Map.put("id", stable_id("question", "#{stable_key}:#{index}"))
-  end
-
-  defp adaptivity_config(question, reminder) do
-    %{
-      "maxAttempt" => 2,
-      "score" => 0,
-      "requireAllModified" => true,
-      "correctFeedback" =>
-        question_feedback(
-          question,
-          "correct",
-          "Your response addresses the prompt. Continue when you are ready."
-        ),
-      "blankFeedback" =>
-        question_feedback(
-          question,
-          "blank",
-          "Add a more complete explanation before continuing. Revisit this idea: #{reminder}"
-        ),
-      "incorrectFeedback" =>
-        question_feedback(question, "incorrect", "Revisit this idea: #{reminder}"),
-      "exhaustedFeedback" =>
-        question_feedback(
-          question,
-          "exhausted",
-          "Compare your response with this source-grounded reminder: #{reminder}"
-        ),
-      "commonErrors" => question_common_errors(question),
-      "onCorrect" => "navigate next",
-      "onIncorrect" => "show feedback"
-    }
-  end
-
-  defp question_common_errors(
-         %{
-           "type" => "multiple_choice",
-           "normalized_choices" => choices,
-           "correct_index" => correct_index
-         } = question
-       ) do
-    errors =
-      choices
-      |> Enum.with_index(1)
-      |> Enum.flat_map(fn {choice, option} ->
-        if option - 1 != correct_index and present_text?(choice["feedback"]),
-          do: [%{"option" => option, "feedback" => choice["feedback"]}],
-          else: []
-      end)
-
-    if question["allow_not_sure"] == true do
-      errors ++
-        [
-          %{
-            "option" => length(choices) + 1,
-            "feedback" =>
-              first_present([
-                question["hint"],
-                "Review the preceding explanation, then try again."
-              ])
-          }
-        ]
-    else
-      errors
-    end
-  end
-
-  defp question_common_errors(_question), do: []
-
-  defp narrative_segments(narrative) do
-    narrative
-    |> to_string()
-    |> String.trim()
-    |> case do
-      "" ->
-        ["Review the lesson objective and use the source evidence in each practice check."]
-
-      text ->
-        text
-        |> String.split(~r/\s+/u, trim: true)
-        |> Enum.chunk_every(@narrative_words_per_screen)
-        |> Enum.map(&Enum.join(&1, " "))
-    end
-  end
-
-  defp content_screen_title(title, 1), do: "#{title} — Explore"
-  defp content_screen_title(title, index), do: "#{title} — Explore #{index}"
-
-  defp remediation_excerpt(question, content, objective, index) do
-    case present_string(question["remediation"]) do
-      remediation when is_binary(remediation) ->
-        remediation
-
-      nil ->
-        segments =
-          [content["narrative"]]
-          |> Kernel.++(
-            content
-            |> Map.get("instructional_sections", [])
-            |> normalize_content_entries("Concept")
-            |> Enum.map(& &1.body)
-          )
-          |> Kernel.++(takeaway_items(content["key_takeaways"]))
-          |> Enum.filter(&present_text?/1)
-          |> Enum.flat_map(&narrative_segments/1)
-          |> case do
-            [] -> [objective]
-            values -> values
-          end
-
-        segments
-        |> Enum.at(rem(index - 1, length(segments)), objective)
-        |> String.slice(0, 360)
-        |> String.trim()
-        |> case do
-          "" -> objective
-          excerpt -> excerpt
-        end
-    end
-  end
-
-  defp question_prompt(%{"prompt" => prompt}) when is_binary(prompt), do: String.trim(prompt)
-  defp question_prompt(_question), do: "Explain the lesson's central idea."
-
-  defp question_minimum_length(%{"minimum_length" => value})
-       when is_integer(value) and value > 0,
-       do: min(value, 500)
-
-  defp question_minimum_length(_question), do: @minimum_reflection_length
-
-  defp question_required_terms(question) do
-    question
-    |> Map.get(
-      "answer_keywords",
-      Map.get(question, "keywords", get_in(question, ["correct_answer", "mustContain"]) || [])
-    )
-    |> normalize_terms()
-  end
-
-  defp question_forbidden_terms(question) do
-    question
-    |> Map.get("forbidden_keywords", get_in(question, ["correct_answer", "mustNotContain"]) || [])
-    |> normalize_terms()
-  end
-
-  defp normalize_terms(terms) when is_list(terms) do
-    terms
-    |> Enum.filter(&present_text?/1)
-    |> Enum.map(&String.trim/1)
-    |> Enum.take(2)
-    |> Enum.join(",")
-  end
-
-  defp normalize_terms(terms) when is_binary(terms), do: String.trim(terms)
-  defp normalize_terms(_terms), do: ""
 
   defp question_feedback(question, kind, fallback) do
     direct_key =
@@ -3017,209 +1791,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end
   end
 
-  defp instructional_sections(content) do
-    sections =
-      content["instructional_sections"] ||
-        content["lesson_sections"] ||
-        content["sections"]
-
-    sections
-    |> List.wrap()
-    |> Enum.with_index(1)
-    |> Enum.flat_map(fn {section, index} ->
-      case normalize_instructional_section(section, index, content) do
-        nil -> []
-        normalized -> [normalized]
-      end
-    end)
-    |> case do
-      [] ->
-        case first_present([content["narrative"]]) do
-          nil ->
-            []
-
-          narrative ->
-            [
-              %{
-                "id" => "core-concepts",
-                "title" => "Core Concepts",
-                "explanation" => narrative,
-                "examples" => [],
-                "callouts" => [],
-                "curiosity_prompts" => [],
-                "media" => [],
-                "key_takeaways" => [],
-                "source_evidence_links" => content["source_evidence_links"] || []
-              }
-            ]
-        end
-
-      normalized ->
-        normalized
-    end
-  end
-
-  defp normalize_instructional_section(section, index, content) when is_binary(section) do
-    case present_string(section) do
-      nil ->
-        nil
-
-      explanation ->
-        %{
-          "id" => "section-#{index}",
-          "title" => "Core Concept #{index}",
-          "explanation" => explanation,
-          "examples" => [],
-          "callouts" => [],
-          "curiosity_prompts" => [],
-          "media" => [],
-          "key_takeaways" => [],
-          "source_evidence_links" => content["source_evidence_links"] || []
-        }
-    end
-  end
-
-  defp normalize_instructional_section(section, index, content) when is_map(section) do
-    title =
-      first_present([
-        section["title"],
-        section["heading"],
-        "Core Concept #{index}"
-      ])
-
-    explanation =
-      first_present([
-        section["explanation"],
-        section["body"],
-        section["content"],
-        section["narrative"]
-      ])
-
-    case explanation do
-      nil ->
-        nil
-
-      explanation ->
-        %{
-          "id" => first_present([section["id"], "section-#{index}"]),
-          "title" => title,
-          "explanation" => explanation,
-          "examples" => section["examples"] || section["worked_examples"] || [],
-          "callouts" => section["callouts"] || section["callout_blocks"] || [],
-          "curiosity_prompts" => section["curiosity_prompts"] || [],
-          "media" => section["media"] || section["images"] || [],
-          "key_takeaways" => section["key_takeaways"] || section["takeaways"] || [],
-          "evidence_block_ids" => normalize_identifier_list(section["evidence_block_ids"]),
-          "source_evidence_links" =>
-            section["source_evidence_links"] || content["source_evidence_links"] || []
-        }
-    end
-  end
-
-  defp normalize_instructional_section(_, _, _), do: nil
-
-  defp normalize_examples(examples) do
-    examples
-    |> List.wrap()
-    |> Enum.with_index(1)
-    |> Enum.flat_map(fn
-      {example, index} when is_binary(example) ->
-        case present_string(example) do
-          nil ->
-            []
-
-          explanation ->
-            [
-              %{
-                "title" => "Worked Example #{index}",
-                "explanation" => explanation,
-                "steps" => [],
-                "source_evidence_links" => []
-              }
-            ]
-        end
-
-      {example, index} when is_map(example) ->
-        explanation =
-          first_present([
-            example["explanation"],
-            example["walkthrough"],
-            example["body"],
-            example["content"]
-          ])
-
-        steps = normalize_strings(example["steps"])
-
-        if is_nil(explanation) and steps == [] do
-          []
-        else
-          [
-            %{
-              "title" =>
-                first_present([
-                  example["title"],
-                  example["name"],
-                  "Worked Example #{index}"
-                ]),
-              "scenario" => first_present([example["scenario"], example["problem"]]),
-              "explanation" => explanation,
-              "steps" => steps,
-              "conclusion" =>
-                first_present([
-                  example["conclusion"],
-                  example["solution"],
-                  example["result"],
-                  example["answer"]
-                ]),
-              "source_evidence_links" => example["source_evidence_links"] || []
-            }
-          ]
-        end
-
-      _ ->
-        []
-    end)
-  end
-
-  defp ordered_step_elements(steps, stable_key) do
-    case normalize_strings(steps) do
-      [] ->
-        []
-
-      normalized_steps ->
-        [
-          text_element("h4", "Walkthrough", "#{stable_key}:walkthrough-heading"),
-          string_list_element("ol", normalized_steps, "#{stable_key}:walkthrough")
-        ]
-    end
-  end
-
-  defp section_takeaway_elements(takeaways, stable_key) do
-    case normalize_strings(takeaways) do
-      [] ->
-        []
-
-      normalized_takeaways ->
-        [
-          text_element("h3", "Section Takeaways", "#{stable_key}:takeaways-heading"),
-          string_list_element("ul", normalized_takeaways, "#{stable_key}:takeaways")
-        ]
-    end
-  end
-
-  defp source_evidence_elements(links, stable_key) do
-    case normalize_source_links(links) do
-      [] ->
-        []
-
-      source_links ->
-        [
-          text_element("h4", "Source Evidence", "#{stable_key}:sources-heading"),
-          source_link_list(source_links, "#{stable_key}:sources")
-        ]
-    end
-  end
-
   defp source_link_list(links, stable_key) do
     %{
       "id" => stable_id("ul", stable_key),
@@ -3281,54 +1852,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     |> Enum.uniq_by(& &1.url)
   end
 
-  defp normalize_curated_enrichments(enrichments) do
-    enrichments
-    |> List.wrap()
-    |> Enum.flat_map(fn
-      %{} = enrichment ->
-        with "annotated_link" <- enrichment["delivery_mode"],
-             url when is_binary(url) <- safe_curated_url(enrichment["url"]),
-             title when is_binary(title) <- present_string(enrichment["title"]),
-             annotation when is_binary(annotation) <-
-               present_string(enrichment["annotation"]),
-             learner_task when is_binary(learner_task) <-
-               present_string(enrichment["learner_task"]) do
-          [
-            %{
-              "proposal_id" => enrichment["proposal_id"],
-              "title" => title,
-              "url" => url,
-              "annotation" => annotation,
-              "learner_task" => learner_task,
-              "placement_after_section_id" =>
-                get_in(enrichment, ["placement", "after_section_id"])
-            }
-          ]
-        else
-          _ -> []
-        end
-
-      _ ->
-        []
-    end)
-    |> Enum.uniq_by(& &1["proposal_id"])
-  end
-
-  defp curated_for_placement(enrichments, section_id) do
-    Enum.filter(enrichments, &(&1["placement_after_section_id"] == section_id))
-  end
-
-  defp safe_curated_url(url) do
-    with trimmed when is_binary(trimmed) <- present_string(url),
-         %URI{scheme: "https", host: host, userinfo: nil} = uri <- URI.parse(trimmed),
-         true <- is_binary(host) and host != "",
-         true <- is_nil(uri.port) or uri.port == 443 do
-      URI.to_string(uri)
-    else
-      _ -> nil
-    end
-  end
-
   defp safe_source_url(url) do
     with trimmed when is_binary(trimmed) <- present_string(url),
          %URI{scheme: "https", host: host, userinfo: nil} = uri <- URI.parse(trimmed),
@@ -3374,39 +1897,13 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
         }
       end)
 
-    section_entries =
-      (content["instructional_sections"] ||
-         content["lesson_sections"] ||
-         content["sections"] ||
-         [])
-      |> List.wrap()
-      |> Enum.with_index(1)
-      |> Enum.flat_map(fn
-        {section, section_index} when is_map(section) ->
-          section_id = first_present([section["id"], "section-#{section_index}"])
-
-          section
-          |> media_entries()
-          |> Enum.with_index(1)
-          |> Enum.map(fn {entry, media_index} ->
-            %{
-              entry: entry,
-              placement: section_id,
-              fallback_id: "#{section_id}-media-#{media_index}"
-            }
-          end)
-
-        _section ->
-          []
-      end)
-
-    top_level ++ section_entries
+    top_level
   end
 
   defp media_entries(value) when is_map(value) do
-    value["media"] || value["images"] ||
-      []
-      |> List.wrap()
+    value
+    |> Map.get("media", [])
+    |> List.wrap()
   end
 
   defp media_entries(_value), do: []
@@ -3676,9 +2173,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       end)
   end
 
-  defp maybe_put_present(map, _key, value) when value in [nil, ""], do: map
-  defp maybe_put_present(map, key, value), do: Map.put(map, key, value)
-
   defp normalize_strings(value) when is_binary(value) do
     value
     |> String.split(~r/\n{2,}/, trim: true)
@@ -3729,11 +2223,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
        when length(questions) in 0..10,
        do: normalize_questions_for_compile(questions)
 
-  defp validate_questions(questions, mode, _content)
-       when (mode == "basic" and length(questions) in 1..10) or
-              (mode == "advanced" and length(questions) in 2..6) do
-    normalize_questions_for_compile(questions)
-  end
+  defp validate_questions([], "advanced", %{"schema_version" => 6}), do: {:ok, []}
 
   defp validate_questions(_, _, _), do: {:error, :invalid_question_count}
 

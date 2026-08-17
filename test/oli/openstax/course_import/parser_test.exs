@@ -33,7 +33,7 @@ defmodule Oli.OpenStax.CourseImport.ParserTest do
   end
 
   describe "build_outline/1" do
-    test "groups source sections into deterministic bundles of one to three" do
+    test "keeps each ordinary source section as one source-faithful lesson" do
       snapshot = %{
         "book_slug" => "sample-book",
         "title" => "Sample Book",
@@ -65,18 +65,17 @@ defmodule Oli.OpenStax.CourseImport.ParserTest do
       }
 
       assert {:ok, %{"units" => [unit]}} = Parser.build_outline(snapshot)
-      assert length(unit["lessons"]) == 3
-      assert Enum.map(unit["lessons"], &length(&1["source_sections"])) == [2, 2, 1]
-      assert Enum.all?(unit["lessons"], &(length(&1["source_evidence_links"]) in 1..3))
+      assert length(unit["lessons"]) == 5
+      assert Enum.map(unit["lessons"], &length(&1["source_sections"])) == [1, 1, 1, 1, 1]
+      assert Enum.all?(unit["lessons"], &(length(&1["source_evidence_links"]) == 1))
 
       [first_lesson | _] = unit["lessons"]
-      assert first_lesson["source_excerpt"] =~ "## 1.1 Topic 1"
-      assert first_lesson["source_excerpt"] =~ "## 1.2 Topic 2"
-      assert length(first_lesson["source_blocks"]) == 2
+      assert first_lesson["source_excerpt"] == ""
+      assert first_lesson["source_blocks"] == []
       assert first_lesson["source_media"] == []
       assert first_lesson["source_word_count"] > 0
-      assert first_lesson["source_coverage"]["section_count"] == 2
-      assert first_lesson["source_coverage"]["block_count"] == 2
+      assert first_lesson["source_coverage"]["section_count"] == 1
+      assert first_lesson["source_coverage"]["block_count"] == 0
       refute first_lesson["source_coverage"]["complete"]
     end
 
@@ -184,7 +183,7 @@ defmodule Oli.OpenStax.CourseImport.ParserTest do
       }
 
       assert {:ok, %{"units" => [%{"lessons" => lessons}]}} = Parser.build_outline(snapshot)
-      assert Enum.map(lessons, &length(&1["source_sections"])) == [1, 1, 2]
+      assert Enum.map(lessons, &length(&1["source_sections"])) == [1, 1, 1, 1]
 
       substantial_lesson = Enum.at(lessons, 1)
 
@@ -195,7 +194,7 @@ defmodule Oli.OpenStax.CourseImport.ParserTest do
       assert substantial_lesson["source_coverage"]["section_count"] == 1
       assert substantial_lesson["source_coverage"]["block_count"] == 30
       assert substantial_lesson["source_coverage"]["excerpt_truncated"]
-      assert substantial_lesson["source_excerpt"] =~ "### Final synthesis"
+      refute substantial_lesson["source_excerpt"] =~ "Final synthesis"
       assert String.length(substantial_lesson["source_excerpt"]) <= 10_000
 
       assert [%{"id" => "media-1", "source_section_url" => source_url}] =
@@ -356,7 +355,7 @@ defmodule Oli.OpenStax.CourseImport.ParserTest do
              ]
     end
 
-    test "merges a chapter introduction as an opening hook unless it has objectives" do
+    test "keeps a chapter introduction as its own source-faithful lesson" do
       introduction = %{
         "title" => "Chapter 1",
         "url" => "https://openstax.org/books/sample-book/pages/1-introduction",
@@ -382,8 +381,11 @@ defmodule Oli.OpenStax.CourseImport.ParserTest do
         })
       end
 
-      assert {:ok, %{"units" => [%{"lessons" => [merged]}]}} = outline.(introduction)
-      assert merged["source_sections"] == [introduction["url"], numbered["url"]]
+      assert {:ok, %{"units" => [%{"lessons" => [intro_lesson, numbered_lesson]}]}} =
+               outline.(introduction)
+
+      assert intro_lesson["source_sections"] == [introduction["url"]]
+      assert numbered_lesson["source_sections"] == [numbered["url"]]
 
       independent_intro =
         Map.put(introduction, "learning_objectives", ["Evaluate the chapter's central problem"])

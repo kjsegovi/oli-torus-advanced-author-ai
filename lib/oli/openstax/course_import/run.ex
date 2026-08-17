@@ -45,7 +45,7 @@ defmodule Oli.OpenStax.CourseImport.Run do
     :cancelled
   ]
 
-  @lesson_planning_strategies [:serial_v1, :parallel_v1]
+  @lesson_planning_strategies [:parallel_v1]
 
   @create_fields [
     :project_id,
@@ -118,8 +118,8 @@ defmodule Oli.OpenStax.CourseImport.Run do
 
     field :lesson_planning_generation, :integer, default: 0
     field :lesson_planning_parallelism, :integer, default: 3
-    field :source_schema_version, :integer, default: 1
-    field :plan_schema_version, :integer, default: 2
+    field :source_schema_version, :integer, default: 3
+    field :plan_schema_version, :integer, default: 6
     field :error, :map
     field :result, :map
     field :preflight_snapshot, :map
@@ -163,8 +163,8 @@ defmodule Oli.OpenStax.CourseImport.Run do
       greater_than_or_equal_to: 1,
       less_than_or_equal_to: 8
     )
-    |> validate_number(:source_schema_version, greater_than_or_equal_to: 1)
-    |> validate_number(:plan_schema_version, greater_than_or_equal_to: 1)
+    |> validate_inclusion(:source_schema_version, [3])
+    |> validate_inclusion(:plan_schema_version, [6])
     |> unique_constraint(:target_root_container_resource_id,
       name: :course_import_runs_one_active_per_project
     )
@@ -195,8 +195,8 @@ defmodule Oli.OpenStax.CourseImport.Run do
       greater_than_or_equal_to: 1,
       less_than_or_equal_to: 8
     )
-    |> validate_number(:source_schema_version, greater_than_or_equal_to: 1)
-    |> validate_number(:plan_schema_version, greater_than_or_equal_to: 1)
+    |> validate_inclusion(:source_schema_version, [3])
+    |> validate_inclusion(:plan_schema_version, [6])
     |> validate_number(:failure_count, greater_than_or_equal_to: 0)
     |> unique_constraint(:target_root_container_resource_id,
       name: :course_import_runs_one_active_per_project

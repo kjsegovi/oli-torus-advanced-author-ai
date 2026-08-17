@@ -316,7 +316,7 @@ defmodule Oli.OpenStax.CourseImport.RichSource do
           normalize_map(value(section, "source_coverage") || value(section, "coverage")),
         source_metadata:
           normalize_map(value(section, "source_metadata"))
-          |> Map.put_new("source_schema_version", 2)
+          |> Map.put_new("source_schema_version", 3)
       })
       |> Repo.insert!()
 
@@ -434,39 +434,7 @@ defmodule Oli.OpenStax.CourseImport.RichSource do
         source_media: value(block, "source_media") || value(block, "media") || []
       }
     end)
-    |> case do
-      [] ->
-        case value(section, "excerpt") do
-          excerpt when is_binary(excerpt) and excerpt != "" ->
-            text = String.trim(excerpt)
-
-            [
-              %{
-                source_key:
-                  normalized_source_key(
-                    nil,
-                    "block",
-                    "#{value(section, "url")}|legacy-excerpt"
-                  ),
-                order: 1,
-                heading_path: normalize_strings([value(section, "title")]),
-                block_kind: "legacy_excerpt",
-                normalized_text: text,
-                source_locator: %{"legacy_excerpt" => true},
-                token_estimate: token_estimate(text),
-                content_hash: sha256(text),
-                metadata: %{},
-                source_media: []
-              }
-            ]
-
-          _ ->
-            []
-        end
-
-      blocks ->
-        blocks
-    end
+    |> Enum.reject(&(&1.normalized_text == ""))
   end
 
   defp flatten_semantic_blocks(blocks, parent_path \\ []) do

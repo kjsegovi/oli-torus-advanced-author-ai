@@ -19,19 +19,20 @@ defmodule Oli.OpenStax.CourseImport.ParallelPlanningSchemaTest do
            } = %Lesson{}
   end
 
-  test "run changesets accept supported strategies and clamp per-run parallelism" do
+  test "run changesets accept only the current parallel strategy and clamp per-run parallelism" do
     attrs = %{
       project_id: 1,
       author_id: 1,
       source_url: "https://openstax.org/details/books/example",
       book_slug: "example",
-      lesson_planning_strategy: :serial_v1,
+      lesson_planning_strategy: :parallel_v1,
       lesson_planning_generation: 2,
       lesson_planning_parallelism: 8
     }
 
     assert Run.create_changeset(%Run{}, attrs).valid?
 
+    refute Run.create_changeset(%Run{}, %{attrs | lesson_planning_strategy: :serial_v1}).valid?
     refute Run.create_changeset(%Run{}, %{attrs | lesson_planning_parallelism: 0}).valid?
     refute Run.create_changeset(%Run{}, %{attrs | lesson_planning_parallelism: 9}).valid?
     refute Run.create_changeset(%Run{}, %{attrs | lesson_planning_strategy: :unknown}).valid?

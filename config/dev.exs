@@ -37,7 +37,7 @@ end
 config :oli,
   env: :dev,
   openstax_course_import_test_conveniences_enabled: true,
-  openstax_basic_pages_v5_enabled: true,
+  openstax_advanced_pages_v6_enabled: true,
   s3_xapi_bucket_name: System.get_env("S3_XAPI_BUCKET_NAME", "torus-xapi-dev"),
   s3_media_bucket_name: System.get_env("S3_MEDIA_BUCKET_NAME", "torus-media-dev"),
   media_url: System.get_env("MEDIA_URL", "http://localhost:9000/torus-media-dev"),

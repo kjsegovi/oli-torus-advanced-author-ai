@@ -106,7 +106,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
 
     opts = [
       plan_schema_version: claim.plan_schema_version,
-      basic_v5_enabled: claim.basic_v5_enabled,
+      advanced_v6_enabled: claim.advanced_v6_enabled,
       author_id: claim.author_id,
       project_id: claim.project_id,
       generation_checkpoint: claim.generation_checkpoint,
@@ -140,14 +140,8 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
   defp classify_failure({:ai_configuration_failed, reason}),
     do: {:permanent, configuration_category(reason)}
 
-  defp classify_failure({:basic_v5_required, :start_a_new_import}),
-    do: {:permanent, :basic_v5_reimport_required}
-
-  defp classify_failure({:basic_v5_source_ast_required, :start_a_new_import}),
-    do: {:permanent, :basic_v5_source_ast_required}
-
-  defp classify_failure({:basic_v5_disabled, :feature_not_enabled}),
-    do: {:permanent, :basic_v5_disabled}
+  defp classify_failure({:current_source_ast_required, :start_a_new_import}),
+    do: {:permanent, :current_source_ast_required}
 
   defp classify_failure({:ai_planning_failed, {:content_validation_exhausted, _details}}),
     do: {:permanent, :content_validation_exhausted}
@@ -247,8 +241,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
         :invalid_response,
         :invalid_execution_response,
         :invalid_ai_response,
-        :invalid_advanced_blueprint,
-        :invalid_v4_advanced_blueprint
+        :invalid_advanced_experience
       ]) ->
         {:transient, :invalid_provider_response}
 
@@ -383,25 +376,11 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
   defp failure_details({:ai_configuration_failed, _reason}),
     do: %{"phase" => "provider_configuration"}
 
-  defp failure_details({:basic_v5_required, :start_a_new_import}),
+  defp failure_details({:current_source_ast_required, :start_a_new_import}),
     do: %{
-      "phase" => "basic_v5_migration",
+      "phase" => "current_source_ast",
       "message" =>
-        "This legacy Basic run cannot be regenerated. Start a new OpenStax import to generate the lesson with Basic v5."
-    }
-
-  defp failure_details({:basic_v5_source_ast_required, :start_a_new_import}),
-    do: %{
-      "phase" => "basic_v5_source",
-      "message" =>
-        "This Basic lesson does not contain the v5 source AST. Start a new OpenStax import instead of retrying this run."
-    }
-
-  defp failure_details({:basic_v5_disabled, :feature_not_enabled}),
-    do: %{
-      "phase" => "basic_v5_rollout",
-      "message" =>
-        "Basic v5 generation is not enabled for this project. Enable the Basic v5 feature before retrying."
+        "This lesson does not contain the current source AST. Start a new OpenStax import instead of retrying this run."
     }
 
   defp failure_details(_reason), do: %{}

@@ -7,7 +7,7 @@ defmodule Oli.OpenStax.CourseImportTest do
 
   alias Oli.OpenStax.CourseImport.Worker.{
     ApplyWorker,
-    LessonPlannerWorker,
+    LessonPlanWorker,
     OutlineWorker,
     PreflightWorker
   }
@@ -17,17 +17,53 @@ defmodule Oli.OpenStax.CourseImportTest do
   alias Oli.ScopedFeatureFlags
 
   defmodule DeterministicLessonPlanner do
-    def plan(lesson, index, opts) do
-      {plan_mode, payload} =
-        Oli.OpenStax.CourseImport.Planner.build_lesson_plan(lesson, index, opts)
+    alias Oli.OpenStax.CourseImport.BasicPlanV5
+
+    def plan(lesson, index, _opts) do
+      block_ids = lesson |> BasicPlanV5.source_blocks() |> Enum.map(& &1["id"])
+
+      candidate = %{
+        "title" => lesson["title"],
+        "orientation" => %{
+          "overview" => "Read the complete source evidence and connect it to the objectives."
+        },
+        "content_groups" => [
+          %{
+            "id" => "source-content",
+            "title" => lesson["title"] || "Source content",
+            "instructional_purpose" => "reading",
+            "source_block_ids" => block_ids
+          }
+        ],
+        "question_slots" => [],
+        "synthesis" => %{
+          "heading" => "Synthesis",
+          "summary" => "Connect the source evidence to the stated objectives.",
+          "takeaways" => ["Support conclusions with source evidence."]
+        }
+      }
+
+      {:ok, content} = BasicPlanV5.build(candidate, lesson, index)
 
       {:ok,
        %{
-         plan_mode: plan_mode,
-         payload: payload,
+         plan_mode: "basic",
+         payload: %{
+           "content_payload" => content,
+           "questions_payload" => %{"items" => []}
+         },
          enrichment_proposals: [],
          created_by: "system",
-         metadata: %{strategy: :deterministic_test}
+         metadata: %{
+           "strategy" => "deterministic_current_contract_test",
+           "quality_gate" => %{
+             "approved" => true,
+             "confidence" => 0.99,
+             "hard_blockers" => [],
+             "repairs" => [],
+             "advisories" => []
+           }
+         }
        }}
     end
   end
@@ -213,26 +249,7 @@ defmodule Oli.OpenStax.CourseImportTest do
     Application.put_env(:oli, :env, :test)
   end
 
-  test "Basic v5 is unconditionally enabled only in local development", %{
-    project: project
-  } do
-    previous_env = Application.get_env(:oli, :env)
-    previous_v5 = Application.get_env(:oli, :openstax_basic_pages_v5_enabled)
-
-    on_exit(fn ->
-      Application.put_env(:oli, :env, previous_env)
-      Application.put_env(:oli, :openstax_basic_pages_v5_enabled, previous_v5)
-    end)
-
-    Application.put_env(:oli, :openstax_basic_pages_v5_enabled, false)
-    Application.put_env(:oli, :env, :dev)
-    assert CourseImport.basic_v5_enabled?(project)
-
-    Application.put_env(:oli, :env, :prod)
-    refute CourseImport.basic_v5_enabled?(project)
-  end
-
-  test "new imports persist only the rich source and Basic v5 write contract", %{
+  test "new imports persist only the current rich source and run schema contracts", %{
     author: author,
     project: project,
     root: root
@@ -246,7 +263,7 @@ defmodule Oli.OpenStax.CourseImportTest do
              )
 
     assert run.source_schema_version == 3
-    assert run.plan_schema_version == 5
+    assert run.plan_schema_version == 6
   end
 
   test "initial chapter selection follows the convenience mode and retries preserve stored choices",
@@ -396,8 +413,6 @@ defmodule Oli.OpenStax.CourseImportTest do
                "https://openstax.org/details/books/sample-book"
              )
 
-    run = legacy_test_run(run)
-
     assert run.status == :preflighting
     assert run.progress["work_state"] == "queued"
     assert get_in(run.progress, ["timing", "stage_started_at"])
@@ -422,16 +437,15 @@ defmodule Oli.OpenStax.CourseImportTest do
     assert {:ok, outline_run} = CourseImport.get_run(project, author, run.id)
     assert outline_run.status == :awaiting_outline_approval
     assert length(outline_run.units) == 1
-    assert length(hd(outline_run.units).lessons) == 2
-    assert hd(outline_run.units).assessment_payload["questions"] != []
+    assert length(hd(outline_run.units).lessons) == 3
+    assert get_in(hd(outline_run.units).assessment_payload || %{}, ["questions"]) in [nil, []]
 
-    use_serial_lesson_planner(run.id)
     assert {:ok, planning} = CourseImport.approve_outline(run.id, author)
     assert planning.status == :planning_lessons
     assert planning.progress["stage"] == "planning_lessons"
     assert planning.progress["work_state"] == "queued"
     assert get_in(planning.progress, ["timing", "stage_started_at"])
-    assert :ok = perform_job(LessonPlannerWorker, %{"run_id" => run.id})
+    assert :ok = drain_lesson_plan_jobs(run.id)
 
     assert {:ok, review_run} = CourseImport.get_run(project, author, run.id)
     assert review_run.status == :awaiting_lesson_approval
@@ -448,8 +462,7 @@ defmodule Oli.OpenStax.CourseImportTest do
       Enum.flat_map(lessons, fn lesson ->
         latest = List.first(lesson.plans)
 
-        if latest.checks_snapshot["status"] == "passed" and
-             length(latest.questions_payload["items"]) in 4..6 do
+        if latest.checks_snapshot["status"] == "passed" do
           []
         else
           [
@@ -465,60 +478,15 @@ defmodule Oli.OpenStax.CourseImportTest do
 
     assert failed_lesson_checks == []
 
-    [edited_lesson, adaptive_lesson | _] = lessons
-    old_version = edited_lesson.last_plan_version
-    original_plan = List.first(edited_lesson.plans)
+    [basic_lesson | _] = lessons
 
-    revised_narrative =
-      original_plan.content_payload["narrative"] <>
-        "\n\n" <>
-        hd(original_plan.content_payload["instructional_sections"])["explanation"]
-
-    assert {:ok, edited} =
+    assert {:error, :advanced_requires_fresh_generation} =
              CourseImport.update_lesson_plan(
-               edited_lesson.id,
-               author,
-               %{
-                 "content_payload" => %{"narrative" => revised_narrative}
-               },
-               edited_lesson.plan_mode
-             )
-
-    latest_edited_plan = Enum.max_by(edited.plans, & &1.version)
-
-    assert edited.last_plan_version > old_version
-    assert latest_edited_plan.content_payload["narrative"] == revised_narrative
-    assert latest_edited_plan.questions_payload == original_plan.questions_payload
-    assert latest_edited_plan.checks_snapshot["status"] == "passed"
-    refute latest_edited_plan.approved_by_user
-
-    assert {:ok, adaptive} =
-             CourseImport.update_lesson_plan(
-               adaptive_lesson.id,
+               basic_lesson.id,
                author,
                %{"content_payload" => %{}},
                "advanced"
              )
-
-    latest_adaptive_plan = Enum.max_by(adaptive.plans, & &1.version)
-
-    assert latest_adaptive_plan.checks_snapshot["status"] == "passed",
-           inspect(latest_adaptive_plan.checks_snapshot["results"],
-             pretty: true,
-             limit: :infinity
-           )
-
-    assert adaptive.plan_mode == "advanced"
-
-    assert [
-             %{
-               "kind" => "decision",
-               "interaction_type" => "multiple_choice",
-               "choices" => [_correct, _incorrect]
-             }
-           ] = latest_adaptive_plan.content_payload["advanced_blueprint"]["screens"]
-
-    refute latest_adaptive_plan.approved_by_user
 
     Enum.each(lessons, fn lesson ->
       assert {:ok, _lesson} = CourseImport.approve_lesson(run.id, lesson.id, author)
@@ -539,8 +507,8 @@ defmodule Oli.OpenStax.CourseImportTest do
     assert {:ok, completed} = CourseImport.get_run(project, author, run.id)
     assert completed.status == :completed
     assert completed.result["units_applied"] == 1
-    assert completed.result["lessons_applied"] == 2
-    assert completed.result["unit_assessments_applied"] == 1
+    assert completed.result["lessons_applied"] == 3
+    assert completed.result["unit_assessments_applied"] == 0
 
     latest_root = AuthoringResolver.root_container(project.slug)
     assert length(latest_root.children) == 1
@@ -559,49 +527,8 @@ defmodule Oli.OpenStax.CourseImportTest do
         AuthoringResolver.from_resource_id(project.slug, resource_id)
       end)
 
-    persisted_advanced_lesson =
-      Enum.find(persisted_lessons, &(&1.title == adaptive_lesson.title))
-
-    assert persisted_advanced_lesson.content["advancedAuthoring"]
-    assert persisted_advanced_lesson.content["advancedDelivery"]
-    refute persisted_advanced_lesson.graded
-
-    assert [
-             %{
-               "type" => "group",
-               "layout" => "deck",
-               "children" => advanced_sequence
-             }
-           ] = persisted_advanced_lesson.content["model"]
-
-    assert length(advanced_sequence) > 1
-    assert Enum.all?(advanced_sequence, &is_integer(&1["activity_id"]))
-
-    adaptive_registration = Oli.Activities.get_registration_by_slug("oli_adaptive")
-
-    persisted_adaptive_activities =
-      Enum.map(advanced_sequence, fn %{"activity_id" => activity_id} ->
-        AuthoringResolver.from_resource_id(project.slug, activity_id)
-      end)
-
-    assert Enum.all?(
-             persisted_adaptive_activities,
-             &(&1.activity_type_id == adaptive_registration.id)
-           )
-
-    assert Enum.any?(persisted_adaptive_activities, fn activity ->
-             Enum.any?(activity.content["partsLayout"], &(&1["type"] == "janus-mcq"))
-           end)
-
-    assert Enum.any?(persisted_adaptive_activities, fn activity ->
-             Enum.any?(activity.content["authoring"]["rules"], fn rule ->
-               rule["name"] == "incorrect-max-attempt" and
-                 Enum.any?(get_in(rule, ["event", "params", "actions"]), fn action ->
-                   action["type"] == "navigation" and
-                     get_in(action, ["params", "target"]) not in [nil, "next"]
-                 end)
-             end)
-           end)
+    assert length(persisted_lessons) == 3
+    assert Enum.all?(persisted_lessons, &(&1.content["advancedAuthoring"] != true))
 
     attributed_project = Course.get_project!(project.id)
     assert attributed_project.attributes.license.license_type == :cc_by
@@ -704,7 +631,17 @@ defmodule Oli.OpenStax.CourseImportTest do
   end
 
   test "lesson planning jobs use the dedicated AI queue" do
-    job_changeset = LessonPlannerWorker.new(%{"run_id" => Ecto.UUID.generate()})
+    job_changeset =
+      LessonPlanWorker.new(%{
+        "run_id" => Ecto.UUID.generate(),
+        "lesson_id" => Ecto.UUID.generate(),
+        "generation" => 1,
+        "request_id" => Ecto.UUID.generate(),
+        "position" => 1,
+        "operation" => "initial",
+        "base_plan_version" => 0,
+        "attempt_offset" => 0
+      })
 
     assert Ecto.Changeset.get_field(job_changeset, :queue) == "course_import_ai"
   end
@@ -987,24 +924,80 @@ defmodule Oli.OpenStax.CourseImportTest do
     assert returned_lesson.status == "needs_attention"
     refute List.first(returned_lesson.plans).approved_by_user
 
+    current_plan = List.first(returned_lesson.plans)
+
     assert {:ok, repaired} =
              CourseImport.update_lesson_plan(
                lesson.id,
                author,
                %{
-                 "objective" => "Explain the corrected lesson",
-                 "narrative" => "A corrected source-grounded narrative.",
-                 "questions_payload" => %{
-                   "items" => [
-                     %{"prompt" => "Explain the main idea.", "type" => "short_answer"},
-                     %{"prompt" => "Apply the main idea.", "type" => "short_answer"}
-                   ]
-                 }
+                 "content_payload" => current_plan.content_payload,
+                 "questions_payload" => current_plan.questions_payload
                },
                lesson.plan_mode
              )
 
-    refute List.first(repaired.plans).approved_by_user
+    repaired_plan = Enum.max_by(repaired.plans, & &1.version)
+    refute repaired_plan.approved_by_user
+    refute get_in(repaired_plan.generation_metadata, ["quality_gate", "approved"])
+    assert get_in(repaired_plan.generation_metadata, ["quality_gate", "repairs"]) != []
+  end
+
+  test "an Advanced v6 lesson can be downgraded to Basic v5 without losing its source AST", %{
+    author: author,
+    project: project,
+    root: root
+  } do
+    review_run = lesson_review_run(project, root, author)
+    lesson = review_run.units |> Enum.flat_map(& &1.lessons) |> List.first()
+    plan = List.first(lesson.plans)
+
+    advanced_content =
+      plan.content_payload
+      |> Map.put("schema_version", 6)
+      |> Map.put("authoring_mode", "advanced")
+      |> Map.put("advanced_v6_contract", %{"validated" => true})
+      |> Map.put("experience_blueprint", %{
+        "driving_question" => "How does the evidence support the lesson's central claim?",
+        "stages" => [],
+        "activities" => []
+      })
+
+    lesson
+    |> Ecto.Changeset.change(plan_mode: "advanced")
+    |> Repo.update!()
+
+    plan
+    |> Ecto.Changeset.change(
+      content_payload: advanced_content,
+      questions_payload: %{"items" => []}
+    )
+    |> Repo.update!()
+
+    assert {:ok, downgraded} =
+             CourseImport.update_lesson_plan(
+               lesson.id,
+               author,
+               %{
+                 "content_payload" => advanced_content,
+                 "questions_payload" => %{"items" => []}
+               },
+               "basic"
+             )
+
+    downgraded_plan = Enum.max_by(downgraded.plans, & &1.version)
+
+    assert downgraded.plan_mode == "basic"
+    assert downgraded.status == "needs_attention"
+    assert downgraded_plan.content_payload["schema_version"] == 5
+    assert downgraded_plan.content_payload["authoring_mode"] == "basic"
+
+    assert downgraded_plan.content_payload["content_groups"] ==
+             plan.content_payload["content_groups"]
+
+    refute Map.has_key?(downgraded_plan.content_payload, "experience_blueprint")
+    refute Map.has_key?(downgraded_plan.content_payload, "advanced_v6_contract")
+    refute get_in(downgraded_plan.generation_metadata, ["quality_gate", "approved"])
   end
 
   test "authors can approve and compile a lesson with advisory check failures", %{
@@ -1013,7 +1006,10 @@ defmodule Oli.OpenStax.CourseImportTest do
     root: root
   } do
     review_run = lesson_review_run(project, root, author)
-    [warning_lesson, other_lesson] = review_run.units |> Enum.flat_map(& &1.lessons)
+
+    [warning_lesson, other_lesson | remaining_lessons] =
+      review_run.units |> Enum.flat_map(& &1.lessons)
+
     warning_plan = List.first(warning_lesson.plans)
 
     failed_snapshot = %{
@@ -1048,6 +1044,10 @@ defmodule Oli.OpenStax.CourseImportTest do
     assert {:ok, _approved_other} =
              CourseImport.approve_lesson(review_run.id, other_lesson.id, author)
 
+    Enum.each(remaining_lessons, fn lesson ->
+      assert {:ok, _approved} = CourseImport.approve_lesson(review_run.id, lesson.id, author)
+    end)
+
     assert {:ok, compiling} = CourseImport.get_run(project, author, review_run.id)
     assert compiling.status == :compiling
 
@@ -1061,7 +1061,10 @@ defmodule Oli.OpenStax.CourseImportTest do
     root: root
   } do
     review_run = lesson_review_run(project, root, author)
-    [stale_lesson, other_lesson] = review_run.units |> Enum.flat_map(& &1.lessons)
+
+    [stale_lesson, other_lesson | remaining_lessons] =
+      review_run.units |> Enum.flat_map(& &1.lessons)
+
     stale_plan = List.first(stale_lesson.plans)
 
     stale_current_plan =
@@ -1086,6 +1089,10 @@ defmodule Oli.OpenStax.CourseImportTest do
     assert {:ok, _approved} =
              CourseImport.approve_lesson(review_run.id, other_lesson.id, author)
 
+    Enum.each(remaining_lessons, fn lesson ->
+      assert {:ok, _approved} = CourseImport.approve_lesson(review_run.id, lesson.id, author)
+    end)
+
     assert {:ok, current} = CourseImport.get_run(project, author, review_run.id)
     assert current.status == :awaiting_lesson_approval
   end
@@ -1098,9 +1105,8 @@ defmodule Oli.OpenStax.CourseImportTest do
     review_run = lesson_review_run(project, root, author)
 
     assert Enum.all?(review_run.units |> Enum.flat_map(& &1.lessons), fn lesson ->
-             List.first(lesson.plans).generation_metadata == %{
-               "strategy" => "deterministic_test"
-             }
+             List.first(lesson.plans).generation_metadata["strategy"] ==
+               "deterministic_current_contract_test"
            end)
 
     assert {:ok, applying} = CourseImport.approve_all_lessons(review_run.id, author)
@@ -1110,54 +1116,6 @@ defmodule Oli.OpenStax.CourseImportTest do
     assert Enum.all?(applying.units |> Enum.flat_map(& &1.lessons), fn lesson ->
              lesson.status == "approved" and List.first(lesson.plans).approved_by_user
            end)
-  end
-
-  test "Basic lesson plans preserve an accepted ten-question batch", %{
-    author: author,
-    project: project,
-    root: root
-  } do
-    review_run = lesson_review_run(project, root, author)
-
-    basic_lesson =
-      review_run.units
-      |> Enum.flat_map(& &1.lessons)
-      |> Enum.find(&(&1.plan_mode == "basic"))
-
-    original_plan = List.first(basic_lesson.plans)
-    original_questions = original_plan.questions_payload["items"]
-
-    ten_questions =
-      1..10
-      |> Enum.map(fn index ->
-        original_questions
-        |> Enum.at(rem(index - 1, length(original_questions)))
-        |> Map.put("id", "q#{index}")
-        |> Map.put(
-          "prompt",
-          "Scenario #{index}: " <>
-            Enum.at(original_questions, rem(index - 1, length(original_questions)))["prompt"]
-        )
-      end)
-
-    assert {:ok, updated} =
-             CourseImport.update_lesson_plan(
-               basic_lesson.id,
-               author,
-               %{"questions_payload" => %{"items" => ten_questions}},
-               "basic"
-             )
-
-    latest = Enum.max_by(updated.plans, & &1.version)
-
-    assert length(latest.questions_payload["items"]) == 10,
-           inspect(
-             Enum.map(updated.plans, fn plan ->
-               {plan.version, length(plan.questions_payload["items"]), plan.checks_snapshot}
-             end),
-             pretty: true,
-             limit: :infinity
-           )
   end
 
   test "bulk approval rolls every approval back when one lesson is busy", %{
@@ -1308,34 +1266,58 @@ defmodule Oli.OpenStax.CourseImportTest do
         "https://openstax.org/details/books/sample-book"
       )
 
-    run = legacy_test_run(run)
-
     :ok = perform_job(PreflightWorker, %{"run_id" => run.id})
     {:ok, _} = CourseImport.update_scope(run.id, author, ["chapter-1"])
     :ok = perform_job(OutlineWorker, %{"run_id" => run.id})
-    use_serial_lesson_planner(run.id)
     {:ok, _} = CourseImport.approve_outline(run.id, author)
-    :ok = perform_job(LessonPlannerWorker, %{"run_id" => run.id})
+    :ok = drain_lesson_plan_jobs(run.id)
     {:ok, details} = CourseImport.get_run(project, author, run.id)
     assert details.status == :awaiting_lesson_approval
     details
   end
 
-  defp use_serial_lesson_planner(run_id) do
-    Oli.OpenStax.CourseImport.Run
-    |> Repo.get!(run_id)
-    |> Oli.OpenStax.CourseImport.Run.update_changeset(%{
-      lesson_planning_strategy: :serial_v1
-    })
-    |> Repo.update!()
+  defp drain_lesson_plan_jobs(run_id) do
+    run = Repo.get!(Oli.OpenStax.CourseImport.Run, run_id)
+
+    assert {:ok, _run} =
+             CourseImport.initialize_parallel_lesson_planning(
+               run_id,
+               run.lesson_planning_generation
+             )
+
+    drain_queued_lesson_jobs(run_id, 100)
   end
 
-  defp legacy_test_run(run) do
-    run
-    |> Oli.OpenStax.CourseImport.Run.update_changeset(%{
-      source_schema_version: 2,
-      plan_schema_version: 3
-    })
-    |> Repo.update!()
+  defp drain_queued_lesson_jobs(_run_id, 0), do: {:error, :lesson_job_drain_exhausted}
+
+  defp drain_queued_lesson_jobs(run_id, remaining) do
+    run = Repo.get!(Oli.OpenStax.CourseImport.Run, run_id)
+
+    if run.status == :planning_lessons do
+      jobs =
+        Oli.OpenStax.CourseImport.Lesson
+        |> where(
+          [lesson],
+          lesson.run_id == ^run_id and lesson.planning_state == "queued" and
+            not is_nil(lesson.planning_oban_job_id)
+        )
+        |> order_by([lesson], asc: lesson.planning_position)
+        |> Repo.all()
+        |> Enum.map(&Repo.get!(Oban.Job, &1.planning_oban_job_id))
+
+      case jobs do
+        [] ->
+          {:error, :no_queued_lesson_jobs}
+
+        jobs ->
+          Enum.each(jobs, fn job ->
+            assert :ok = LessonPlanWorker.perform(%{job | attempt: 1, max_attempts: 4})
+          end)
+
+          drain_queued_lesson_jobs(run_id, remaining - 1)
+      end
+    else
+      :ok
+    end
   end
 end

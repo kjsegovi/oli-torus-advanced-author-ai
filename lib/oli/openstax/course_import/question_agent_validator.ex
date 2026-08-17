@@ -34,13 +34,20 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentValidator do
     count_rationale = present_string(candidate["count_rationale"] || candidate[:count_rationale])
     content = context[:content_payload] || context["content_payload"] || %{}
     lesson = context[:lesson] || context["lesson"] || %{}
-    section_ids = content |> Map.get("instructional_sections", []) |> ids("id")
+    content_group_ids = content |> Map.get("content_groups", []) |> ids("id")
 
-    slot_section_ids =
-      content |> Map.get("question_slots", []) |> ids("placement_after_section_id")
+    slot_group_ids =
+      content
+      |> Map.get("question_slots", [])
+      |> Enum.map(
+        &(&1["placement_after_group_id"] || &1[:placement_after_group_id] ||
+            &1["placement_after_section_id"] || &1[:placement_after_section_id])
+      )
+      |> Enum.filter(&is_binary/1)
+      |> MapSet.new()
 
-    allowed_section_ids =
-      if MapSet.size(slot_section_ids) > 0, do: slot_section_ids, else: section_ids
+    allowed_group_ids =
+      if MapSet.size(slot_group_ids) > 0, do: slot_group_ids, else: content_group_ids
 
     current_objective_catalog = objective_catalog(content)
     prior_objective_catalog = prior_objective_catalog(context)
@@ -65,7 +72,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentValidator do
           validate_question(
             question,
             index,
-            allowed_section_ids,
+            allowed_group_ids,
             objective_ids,
             objective_lookup,
             evidence_ids,
@@ -75,7 +82,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentValidator do
         {normalized_question, findings ++ question_findings}
       end)
 
-    slot_count = MapSet.size(slot_section_ids)
+    slot_count = MapSet.size(slot_group_ids)
     allowed_question_count = if slot_count > 0, do: min(slot_count, 10), else: 10
 
     findings =
@@ -180,7 +187,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentValidator do
   defp validate_question(
          question,
          index,
-         section_ids,
+         content_group_ids,
          objective_ids,
          objective_lookup,
          evidence_ids,
@@ -231,9 +238,9 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentValidator do
         "Question #{index} uses a generic prompt template."
       )
       |> add_unless(
-        MapSet.member?(section_ids, placement),
-        "invalid_section_placement",
-        "Question #{index} must follow a valid instructional section."
+        MapSet.member?(content_group_ids, placement),
+        "invalid_content_group_placement",
+        "Question #{index} must follow an approved content group."
       )
       |> add_unless(
         mapped_objective_ids != [] and subset?(mapped_objective_ids, objective_ids),
@@ -275,7 +282,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentValidator do
   defp validate_question(
          _question,
          index,
-         _section_ids,
+         _content_group_ids,
          _objective_ids,
          _objective_lookup,
          _evidence_ids,

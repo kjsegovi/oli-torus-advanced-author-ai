@@ -69,15 +69,12 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
                present(candidate["overview"]) || source_overview(blocks),
            "content_groups" => hydrated_groups,
            "question_slots" => slots,
-           "instructional_sections" => compatibility_sections(hydrated_groups),
            "media" => hydrate_media(media, hydrated_groups, generated_alt),
            "synthesis" => normalize_synthesis(candidate["synthesis"], blocks),
-           "key_takeaways" => synthesis_takeaways(candidate["synthesis"]),
            "source_evidence_links" => normalize_strings(lesson["source_evidence_links"]),
            "source_block_ids" => all_ids,
            "coverage_manifest" => coverage_manifest(blocks, hydrated_groups),
            "attribution" => normalized_attribution(lesson),
-           "advanced_blueprint" => %{"screens" => [], "remediation_paths" => []},
            "v5_contract" => %{
              "source_ast_authority" => "deterministic_extractor",
              "organization_authority" => "content_architect",
@@ -530,28 +527,6 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
     Enum.filter(media, &MapSet.member?(block_ids, &1["source_block_id"]))
   end
 
-  defp compatibility_sections(groups) do
-    Enum.map(groups, fn group ->
-      %{
-        "id" => group["id"],
-        "title" => group["title"],
-        "heading" => group["title"],
-        "instructional_purpose" => group["instructional_purpose"],
-        "explanation" => Enum.map_join(group["source_blocks"], "\n\n", & &1["text"]),
-        "source_block_ids" => group["source_block_ids"],
-        "evidence_block_ids" => group["source_block_ids"],
-        "source_evidence_links" =>
-          group["source_blocks"]
-          |> Enum.map(& &1["source_section_url"])
-          |> normalize_strings(),
-        "media_ids" => Enum.map(group["media"], & &1["id"]),
-        "key_takeaways" => [],
-        "callouts" => [],
-        "examples" => []
-      }
-    end)
-  end
-
   defp coverage_manifest(blocks, groups) do
     group_by_block =
       groups
@@ -624,9 +599,6 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
       "takeaways" => normalize_strings(value["takeaways"])
     }
   end
-
-  defp synthesis_takeaways(value),
-    do: value |> stringify_map() |> Map.get("takeaways", []) |> normalize_strings()
 
   defp generated_alt_map(values) do
     values

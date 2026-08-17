@@ -97,10 +97,11 @@ defmodule Oli.OpenStax.CourseImport.Worker.OutlineWorker do
     end
   end
 
-  defp planning_snapshot(%Run{source_schema_version: version} = run) when version >= 2,
+  defp planning_snapshot(%Run{source_schema_version: 3} = run),
     do: RichSource.load_snapshot(run.id, run.preflight_snapshot || %{})
 
-  defp planning_snapshot(%Run{} = run), do: {:ok, run.preflight_snapshot || %{}}
+  defp planning_snapshot(%Run{source_schema_version: version}),
+    do: {:error, {:unsupported_openstax_source_schema, version}}
 
   defp retry_or_fail(run_id, attempt, max_attempts, reason) when attempt < max_attempts do
     _ =
@@ -118,10 +119,10 @@ defmodule Oli.OpenStax.CourseImport.Worker.OutlineWorker do
     {:discard, reason}
   end
 
-  defp source_options(%Run{} = run) do
+  defp source_options(%Run{}) do
     :oli
     |> Application.get_env(:openstax_course_import_source_options, [])
-    |> Keyword.put_new(:strict_book_content, run.source_schema_version >= 2)
+    |> Keyword.put_new(:strict_book_content, true)
   end
 
   @impl Oban.Worker
