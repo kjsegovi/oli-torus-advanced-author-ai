@@ -13,7 +13,9 @@ defmodule Oli.OpenStax.CourseImport.TelemetryTest do
     [:oli, :openstax, :course_import, :lesson_job_failed],
     [:oli, :openstax, :course_import, :lesson_batch_finished],
     [:oli, :openstax, :course_import, :media_staged],
-    [:oli, :openstax, :course_import, :compile_failed]
+    [:oli, :openstax, :course_import, :compile_failed],
+    [:oli, :openstax, :course_import, :simulation_stage],
+    [:oli, :openstax, :course_import, :simulation_author_decision]
   ]
 
   setup do
@@ -119,5 +121,134 @@ defmodule Oli.OpenStax.CourseImport.TelemetryTest do
 
     assert_receive {:telemetry, [:oli, :openstax, :course_import, :compile_failed],
                     %{count: 1, affected_lessons: 1}, %{run_id: ^run_id, reason: :invalid_plan}}
+  end
+
+  test "emits bounded simulation operations without prompts, source text, or decision reasons" do
+    run_id = Ecto.UUID.generate()
+    lesson_id = Ecto.UUID.generate()
+    proposal_id = Ecto.UUID.generate()
+    record_id = Ecto.UUID.generate()
+
+    scope = %{
+      run_id: run_id,
+      lesson_id: lesson_id,
+      proposal_id: proposal_id,
+      record_id: record_id,
+      version: 2
+    }
+
+    assert :ok =
+             Telemetry.simulation_stage(:artifact, :passed, scope, %{
+               duration_ms: 1_250,
+               input_tokens: 320,
+               output_tokens: 180,
+               repair_count: 1,
+               validation_failures: 2,
+               artifact_bytes: 42_000,
+               capi_sample_count: 3,
+               capi_sample_failures: 0,
+               provider: "open_ai",
+               model: "gpt-5.6-sol",
+               rendering_mode: "3d",
+               library_ids: ["three-0.185.1", "three-0.185.1"],
+               prompt: "must not be emitted",
+               source_text: "must not be emitted"
+             })
+
+    assert :ok = Telemetry.simulation_author_decision(:approve_artifact, scope)
+
+    assert_receive {:telemetry, [:oli, :openstax, :course_import, :simulation_stage],
+                    %{
+                      count: 1,
+                      duration_ms: 1_250,
+                      input_tokens: 320,
+                      output_tokens: 180,
+                      repair_count: 1,
+                      validation_failures: 2,
+                      artifact_bytes: 42_000,
+                      capi_sample_count: 3,
+                      capi_sample_failures: 0
+                    },
+                    %{
+                      run_id: ^run_id,
+                      lesson_id: ^lesson_id,
+                      proposal_id: ^proposal_id,
+                      record_id: ^record_id,
+                      version: 2,
+                      stage: :artifact,
+                      outcome: :passed,
+                      provider: "open_ai",
+                      model: "gpt-5.6-sol",
+                      rendering_mode: :three_d,
+                      library_ids: ["three-0.185.1"]
+                    } = metadata}
+
+    refute Map.has_key?(metadata, :prompt)
+    refute Map.has_key?(metadata, :source_text)
+
+    assert_receive {:telemetry, [:oli, :openstax, :course_import, :simulation_author_decision],
+                    %{count: 1},
+                    %{
+                      run_id: ^run_id,
+                      proposal_id: ^proposal_id,
+                      record_id: ^record_id,
+                      version: 2,
+                      decision: :approve_artifact
+                    } = decision_metadata}
+
+    refute Map.has_key?(decision_metadata, :reason)
+  end
+
+  test "plan checks emit persisted opportunity duration and exact provider usage" do
+    run_id = Ecto.UUID.generate()
+    lesson_id = Ecto.UUID.generate()
+
+    plan = %LessonPlan{
+      id: Ecto.UUID.generate(),
+      version: 4,
+      created_by: "ai",
+      checks_snapshot: %{"status" => "passed", "results" => []},
+      generation_metadata: %{
+        "simulation_opportunities" => %{
+          "status" => "approved",
+          "opportunity_count" => 2,
+          "duration_ms" => 640,
+          "repair_count" => 1,
+          "designer" => %{
+            "provider" => "open_ai",
+            "model" => "gpt-5.6-terra"
+          },
+          "attempts" => [
+            %{
+              "designer_usage" => %{"input_tokens" => 100, "output_tokens" => 30},
+              "critic_usage" => %{"input_tokens" => 40, "output_tokens" => 10}
+            }
+          ]
+        }
+      }
+    }
+
+    assert :ok = Telemetry.plan_checked(run_id, lesson_id, plan, false)
+
+    assert_receive {:telemetry, [:oli, :openstax, :course_import, :plan_checked], _, _}
+
+    assert_receive {:telemetry, [:oli, :openstax, :course_import, :simulation_stage],
+                    %{
+                      count: 1,
+                      candidate_count: 2,
+                      duration_ms: 640,
+                      input_tokens: 140,
+                      output_tokens: 40,
+                      repair_count: 1
+                    },
+                    %{
+                      run_id: ^run_id,
+                      lesson_id: ^lesson_id,
+                      version: 4,
+                      stage: :opportunity,
+                      outcome: :approved,
+                      provider: "open_ai",
+                      model: "gpt-5.6-terra"
+                    }}
   end
 end

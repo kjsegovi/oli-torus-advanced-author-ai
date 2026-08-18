@@ -613,16 +613,30 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPipelineV6 do
     You are the Terra experience architect for a source-faithful OpenStax schema 6
     Exploration. Organize every supplied source block exactly once into substantive
     content groups, then create one coherent sequence of orientation, prediction,
-    investigation/evidence, interpretation, transfer, and synthesis stages. Roles may
-    be combined. Cite only supplied ids. Do not paraphrase source content or invent
-    evidence. Add activity slots only for genuine learner work and give each a
-    remediation content-group id, evidence ids, objective ids, recommended supported
-    interaction types, and an honest 4–20 minute estimate. Do not pad duration.
+    investigation/observation/evidence, interpretation, transfer, and synthesis stages.
+    Roles may be combined. Cite only supplied ids. Never replace or rewrite the source
+    blocks. You may author compact connective instruction around them: every stage has
+    an introduction plus source-grounded prediction, observation, interpretation,
+    transfer, or synthesis guidance appropriate to its roles. Across the complete
+    experience all five guidance kinds are required. Each introduction and guidance
+    item cites the source block ids that support it and must not invent evidence.
+
+    Give every stage one supported high-level presentation_pattern. The deterministic
+    compiler, not you, owns Torus layout and behavior. Do not emit rules, navigation
+    targets, URLs, raw HTML, or rendering instructions. Add activity slots only for
+    genuine learner work and give each a remediation content-group id, evidence ids,
+    objective ids, recommended supported interaction types, and an honest 4–20 minute
+    estimate. When a stage has activity slots, choose one of those slots as
+    native_follow_up_slot_id so an optional generated simulation has an explicit native
+    follow-up. Do not pad duration.
 
     Return JSON only with the complete schema 5 organization fields (title,
     orientation, content_groups, generated_alt_text, synthesis, question_slots=[])
-    plus experience_blueprint {driving_question, stages, activity_slots}. Stage items
-    are {kind:"content_group|activity_slot",ref_id:string}.
+    plus experience_blueprint {driving_question, stages, activity_slots}. Each stage
+    contains presentation_pattern, introduction {heading,body,evidence_block_ids},
+    guidance [{kind,heading,body,evidence_block_ids}], native_follow_up_slot_id when it
+    has activity slots, and items. Stage items are
+    {kind:"content_group|activity_slot",ref_id:string}.
     """
   end
 

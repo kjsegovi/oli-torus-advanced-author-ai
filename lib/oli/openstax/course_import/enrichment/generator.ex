@@ -31,21 +31,23 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Generator do
     adapter = adapter(opts)
 
     function_exported?(adapter, :available?, 0) and adapter.available?() == true and
-      runtime_safe?(adapter)
+      generation_profile_supported?(adapter)
   rescue
     _ -> false
   end
 
-  @doc "Restricts delivery to audited static generators until runtime navigation is contained."
+  @doc "Returns whether an adapter declares a supported generation trust profile."
   @spec runtime_safe?(module()) :: boolean()
-  def runtime_safe?(adapter) when is_atom(adapter) do
+  def runtime_safe?(adapter), do: generation_profile_supported?(adapter)
+
+  defp generation_profile_supported?(adapter) when is_atom(adapter) do
     function_exported?(adapter, :runtime_profile, 0) and
-      adapter.runtime_profile() == :audited_static
+      adapter.runtime_profile() in [:audited_static, :untrusted_generated]
   rescue
     _ -> false
   end
 
-  def runtime_safe?(_adapter), do: false
+  defp generation_profile_supported?(_adapter), do: false
 
   @spec generate(EnrichmentProposal.t(), keyword()) :: {:ok, bundle()} | {:error, term()}
   def generate(proposal, opts \\ [])

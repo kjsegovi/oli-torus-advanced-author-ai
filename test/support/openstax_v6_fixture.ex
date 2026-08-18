@@ -70,8 +70,17 @@ defmodule Oli.OpenStax.CourseImport.V6Fixture do
             "id" => "investigation",
             "title" => "Investigate and decide",
             "purpose" => "Move from prediction through transfer and synthesis.",
+            "presentation_pattern" => "predict_observe_explain",
             "roles" =>
-              ~w(orientation prediction investigation evidence interpretation transfer synthesis),
+              ~w(orientation prediction investigation observation evidence interpretation transfer synthesis),
+            "introduction" => %{
+              "heading" => "Turn the model into a testable claim",
+              "body" =>
+                "Connect the source relationship to a prediction, then use the recorded measurements to decide which model is better supported.",
+              "evidence_block_ids" => ["evidence", "investigation"]
+            },
+            "guidance" => rich_guidance(),
+            "native_follow_up_slot_id" => "slot-3",
             "items" =>
               [%{"kind" => "content_group", "ref_id" => "evidence-group"}] ++
                 Enum.map(
@@ -120,6 +129,46 @@ defmodule Oli.OpenStax.CourseImport.V6Fixture do
           }
         end)
     }
+  end
+
+  def rich_guidance do
+    [
+      %{
+        "kind" => "prediction",
+        "heading" => "Commit to a prediction",
+        "body" =>
+          "State which model should agree more closely with the measurement before comparing the values.",
+        "evidence_block_ids" => ["evidence"]
+      },
+      %{
+        "kind" => "observation",
+        "heading" => "Record what the evidence shows",
+        "body" =>
+          "Record the predicted and observed values with their units, including any discrepancy.",
+        "evidence_block_ids" => ["evidence", "investigation"]
+      },
+      %{
+        "kind" => "interpretation",
+        "heading" => "Explain the discrepancy",
+        "body" =>
+          "Use the direction and size of the discrepancy to explain which model is better supported.",
+        "evidence_block_ids" => ["evidence", "investigation"]
+      },
+      %{
+        "kind" => "transfer",
+        "heading" => "Test a changed condition",
+        "body" =>
+          "Apply the same comparison when one measured condition changes and identify what remains invariant.",
+        "evidence_block_ids" => ["evidence", "investigation"]
+      },
+      %{
+        "kind" => "synthesis",
+        "heading" => "Answer the driving question",
+        "body" =>
+          "Combine the calculation and measurement into a concise evidence-based model decision.",
+        "evidence_block_ids" => ["evidence", "investigation"]
+      }
+    ]
   end
 
   defp block(id, kind, text),

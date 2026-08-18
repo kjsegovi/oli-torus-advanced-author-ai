@@ -80,6 +80,27 @@ defmodule Oli.ScopedFeatureFlags.DefinedFeatures do
     rollout_mode: :canary
   )
 
+  deffeature(
+    :openstax_simulation_web_research,
+    [:authoring],
+    "Enable author-reviewed web research for generated OpenStax simulations",
+    rollout_mode: :canary
+  )
+
+  deffeature(
+    :openstax_simulation_3d_generation,
+    [:authoring],
+    "Enable audited Three.js generation for OpenStax simulations",
+    rollout_mode: :canary
+  )
+
+  deffeature(
+    :openstax_generated_simulation_delivery,
+    [:both],
+    "Enable delivery of approved generated OpenStax simulation artifacts",
+    rollout_mode: :canary
+  )
+
   # Test-only features for comprehensive testing
   if Mix.env() in [:test] do
     deffeature(:feature1, [:both], "Test feature for both scopes")

@@ -53,6 +53,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
        target_container: target_container,
        return_path: ~p"/workspaces/course_author/#{project.slug}/curriculum",
        available?: CourseImport.available?(project, author),
+       unfinished_legacy_run?: CourseImport.unfinished_legacy_run?(project, author),
        approve_all_enabled: CourseImport.approve_all_lessons_enabled?(),
        test_conveniences_enabled: CourseImport.test_conveniences_enabled?(),
        enrichment_capabilities: CourseImport.enrichment_capabilities(project),
@@ -117,7 +118,8 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   def handle_event("start", %{"openstax_course_import" => attrs}, socket) do
     source_url = String.trim(Map.get(attrs, "source_url", ""))
 
-    with true <- socket.assigns.available?,
+    with false <- socket.assigns.unfinished_legacy_run?,
+         true <- socket.assigns.available?,
          true <- source_url != "",
          {:ok, run} <-
            CourseImport.start_import(
@@ -132,6 +134,16 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
        |> assign_run(run)
        |> push_patch(to: run_path(socket.assigns.project.slug, run.id))}
     else
+      true ->
+        {:noreply,
+         assign(
+           socket,
+           error_message:
+             gettext(
+               "This project contains an unfinished legacy import. It remains unchanged; start a new v6 import in a new project."
+             )
+         )}
+
       false ->
         {:noreply, assign(socket, error_message: gettext("Enter a valid OpenStax book URL."))}
 
@@ -299,6 +311,33 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     end
   end
 
+  def handle_event(
+        "approve_enrichment",
+        %{
+          "proposal_id" => proposal_id,
+          "research_set_id" => research_set_id,
+          "content_hash" => content_hash
+        },
+        socket
+      ) do
+    with %{} = run <- socket.assigns.run,
+         {:ok, _research} <-
+           CourseImport.approve_enrichment_evidence(
+             run.id,
+             proposal_id,
+             research_set_id,
+             content_hash,
+             socket.assigns.author
+           ),
+         {:ok, refreshed} <-
+           CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
+      {:noreply, socket |> assign(error_message: nil) |> assign_run(refreshed)}
+    else
+      {:error, reason} -> {:noreply, assign(socket, error_message: course_import_error(reason))}
+      _ -> {:noreply, socket}
+    end
+  end
+
   def handle_event("approve_enrichment", %{"proposal_id" => proposal_id}, socket) do
     with %{} = run <- socket.assigns.run,
          {:ok, _proposal} <-
@@ -306,6 +345,34 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
              run.id,
              proposal_id,
              socket.assigns.author
+           ),
+         {:ok, refreshed} <-
+           CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
+      {:noreply, socket |> assign(error_message: nil) |> assign_run(refreshed)}
+    else
+      {:error, reason} -> {:noreply, assign(socket, error_message: course_import_error(reason))}
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event(
+        "reject_enrichment_evidence",
+        %{
+          "proposal_id" => proposal_id,
+          "research_set_id" => research_set_id,
+          "content_hash" => content_hash
+        },
+        socket
+      ) do
+    with %{} = run <- socket.assigns.run,
+         {:ok, _research} <-
+           CourseImport.reject_enrichment_evidence(
+             run.id,
+             proposal_id,
+             research_set_id,
+             content_hash,
+             socket.assigns.author,
+             "Rejected during evidence review"
            ),
          {:ok, refreshed} <-
            CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
@@ -333,10 +400,39 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     end
   end
 
-  def handle_event("generate_simulation", %{"proposal_id" => proposal_id}, socket) do
+  def handle_event(
+        "generate_simulation",
+        %{
+          "proposal_id" => proposal_id,
+          "simulation_spec_id" => simulation_spec_id,
+          "simulation_spec_hash" => simulation_spec_hash,
+          "author_feedback" => author_feedback
+        },
+        socket
+      ) do
     with %{} = run <- socket.assigns.run,
          {:ok, _artifact} <-
            CourseImport.request_simulation_generation(
+             run.id,
+             proposal_id,
+             simulation_spec_id,
+             simulation_spec_hash,
+             author_feedback,
+             socket.assigns.author
+           ),
+         {:ok, refreshed} <-
+           CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
+      {:noreply, socket |> assign(error_message: nil) |> assign_run(refreshed)}
+    else
+      {:error, reason} -> {:noreply, assign(socket, error_message: course_import_error(reason))}
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("generate_simulation_spec", %{"proposal_id" => proposal_id}, socket) do
+    with %{} = run <- socket.assigns.run,
+         {:ok, _spec} <-
+           CourseImport.request_simulation_spec(
              run.id,
              proposal_id,
              socket.assigns.author
@@ -350,12 +446,19 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     end
   end
 
-  def handle_event("approve_simulation", %{"artifact_id" => artifact_id}, socket) do
+  def handle_event(
+        "approve_simulation",
+        %{"artifact_id" => artifact_id, "version" => version, "content_hash" => content_hash},
+        socket
+      ) do
     with %{} = run <- socket.assigns.run,
+         {version, ""} <- Integer.parse(version),
          {:ok, _artifact} <-
            CourseImport.approve_simulation_artifact(
              run.id,
              artifact_id,
+             version,
+             content_hash,
              socket.assigns.author
            ),
          {:ok, refreshed} <-
@@ -1675,6 +1778,31 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     |> Enum.sort_by(& &1.version, :desc)
   end
 
+  defp proposal_research_sets(proposal) do
+    proposal
+    |> Map.get(:research_sets, [])
+    |> List.wrap()
+    |> Enum.sort_by(& &1.version, :desc)
+  end
+
+  defp reviewable_research_set(proposal),
+    do: Enum.find(proposal_research_sets(proposal), &(&1.status == "evidence_review"))
+
+  defp proposal_specs(proposal) do
+    proposal
+    |> Map.get(:simulation_specs, [])
+    |> List.wrap()
+    |> Enum.sort_by(& &1.version, :desc)
+  end
+
+  defp active_proposal_spec(proposal),
+    do: Enum.find(proposal_specs(proposal), &(&1.status == "designing"))
+
+  defp reviewable_proposal_spec(proposal),
+    do: Enum.find(proposal_specs(proposal), &(&1.status == "ready_for_review"))
+
+  defp latest_proposal_spec(proposal), do: List.first(proposal_specs(proposal))
+
   defp approved_proposal_artifact(proposal),
     do: Enum.find(proposal_artifacts(proposal), &(&1.status == "approved"))
 
@@ -1685,6 +1813,184 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     do: Enum.find(proposal_artifacts(proposal), &(&1.status == "ready_for_review"))
 
   defp latest_proposal_artifact(proposal), do: List.first(proposal_artifacts(proposal))
+
+  defp simulation_spec_identity(spec_payload) do
+    domain = simulation_spec_value(spec_payload, "domain")
+    rendering = simulation_spec_value(spec_payload, "rendering_mode")
+
+    [domain, rendering]
+    |> Enum.reject(&(&1 in [nil, "", "—"]))
+    |> Enum.map_join(" · ", &humanize_check_key/1)
+    |> case do
+      "" -> gettext("Recorded design")
+      identity -> identity
+    end
+  end
+
+  defp simulation_spec_value(spec_payload, key) do
+    case map_string_key(spec_payload, key, nil) do
+      value when is_binary(value) and value != "" -> value
+      value when is_number(value) -> to_string(value)
+      value when is_map(value) -> simulation_summary_value(value)
+      _ -> "—"
+    end
+  end
+
+  defp simulation_spec_list(spec_payload, key) do
+    spec_payload
+    |> map_string_key(key, [])
+    |> List.wrap()
+    |> Enum.map(&simulation_summary_value/1)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("; ")
+    |> case do
+      "" -> "—"
+      value -> value
+    end
+  end
+
+  defp simulation_spec_guided_tasks(spec_payload) do
+    spec_payload
+    |> map_string_key("guided_tasks", [])
+    |> List.wrap()
+    |> Enum.map(fn task ->
+      map_string_key(task, "prompt", map_string_key(task, "task", ""))
+    end)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("; ")
+    |> case do
+      "" -> "—"
+      value -> value
+    end
+  end
+
+  defp simulation_spec_parameters(spec_payload),
+    do:
+      spec_payload
+      |> map_string_key("parameters", [])
+      |> List.wrap()
+      |> Enum.filter(&is_map/1)
+
+  defp simulation_parameter_range(parameter) do
+    minimum = map_string_key(parameter, "min", "—")
+    maximum = map_string_key(parameter, "max", "—")
+    step = map_string_key(parameter, "step", "—")
+    "#{minimum}–#{maximum} (step #{step})"
+  end
+
+  defp simulation_parameter_unit(parameter) do
+    cond do
+      map_string_key(parameter, "unitless", false) == true -> gettext("Unitless")
+      true -> map_string_key(parameter, "unit", "—")
+    end
+  end
+
+  defp simulation_capi_declarations(spec_payload, direction) do
+    spec_payload
+    |> map_string_key("capi_manifest", %{})
+    |> map_string_key(direction, [])
+    |> List.wrap()
+    |> Enum.map(fn declaration ->
+      key = map_string_key(declaration, "key", "?")
+      type = map_string_key(declaration, "type", "?")
+      "#{key}: #{type}"
+    end)
+    |> Enum.join(", ")
+    |> case do
+      "" -> "—"
+      value -> value
+    end
+  end
+
+  defp simulation_accessibility_summary(spec_payload) do
+    spec_payload
+    |> map_string_key("accessibility", %{})
+    |> enrichment_evidence_rows()
+    |> Enum.map_join("; ", fn row -> "#{row.label}: #{row.value}" end)
+    |> case do
+      "" -> "—"
+      value -> value
+    end
+  end
+
+  defp simulation_summary_value(value) when is_binary(value), do: value
+  defp simulation_summary_value(value) when is_number(value), do: to_string(value)
+
+  defp simulation_summary_value(value) when is_map(value) do
+    map_string_key(
+      value,
+      "text",
+      map_string_key(
+        value,
+        "description",
+        map_string_key(value, "prompt", map_string_key(value, "guidance", ""))
+      )
+    )
+  end
+
+  defp simulation_summary_value(_value), do: ""
+
+  defp simulation_artifact_repair_count(artifact) do
+    artifact
+    |> Map.get(:generation_metadata, %{})
+    |> map_string_key("builder_repair_count", 0)
+  end
+
+  defp simulation_artifact_attempts(artifact) do
+    case Map.get(artifact, :attempts, []) do
+      attempts when is_list(attempts) -> Enum.sort_by(attempts, & &1.attempt_number)
+      _ -> []
+    end
+  end
+
+  defp simulation_attempt_findings(attempt) do
+    attempt
+    |> Map.get(:findings, [])
+    |> List.wrap()
+    |> Enum.map(fn finding ->
+      code =
+        map_string_key(
+          finding,
+          "code",
+          map_string_key(finding, "category", gettext("validation finding"))
+        )
+
+      message = map_string_key(finding, "message", "")
+      path = map_string_key(finding, "path", "")
+      details = map_string_key(finding, "details", nil)
+
+      [
+        code,
+        message,
+        path,
+        if(is_nil(details), do: nil, else: enrichment_evidence_value(details))
+      ]
+      |> Enum.reject(&(&1 in [nil, ""]))
+      |> Enum.join(": ")
+    end)
+    |> Enum.reject(&(&1 == ""))
+    |> Enum.join("; ")
+    |> case do
+      "" -> gettext("No findings recorded")
+      findings -> findings
+    end
+  end
+
+  defp simulation_artifact_size(%{byte_size: size}) when is_integer(size) do
+    cond do
+      size >= 1_000_000 -> "#{Float.round(size / 1_000_000, 1)} MB"
+      size >= 1_000 -> "#{Float.round(size / 1_000, 1)} KB"
+      true -> "#{size} B"
+    end
+  end
+
+  defp simulation_artifact_size(_artifact), do: "—"
+
+  defp short_content_hash(value) when is_binary(value) and byte_size(value) > 12,
+    do: String.slice(value, 0, 12) <> "…"
+
+  defp short_content_hash(value) when is_binary(value), do: value
+  defp short_content_hash(_value), do: "—"
 
   defp simulation_preview_url(%{status: status, validation_status: validation_status} = artifact) do
     if status in ["ready_for_review", "approved"] and validation_status == "passed" do
@@ -1707,17 +2013,17 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   defp proposal_state_label(state), do: humanize_check_key(state)
 
   defp proposal_can_approve?(proposal, lesson, capabilities) do
-    proposal.state == "proposed" and
-      case proposal.kind do
-        "generated_simulation" ->
-          lesson.plan_mode == "advanced" and capabilities.generated_available
+    case proposal.kind do
+      "generated_simulation" ->
+        proposal.state == "evidence_review" and lesson.plan_mode == "advanced" and
+          capabilities.generated_enabled and not is_nil(reviewable_research_set(proposal))
 
-        _ ->
-          proposal.research_status == "completed" and
-            is_map(proposal.research_evidence) and
-            map_size(proposal.research_evidence) > 0 and
-            is_binary(curated_resource_url(proposal))
-      end
+      _ ->
+        proposal.state == "proposed" and proposal.research_status == "completed" and
+          is_map(proposal.research_evidence) and
+          map_size(proposal.research_evidence) > 0 and
+          is_binary(curated_resource_url(proposal))
+    end
   end
 
   defp curated_resource_url(%{resource_url: url}) when is_binary(url) do
@@ -1734,10 +2040,18 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   defp curated_resource_url(_proposal), do: nil
 
   defp proposal_can_generate?(proposal, capabilities) do
-    proposal.kind == "generated_simulation" and proposal.state == "approved" and
+    proposal.kind == "generated_simulation" and
+      proposal.state in ["designing", "artifact_review"] and
       capabilities.generated_available and is_nil(active_proposal_artifact(proposal)) and
       is_nil(reviewable_proposal_artifact(proposal)) and
-      is_nil(approved_proposal_artifact(proposal))
+      is_nil(approved_proposal_artifact(proposal)) and
+      not is_nil(reviewable_proposal_spec(proposal))
+  end
+
+  defp proposal_can_design?(proposal, capabilities) do
+    proposal.kind == "generated_simulation" and proposal.state == "designing" and
+      capabilities.generated_enabled and is_nil(active_proposal_spec(proposal)) and
+      is_nil(reviewable_proposal_spec(proposal))
   end
 
   defp enrichment_evidence_rows(value) when is_map(value) do
@@ -2307,6 +2621,9 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
 
   defp course_import_error(:simulation_generation_in_progress),
     do: gettext("This proposal already has a simulation preview in progress or awaiting review.")
+
+  defp course_import_error(:simulation_author_feedback_too_long),
+    do: gettext("Keep simulation builder guidance to 2,000 characters or fewer.")
 
   defp course_import_error(:generated_enrichment_requires_advanced_authoring),
     do: gettext("Generated simulations can be approved only for Advanced Author lessons.")

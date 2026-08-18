@@ -14,13 +14,19 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentProposal do
   alias Oli.Accounts.Author
   alias Oli.Authoring.Course.Project
 
-  alias Oli.OpenStax.CourseImport.{Lesson, Run, SimulationArtifact}
+  alias Oli.OpenStax.CourseImport.{
+    EnrichmentResearchSet,
+    Lesson,
+    Run,
+    SimulationArtifact,
+    SimulationSpec
+  }
 
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
 
   @kinds ~w(article video existing_simulation generated_simulation external_resource)
-  @states ~w(proposed approved rejected cancelled omitted)
+  @states ~w(proposed researching evidence_review designing artifact_review approved rejected cancelled omitted failed)
   @delivery_modes ~w(annotated_link iframe_candidate generated_simulation)
   @research_statuses ~w(not_started running completed failed)
 
@@ -55,6 +61,8 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentProposal do
     belongs_to :decided_by_author, Author, type: :id
 
     has_many :simulation_artifacts, SimulationArtifact, foreign_key: :proposal_id
+    has_many :research_sets, EnrichmentResearchSet, foreign_key: :proposal_id
+    has_many :simulation_specs, SimulationSpec, foreign_key: :proposal_id
 
     field :kind, :string
     field :rank, :integer
@@ -129,6 +137,7 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentProposal do
   def research_changeset(proposal, attrs) do
     proposal
     |> cast(attrs, [
+      :state,
       :research_status,
       :research_version,
       :research_evidence,
@@ -137,12 +146,14 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentProposal do
       :resource_url,
       :delivery_mode
     ])
+    |> validate_inclusion(:state, @states)
     |> validate_inclusion(:research_status, @research_statuses)
     |> validate_number(:research_version, greater_than_or_equal_to: 0)
     |> validate_resource_url()
     |> check_constraint(:research_status,
       name: :course_import_enrichment_proposals_research_status
     )
+    |> check_constraint(:state, name: :course_import_enrichment_proposals_state)
     |> check_constraint(:delivery_mode,
       name: :course_import_enrichment_proposals_delivery_mode
     )

@@ -26,7 +26,7 @@ defmodule Oli.OpenStax.CourseImport.RunHealthWorkerTest do
         "https://openstax.org/details/books/health-check-book"
       )
 
-    {:ok, run: run}
+    {:ok, run: run, author: author, project: project}
   end
 
   test "leaves a run alone while its background job is active", %{run: run} do
@@ -48,6 +48,57 @@ defmodule Oli.OpenStax.CourseImport.RunHealthWorkerTest do
     assert failed.error["phase"] == "preflight"
     assert failed.error["reason"] =~ "background_job_missing"
     assert failed.error["recoverable"]
+  end
+
+  test "ignores unfinished legacy rows and reports them without mutation", %{
+    author: author,
+    project: project
+  } do
+    now = DateTime.utc_now()
+    legacy_id = Ecto.UUID.generate()
+
+    {1, _} =
+      Repo.insert_all(Run, [
+        %{
+          id: legacy_id,
+          project_id: project.id,
+          author_id: author.id,
+          status: :preflighting,
+          source_url: "https://openstax.org/details/books/legacy-preserved",
+          book_slug: "legacy-preserved",
+          source_schema_version: 2,
+          plan_schema_version: 4,
+          lesson_planning_strategy: :parallel_v1,
+          lesson_planning_generation: 0,
+          lesson_planning_parallelism: 1,
+          scope_manifest: %{},
+          progress: %{"legacy" => true},
+          latest_plan_version: 0,
+          failure_count: 0,
+          inserted_at: now,
+          updated_at: now
+        }
+      ])
+
+    before = Repo.get!(Run, legacy_id)
+    assert CourseImport.unfinished_legacy_run?(project, author)
+    assert :ok = perform_job(RunHealthWorker, %{})
+    after_health_check = Repo.get!(Run, legacy_id)
+
+    assert Map.take(after_health_check, [
+             :status,
+             :source_schema_version,
+             :plan_schema_version,
+             :progress,
+             :updated_at
+           ]) ==
+             Map.take(before, [
+               :status,
+               :source_schema_version,
+               :plan_schema_version,
+               :progress,
+               :updated_at
+             ])
   end
 
   test "reviews the oldest unfinished parallel runs across the batch boundary", %{run: run} do

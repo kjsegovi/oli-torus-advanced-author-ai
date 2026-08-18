@@ -700,10 +700,17 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   defp question_hints(question) do
     cognitive_hint = present_string(question["hint"]) || ""
 
+    bottom_out_hint =
+      first_present([
+        question["remediation"],
+        question["explanation"],
+        "Review the worked explanation and connect it to the correct response before trying again."
+      ])
+
     [
       %{"body_md" => ""},
       %{"body_md" => cognitive_hint},
-      %{"body_md" => ""}
+      %{"body_md" => bottom_out_hint}
     ]
   end
 
@@ -764,7 +771,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   end
 
   defp advanced_v6_screens(title, content, stable_key, media_assets, attribution, opts) do
-    blueprint = content["experience_blueprint"] || %{}
+    blueprint = explicit_simulation_placements(content["experience_blueprint"] || %{})
     groups = Map.new(List.wrap(content["content_groups"]), &{&1["id"], &1})
     activities = Map.new(List.wrap(blueprint["activities"]), &{&1["id"], &1})
     stages = List.wrap(blueprint["stages"])
@@ -782,6 +789,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
            stages
            |> Enum.with_index(1)
            |> Enum.reduce_while({:ok, []}, fn {stage, stage_index}, {:ok, compiled} ->
+             stage_screen = advanced_v6_stage_screen(stage, stage_index, stable_key)
+
              stage["items"]
              |> List.wrap()
              |> Enum.with_index(1)
@@ -816,7 +825,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
                end
              end)
              |> case do
-               {:ok, screens} -> {:cont, {:ok, compiled ++ screens}}
+               {:ok, screens} -> {:cont, {:ok, compiled ++ [stage_screen] ++ screens}}
                {:error, reason} -> {:halt, {:error, reason}}
              end
            end) do
@@ -826,6 +835,53 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
         advanced_attribution_screens(content, attribution, "#{stable_key}:v6:attribution")
 
       {:ok, [orientation] ++ stage_screens ++ List.wrap(synthesis) ++ attribution_screens}
+    end
+  end
+
+  defp explicit_simulation_placements(blueprint) do
+    stages = Map.new(List.wrap(blueprint["stages"]), &{&1["id"], &1})
+
+    explicit_targets =
+      blueprint
+      |> Map.get("enrichment_references", [])
+      |> List.wrap()
+      |> Enum.reduce(%{}, fn reference, targets ->
+        stage = stages[reference["stage_id"]] || %{}
+        proposal_id = present_string(reference["proposal_id"])
+        activity_id = present_string(stage["native_follow_up_activity_id"])
+
+        if is_binary(proposal_id) and is_binary(activity_id),
+          do: Map.put(targets, proposal_id, activity_id),
+          else: targets
+      end)
+
+    case explicit_targets do
+      targets when map_size(targets) == 0 ->
+        blueprint
+
+      targets ->
+        proposal_by_activity =
+          Map.new(targets, fn {proposal_id, activity_id} -> {activity_id, proposal_id} end)
+
+        proposal_ids = targets |> Map.keys() |> MapSet.new()
+
+        activities =
+          blueprint
+          |> Map.get("activities", [])
+          |> List.wrap()
+          |> Enum.map(fn activity ->
+            case Map.fetch(proposal_by_activity, activity["id"]) do
+              {:ok, proposal_id} ->
+                Map.put(activity, "enrichment_proposal_id", proposal_id)
+
+              :error ->
+                if MapSet.member?(proposal_ids, activity["enrichment_proposal_id"]),
+                  do: Map.delete(activity, "enrichment_proposal_id"),
+                  else: activity
+            end
+          end)
+
+        Map.put(blueprint, "activities", activities)
     end
   end
 
@@ -863,26 +919,91 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     content_screen(key, title, parts)
   end
 
+  defp advanced_v6_stage_screen(stage, stage_index, stable_key) do
+    stage_id = stage["id"] || stage_index
+    key = "#{stable_key}:v6:stage:#{stage_id}"
+    introduction = stage["introduction"] || %{}
+
+    guidance =
+      stage
+      |> Map.get("guidance", [])
+      |> List.wrap()
+      |> Enum.filter(&present_text?(&1["body"]))
+
+    parts =
+      [
+        [stage["title"], "Exploration stage #{stage_index}"]
+        |> first_present()
+        |> PartBuilders.text_flow(:h2, y: 0)
+        |> Map.put("id", stable_id("stage-title", key)),
+        [introduction["heading"], "Prepare to investigate"]
+        |> first_present()
+        |> PartBuilders.text_flow(:h3, y: 52)
+        |> Map.put("id", stable_id("stage-introduction-heading", key)),
+        [
+          introduction["body"],
+          stage["purpose"],
+          "Connect the source evidence to the next learner task."
+        ]
+        |> first_present()
+        |> PartBuilders.text_flow(:p, y: 96)
+        |> Map.put("id", stable_id("stage-introduction", key))
+      ] ++ advanced_v6_guidance_parts(guidance, key, 184)
+
+    content_screen(key, stage["title"] || "Exploration stage #{stage_index}", parts)
+    |> Map.put(:stage_id, stage["id"])
+    |> Map.put(:presentation_pattern, stage["presentation_pattern"] || "guided_reading")
+  end
+
+  defp advanced_v6_guidance_parts(guidance, stable_key, starting_y) do
+    guidance
+    |> Enum.with_index(1)
+    |> Enum.flat_map(fn {item, index} ->
+      y = starting_y + (index - 1) * 128
+
+      [
+        (item["heading"] || advanced_v6_guidance_heading(item["kind"]))
+        |> PartBuilders.text_flow(:h3, y: y)
+        |> Map.put("id", stable_id("guidance-heading-#{index}", stable_key)),
+        item["body"]
+        |> PartBuilders.text_flow(:p, y: y + 44)
+        |> Map.put("id", stable_id("guidance-body-#{index}", stable_key))
+      ]
+    end)
+  end
+
+  defp advanced_v6_guidance_heading("prediction"), do: "Predict before you inspect"
+  defp advanced_v6_guidance_heading("observation"), do: "Observe and record"
+  defp advanced_v6_guidance_heading("interpretation"), do: "Interpret the evidence"
+  defp advanced_v6_guidance_heading("transfer"), do: "Transfer the relationship"
+  defp advanced_v6_guidance_heading("synthesis"), do: "Synthesize your explanation"
+  defp advanced_v6_guidance_heading(_kind), do: "Investigate the evidence"
+
   defp advanced_v6_group_screens(group, stable_key, media_assets) do
     group_id = group["id"]
+    key = "#{stable_key}:v6:group:#{group_id}"
 
-    source_screens =
+    blocks =
       group
       |> Map.get("source_blocks", [])
       |> List.wrap()
       |> Enum.reject(&(&1["rendering"] == "lesson_title"))
-      |> Enum.with_index(1)
-      |> Enum.map(fn {block, index} ->
-        key = "#{stable_key}:v6:group:#{group_id}:block:#{block["id"] || index}"
 
-        title =
-          if(index == 1, do: group["title"], else: advanced_v6_block_title(block, group["title"]))
+    source_screens =
+      case blocks do
+        [] ->
+          []
 
-        body = advanced_v6_block_markdown(block)
-
-        content_screen(key, title, titled_content_parts(title, body, key))
-        |> Map.put(:section_id, group_id)
-      end)
+        source_blocks ->
+          [
+            content_screen(
+              key,
+              group["title"],
+              advanced_v6_group_parts(group, source_blocks, key)
+            )
+            |> Map.put(:section_id, group_id)
+          ]
+      end
 
     media_screens =
       advanced_media_screens(
@@ -893,6 +1014,48 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       )
 
     source_screens ++ media_screens
+  end
+
+  defp advanced_v6_group_parts(group, source_blocks, stable_key) do
+    purpose = present_string(group["instructional_purpose"])
+
+    heading =
+      [group["title"], "Source evidence"]
+      |> first_present()
+      |> PartBuilders.text_flow(:h2, y: 0)
+      |> Map.put("id", stable_id("group-heading", stable_key))
+
+    purpose_parts =
+      if is_binary(purpose) do
+        [
+          "Evidence focus: #{purpose}"
+          |> PartBuilders.text_flow(:p, y: 56)
+          |> Map.put("id", stable_id("group-purpose", stable_key))
+        ]
+      else
+        []
+      end
+
+    starting_y = if(purpose_parts == [], do: 64, else: 144)
+
+    block_parts =
+      source_blocks
+      |> Enum.with_index(1)
+      |> Enum.map(fn {block, index} ->
+        label = advanced_v6_block_title(block, "Source evidence")
+        body = advanced_v6_block_markdown(block)
+
+        markdown =
+          if length(source_blocks) == 1,
+            do: body,
+            else: "#### #{label}\n\n#{body}"
+
+        markdown
+        |> PartBuilders.text_flow(:p, y: starting_y + (index - 1) * 104)
+        |> Map.put("id", stable_id("source-block-#{block["id"] || index}", stable_key))
+      end)
+
+    [heading] ++ purpose_parts ++ block_parts
   end
 
   defp advanced_v6_block_title(block, fallback) do
@@ -1211,8 +1374,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
       target_screen =
         content_screens
-        |> Enum.filter(&(&1[:section_id] == target_section_id))
-        |> List.last()
+        |> Enum.find(&(&1[:section_id] == target_section_id))
 
       case target_screen do
         %{key: target_key} ->
@@ -1532,8 +1694,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
     if is_binary(target_section_id) do
       content_screens
-      |> Enum.filter(&(&1[:section_id] == target_section_id))
-      |> List.last()
+      |> Enum.find(&(&1[:section_id] == target_section_id))
     end
   end
 

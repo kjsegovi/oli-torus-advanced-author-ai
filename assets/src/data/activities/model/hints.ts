@@ -10,10 +10,16 @@ interface Hints extends Omit<List<Hint>, 'addOne' | 'removeOne'> {
   path: string;
   byPart: (model: HasHints, partId: string) => Hint[];
   addOne: (hint: Hint, partId: string) => (model: any, post: PostUndoable) => void;
-  getDeerInHeadlightsHint: (model: HasHints, partId: string) => Hint;
+  getDeerInHeadlightsHint: (model: HasHints, partId: string) => Hint | undefined;
   getCognitiveHints: (model: HasHints, partId: string) => Hint[];
-  getBottomOutHint: (model: HasHints, partId: string) => Hint;
+  getBottomOutHint: (model: HasHints, partId: string) => Hint | undefined;
   addCognitiveHint(hint: Hint, partId: string): (model: HasHints, _post: PostUndoable) => void;
+  upsertRequiredHint(
+    hint: Hint,
+    partId: string,
+    position: 'start' | 'end',
+    attrs: Partial<Pick<Hint, 'content' | 'editor' | 'textDirection'>>,
+  ): (model: HasHints, _post: PostUndoable) => void;
   setContent(id: string, content: RichText): (model: HasHints, _post: PostUndoable) => void;
   setEditor(id: string, mode: EditorType): (model: HasHints, _post: PostUndoable) => void;
   setTextDirection(
@@ -29,8 +35,11 @@ export const Hints: Hints = {
   path: PATH,
   ...List<Hint>(PATH),
 
-  byPart: (model, partId) =>
-    Operations.apply(model, Operations.find(`$..parts[?(@.id=='${partId}')].hints`)),
+  byPart: (model, partId) => {
+    const hints = Operations.apply(model, Operations.find(`$..parts[?(@.id=='${partId}')].hints`));
+
+    return Array.isArray(hints) ? hints : [];
+  },
 
   // Native OLI activities split out hints into three types:
   // a. (0-1) Deer in headlights (re-explain the problem for students who don't understand the prompt)
@@ -53,6 +62,25 @@ export const Hints: Hints = {
       // right before the bottomOut hint at the end of the list
       const bottomOutIndex = Hints.byPart(model, partId).length - 1;
       model.authoring.parts.find((p) => p.id === partId)?.hints.splice(bottomOutIndex, 0, hint);
+    };
+  },
+
+  upsertRequiredHint(hint, partId, position, attrs) {
+    return (model: HasHints, _post: PostUndoable) => {
+      const part = model.authoring.parts.find((candidate) => candidate.id === partId);
+      if (!part) return;
+
+      if (!Array.isArray(part.hints)) part.hints = [];
+
+      let target = part.hints.find((candidate) => candidate.id === hint.id);
+
+      if (!target) {
+        const created = clone(hint);
+        position === 'start' ? part.hints.unshift(created) : part.hints.push(created);
+        target = created;
+      }
+
+      Object.assign(target, attrs);
     };
   },
 

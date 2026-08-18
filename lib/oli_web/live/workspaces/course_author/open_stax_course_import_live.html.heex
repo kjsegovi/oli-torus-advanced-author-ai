@@ -27,6 +27,19 @@
   </div>
 
   <div
+    :if={@unfinished_legacy_run?}
+    class="mb-6 rounded border border-amber-300 bg-amber-50 p-4 text-sm text-amber-950"
+    role="status"
+  >
+    <p class="font-semibold">{gettext("Legacy OpenStax import preserved")}</p>
+    <p class="mt-1">
+      {gettext(
+        "This project has an unfinished import from an older schema. Torus will not resume, migrate, cancel, or delete it. Create a new project to start a v6 import."
+      )}
+    </p>
+  </div>
+
+  <div
     :if={@error_message}
     class="mb-6 rounded border border-red-200 bg-red-50 p-4 text-sm text-red-800"
     role="alert"
@@ -58,7 +71,7 @@
             label={gettext("OpenStax book URL")}
             placeholder="https://openstax.org/details/books/introduction-computer-science"
             required
-            disabled={!@available?}
+            disabled={!@available? || @unfinished_legacy_run?}
           />
           <p class="mt-1 text-xs text-gray-500">
             {gettext(
@@ -71,7 +84,7 @@
             type="submit"
             variant={:primary}
             size={:sm}
-            disabled={!@available?}
+            disabled={!@available? || @unfinished_legacy_run?}
             phx-disable-with={gettext("Starting course planner...")}
           >
             {gettext("Plan course")}
@@ -1199,6 +1212,246 @@
                           </details>
 
                           <div
+                            :if={reviewable_research_set(proposal)}
+                            class="mt-4 rounded border border-emerald-200 bg-white p-3"
+                          >
+                            <% research = reviewable_research_set(proposal) %>
+                            <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+                              <p class="font-semibold text-emerald-950">
+                                {gettext("Evidence set v%{version}", version: research.version)}
+                              </p>
+                              <span class="rounded bg-emerald-50 px-2 py-1 font-semibold text-emerald-800">
+                                {gettext("Awaiting exact-version approval")}
+                              </span>
+                            </div>
+                            <p class="mt-2 break-all font-mono text-xs text-slate-700">
+                              {research.content_hash}
+                            </p>
+                            <p class="mt-2 text-xs text-slate-700">
+                              {gettext(
+                                "%{claims} claims grounded in %{sources} consulted sources after %{searches} searches.",
+                                claims: length(research.claims || []),
+                                sources: length(research.retrieved_sources || []),
+                                searches: research.search_count
+                              )}
+                            </p>
+                            <ul class="mt-3 space-y-2 text-xs">
+                              <li :for={source <- research.proposed_sources || []}>
+                                <a
+                                  href={map_string_key(source, "url", "")}
+                                  target="_blank"
+                                  rel="noopener noreferrer"
+                                  class="font-semibold text-blue-700 underline"
+                                >
+                                  {map_string_key(
+                                    source,
+                                    "title",
+                                    map_string_key(source, "url", "")
+                                  )}
+                                </a>
+                              </li>
+                            </ul>
+                            <details class="mt-3 text-xs">
+                              <summary class="cursor-pointer font-semibold">
+                                {gettext("Review all claim paraphrases and citations")}
+                              </summary>
+                              <ul class="mt-2 space-y-3">
+                                <li :for={claim <- research.claims || []}>
+                                  <p>{map_string_key(claim, "paraphrase", "")}</p>
+                                  <ul class="mt-1 space-y-1 break-all text-slate-600">
+                                    <li :for={url <- map_string_key(claim, "citation_urls", [])}>
+                                      <a
+                                        href={url}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        class="text-blue-700 underline"
+                                      >
+                                        {url}
+                                      </a>
+                                    </li>
+                                  </ul>
+                                </li>
+                              </ul>
+                            </details>
+                          </div>
+
+                          <div
+                            :if={latest_proposal_spec(proposal)}
+                            class="mt-4 rounded border border-indigo-200 bg-white p-3"
+                          >
+                            <% spec = latest_proposal_spec(proposal) %>
+                            <div class="flex flex-wrap items-center justify-between gap-2 text-xs">
+                              <p class="font-semibold text-indigo-950">
+                                {gettext("Simulation specification v%{version}",
+                                  version: spec.version
+                                )}
+                              </p>
+                              <span class="rounded bg-indigo-50 px-2 py-1 font-semibold text-indigo-800">
+                                {proposal_state_label(spec.status)}
+                              </span>
+                            </div>
+                            <dl class="mt-3 grid gap-2 text-xs sm:grid-cols-2">
+                              <div>
+                                <dt class="font-semibold">{gettext("Evidence hash")}</dt>
+                                <dd class="break-all font-mono">{spec.evidence_hash}</dd>
+                              </div>
+                              <div>
+                                <dt class="font-semibold">{gettext("Spec hash")}</dt>
+                                <dd class="break-all font-mono">{spec.content_hash || "—"}</dd>
+                              </div>
+                              <div>
+                                <dt class="font-semibold">{gettext("Model")}</dt>
+                                <dd>{spec.model || "—"}</dd>
+                              </div>
+                              <div>
+                                <dt class="font-semibold">{gettext("Repairs")}</dt>
+                                <dd>{spec.repair_count}</dd>
+                              </div>
+                            </dl>
+
+                            <% spec_payload = spec.spec_payload || %{} %>
+                            <section
+                              :if={spec_payload != %{}}
+                              class="mt-4 rounded border border-indigo-100 bg-indigo-50/40 p-3 text-xs"
+                              data-openstax-simulation-spec-summary
+                            >
+                              <div class="flex flex-wrap items-center justify-between gap-2">
+                                <h6 class="font-semibold text-indigo-950">
+                                  {gettext("Instructional simulation design")}
+                                </h6>
+                                <span class="rounded bg-white px-2 py-1 font-semibold text-indigo-800">
+                                  {simulation_spec_identity(spec_payload)}
+                                </span>
+                              </div>
+
+                              <dl class="mt-3 grid gap-3 sm:grid-cols-2">
+                                <div>
+                                  <dt class="font-semibold">{gettext("Objectives")}</dt>
+                                  <dd class="mt-1">
+                                    {simulation_spec_list(spec_payload, "objective_ids")}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">{gettext("Model assumptions")}</dt>
+                                  <dd class="mt-1">
+                                    {simulation_spec_list(spec_payload, "assumptions")}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">{gettext("Limitations")}</dt>
+                                  <dd class="mt-1">
+                                    {simulation_spec_list(spec_payload, "limitations")}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">{gettext("Learner sequence")}</dt>
+                                  <dd class="mt-1">
+                                    {simulation_spec_guided_tasks(spec_payload)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">{gettext("Native follow-up")}</dt>
+                                  <dd class="mt-1">
+                                    {simulation_spec_value(spec_payload, "native_follow_up")}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">{gettext("Remediation")}</dt>
+                                  <dd class="mt-1">
+                                    {simulation_spec_value(spec_payload, "remediation")}
+                                  </dd>
+                                </div>
+                              </dl>
+
+                              <div class="mt-4 overflow-x-auto">
+                                <table class="min-w-full border-collapse text-left">
+                                  <caption class="mb-2 text-left font-semibold text-indigo-950">
+                                    {gettext("Controls and valid ranges")}
+                                  </caption>
+                                  <thead>
+                                    <tr class="border-b border-indigo-200">
+                                      <th class="py-1 pr-3">{gettext("Parameter")}</th>
+                                      <th class="py-1 pr-3">{gettext("Range")}</th>
+                                      <th class="py-1 pr-3">{gettext("Default")}</th>
+                                      <th class="py-1">{gettext("Unit")}</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    <tr
+                                      :for={parameter <- simulation_spec_parameters(spec_payload)}
+                                      class="border-b border-indigo-100"
+                                    >
+                                      <td class="py-1 pr-3 font-mono">
+                                        {map_string_key(parameter, "id", "—")}
+                                      </td>
+                                      <td class="py-1 pr-3">
+                                        {simulation_parameter_range(parameter)}
+                                      </td>
+                                      <td class="py-1 pr-3">
+                                        {map_string_key(parameter, "default", "—")}
+                                      </td>
+                                      <td class="py-1">
+                                        {simulation_parameter_unit(parameter)}
+                                      </td>
+                                    </tr>
+                                  </tbody>
+                                </table>
+                              </div>
+
+                              <dl class="mt-4 grid gap-3 sm:grid-cols-2">
+                                <div>
+                                  <dt class="font-semibold">{gettext("CAPI inputs")}</dt>
+                                  <dd class="mt-1 font-mono">
+                                    {simulation_capi_declarations(spec_payload, "inputs")}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">{gettext("CAPI outputs")}</dt>
+                                  <dd class="mt-1 font-mono">
+                                    {simulation_capi_declarations(spec_payload, "outputs")}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">
+                                    {gettext("Accessibility behavior")}
+                                  </dt>
+                                  <dd class="mt-1">
+                                    {simulation_accessibility_summary(spec_payload)}
+                                  </dd>
+                                </div>
+                                <div>
+                                  <dt class="font-semibold">
+                                    {gettext("Deterministic samples")}
+                                  </dt>
+                                  <dd class="mt-1">
+                                    {ngettext(
+                                      "%{count} sample case",
+                                      "%{count} sample cases",
+                                      length(map_string_key(spec_payload, "sample_cases", [])),
+                                      count:
+                                        length(map_string_key(spec_payload, "sample_cases", []))
+                                    )}
+                                  </dd>
+                                </div>
+                              </dl>
+                            </section>
+
+                            <details :if={spec.spec_payload != %{}} class="mt-3 text-xs">
+                              <summary class="cursor-pointer font-semibold">
+                                {gettext("Inspect raw specification JSON")}
+                              </summary>
+                              <pre class="mt-2 max-h-96 overflow-auto whitespace-pre-wrap rounded bg-slate-50 p-2">{Jason.encode!(spec.spec_payload, pretty: true)}</pre>
+                            </details>
+                            <p :if={spec.failure} class="mt-3 text-xs text-red-700">
+                              {gettext("Specification finding")}: {map_string_key(
+                                spec.failure,
+                                "code",
+                                gettext("generation failed")
+                              )}
+                            </p>
+                          </div>
+
+                          <div
                             :if={latest_proposal_artifact(proposal)}
                             class="mt-4 rounded border border-violet-200 bg-white p-3"
                           >
@@ -1283,6 +1536,106 @@
                             </p>
 
                             <details
+                              :if={length(proposal_artifacts(proposal)) > 1}
+                              class="mt-4 rounded border border-violet-100 bg-violet-50/40 text-xs"
+                              open
+                            >
+                              <summary class="cursor-pointer px-3 py-2 font-semibold text-violet-950">
+                                {gettext("Compare artifact versions")}
+                              </summary>
+                              <div class="overflow-x-auto border-t border-violet-100 p-3">
+                                <table class="min-w-full border-collapse text-left">
+                                  <thead>
+                                    <tr class="border-b border-violet-200">
+                                      <th class="py-1 pr-3">{gettext("Version")}</th>
+                                      <th class="py-1 pr-3">{gettext("Status")}</th>
+                                      <th class="py-1 pr-3">{gettext("Validation")}</th>
+                                      <th class="py-1 pr-3">{gettext("Repairs")}</th>
+                                      <th class="py-1 pr-3">{gettext("Size")}</th>
+                                      <th class="py-1">{gettext("Content")}</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    <tr
+                                      :for={versioned <- proposal_artifacts(proposal)}
+                                      class={[
+                                        "border-b border-violet-100",
+                                        versioned.id == artifact.id && "bg-white font-semibold"
+                                      ]}
+                                    >
+                                      <td class="py-1 pr-3">v{versioned.version}</td>
+                                      <td class="py-1 pr-3">
+                                        {proposal_state_label(versioned.status)}
+                                      </td>
+                                      <td class="py-1 pr-3">
+                                        {proposal_state_label(versioned.validation_status)}
+                                      </td>
+                                      <td class="py-1 pr-3">
+                                        {simulation_artifact_repair_count(versioned)}
+                                      </td>
+                                      <td class="py-1 pr-3">
+                                        {simulation_artifact_size(versioned)}
+                                      </td>
+                                      <td class="py-1 font-mono">
+                                        {short_content_hash(versioned.content_hash)}
+                                      </td>
+                                    </tr>
+                                  </tbody>
+                                </table>
+                              </div>
+                            </details>
+
+                            <details
+                              :for={versioned <- proposal_artifacts(proposal)}
+                              :if={simulation_artifact_attempts(versioned) != []}
+                              class="mt-3 rounded border border-violet-100 bg-white text-xs"
+                              open={versioned.id == artifact.id}
+                            >
+                              <summary class="cursor-pointer px-3 py-2 font-semibold text-violet-950">
+                                {gettext("Artifact v%{version} builder attempts",
+                                  version: versioned.version
+                                )}
+                              </summary>
+                              <div class="overflow-x-auto border-t border-violet-100 p-3">
+                                <table class="min-w-full border-collapse text-left">
+                                  <thead>
+                                    <tr class="border-b border-violet-200">
+                                      <th class="py-1 pr-3">{gettext("Attempt")}</th>
+                                      <th class="py-1 pr-3">{gettext("Outcome")}</th>
+                                      <th class="py-1 pr-3">{gettext("Validator")}</th>
+                                      <th class="py-1 pr-3">{gettext("Findings")}</th>
+                                      <th class="py-1">{gettext("Source")}</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    <tr
+                                      :for={attempt <- simulation_artifact_attempts(versioned)}
+                                      class="border-b border-violet-100 align-top"
+                                    >
+                                      <td class="py-1 pr-3">{attempt.attempt_number}</td>
+                                      <td class="py-1 pr-3">
+                                        {proposal_state_label(attempt.status)}
+                                      </td>
+                                      <td class="py-1 pr-3">
+                                        {map_string_key(
+                                          attempt.validation_summary,
+                                          "validator",
+                                          "—"
+                                        )}
+                                      </td>
+                                      <td class="max-w-xl py-1 pr-3">
+                                        {simulation_attempt_findings(attempt)}
+                                      </td>
+                                      <td class="py-1 font-mono">
+                                        {short_content_hash(attempt.source_hash)}
+                                      </td>
+                                    </tr>
+                                  </tbody>
+                                </table>
+                              </div>
+                            </details>
+
+                            <details
                               :if={artifact.approval_history not in [nil, []]}
                               class="mt-3 text-xs"
                             >
@@ -1314,11 +1667,64 @@
                             )}
                           </p>
 
+                          <form
+                            :if={proposal_can_generate?(proposal, @enrichment_capabilities)}
+                            phx-submit="generate_simulation"
+                            class="mt-4 rounded border border-violet-200 bg-violet-50/40 p-3"
+                          >
+                            <input type="hidden" name="proposal_id" value={proposal.id} />
+                            <input
+                              type="hidden"
+                              name="simulation_spec_id"
+                              value={reviewable_proposal_spec(proposal).id}
+                            />
+                            <input
+                              type="hidden"
+                              name="simulation_spec_hash"
+                              value={reviewable_proposal_spec(proposal).content_hash}
+                            />
+                            <label
+                              for={"simulation-author-feedback-#{proposal.id}"}
+                              class="block text-xs font-semibold text-violet-950"
+                            >
+                              {gettext("Builder guidance for this preview (optional)")}
+                            </label>
+                            <textarea
+                              id={"simulation-author-feedback-#{proposal.id}"}
+                              name="author_feedback"
+                              maxlength="2000"
+                              rows="3"
+                              class="mt-2 w-full rounded border border-violet-200 bg-white p-2 text-sm"
+                              placeholder={
+                                gettext(
+                                  "Describe the learner interaction, visual comparison, or prior-preview issue the next artifact should address."
+                                )
+                              }
+                            ></textarea>
+                            <p class="mt-1 text-xs text-slate-600">
+                              {gettext(
+                                "Guidance is recorded with the new immutable artifact version; the approved specification and evidence remain authoritative."
+                              )}
+                            </p>
+                            <button type="submit" class="btn btn-sm btn-primary mt-3">
+                              {if(proposal_artifacts(proposal) == [],
+                                do: gettext("Generate preview"),
+                                else: gettext("Regenerate preview")
+                              )}
+                            </button>
+                          </form>
+
                           <div class="mt-4 flex flex-wrap gap-2">
                             <button
                               :if={
-                                proposal.state == "proposed" &&
-                                  proposal.research_status not in ["running", "completed"] &&
+                                proposal.state in [
+                                  "proposed",
+                                  "researching",
+                                  "evidence_review",
+                                  "designing",
+                                  "artifact_review",
+                                  "failed"
+                                ] && proposal.research_status != "running" &&
                                   @enrichment_capabilities.research_available
                               }
                               type="button"
@@ -1326,7 +1732,10 @@
                               phx-value-proposal_id={proposal.id}
                               class="btn btn-sm btn-outline-primary"
                             >
-                              {gettext("Research resource")}
+                              {if(proposal.research_version > 0,
+                                do: gettext("Research again"),
+                                else: gettext("Research evidence")
+                              )}
                             </button>
                             <button
                               :if={
@@ -1339,20 +1748,46 @@
                               type="button"
                               phx-click="approve_enrichment"
                               phx-value-proposal_id={proposal.id}
+                              phx-value-research_set_id={
+                                if(proposal.kind == "generated_simulation",
+                                  do: reviewable_research_set(proposal).id
+                                )
+                              }
+                              phx-value-content_hash={
+                                if(proposal.kind == "generated_simulation",
+                                  do: reviewable_research_set(proposal).content_hash
+                                )
+                              }
                               class="btn btn-sm btn-primary"
                             >
-                              {gettext("Approve proposal")}
+                              {if(proposal.kind == "generated_simulation",
+                                do: gettext("Approve exact evidence"),
+                                else: gettext("Approve proposal")
+                              )}
                             </button>
                             <button
-                              :if={proposal_can_generate?(proposal, @enrichment_capabilities)}
+                              :if={reviewable_research_set(proposal)}
                               type="button"
-                              phx-click="generate_simulation"
+                              phx-click="reject_enrichment_evidence"
+                              phx-value-proposal_id={proposal.id}
+                              phx-value-research_set_id={reviewable_research_set(proposal).id}
+                              phx-value-content_hash={
+                                reviewable_research_set(proposal).content_hash
+                              }
+                              class="btn btn-sm btn-outline-danger"
+                            >
+                              {gettext("Reject evidence")}
+                            </button>
+                            <button
+                              :if={proposal_can_design?(proposal, @enrichment_capabilities)}
+                              type="button"
+                              phx-click="generate_simulation_spec"
                               phx-value-proposal_id={proposal.id}
                               class="btn btn-sm btn-primary"
                             >
-                              {if(proposal_artifacts(proposal) == [],
-                                do: gettext("Generate preview"),
-                                else: gettext("Regenerate preview")
+                              {if(proposal_specs(proposal) == [],
+                                do: gettext("Generate specification"),
+                                else: gettext("Regenerate specification")
                               )}
                             </button>
                             <button
@@ -1360,6 +1795,10 @@
                               type="button"
                               phx-click="approve_simulation"
                               phx-value-artifact_id={reviewable_proposal_artifact(proposal).id}
+                              phx-value-version={reviewable_proposal_artifact(proposal).version}
+                              phx-value-content_hash={
+                                reviewable_proposal_artifact(proposal).content_hash
+                              }
                               class="btn btn-sm btn-primary"
                             >
                               {gettext("Approve exact artifact")}
@@ -1375,7 +1814,14 @@
                             </button>
                             <button
                               :if={
-                                proposal.state in ["proposed", "approved"] &&
+                                proposal.state in [
+                                  "proposed",
+                                  "researching",
+                                  "evidence_review",
+                                  "designing",
+                                  "artifact_review",
+                                  "failed"
+                                ] &&
                                   is_nil(approved_proposal_artifact(proposal))
                               }
                               type="button"

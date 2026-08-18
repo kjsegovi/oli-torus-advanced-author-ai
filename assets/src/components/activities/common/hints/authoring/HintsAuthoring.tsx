@@ -17,14 +17,18 @@ interface HintsAuthoringProps {
   updateOneEditor: (id: ID, editor: EditorType) => void;
   updateOneTextDirection: (id: ID, textDirection: TextDirection) => void;
   removeOne: (id: ID) => void;
-  deerInHeadlightsHint: Hint;
+  createDeerInHeadlightsHint: HintProps['createOne'];
+  createBottomOutHint: HintProps['createOne'];
+  deerInHeadlightsHint?: Hint;
   cognitiveHints: Hint[];
-  bottomOutHint: Hint;
+  bottomOutHint?: Hint;
 }
 export const HintsAuthoring: React.FC<HintsAuthoringProps> = ({
   deerInHeadlightsHint,
   cognitiveHints,
   bottomOutHint,
+  createDeerInHeadlightsHint,
+  createBottomOutHint,
   addOne,
   updateOne,
   removeOne,
@@ -36,6 +40,7 @@ export const HintsAuthoring: React.FC<HintsAuthoringProps> = ({
     <>
       <DeerInHeadlightsHint
         hint={deerInHeadlightsHint}
+        createOne={createDeerInHeadlightsHint}
         updateOne={updateOne}
         updateOneEditor={updateOneEditor}
         updateOneTextDirection={updateOneTextDirection}
@@ -52,6 +57,7 @@ export const HintsAuthoring: React.FC<HintsAuthoringProps> = ({
       />
       <BottomOutHint
         hint={bottomOutHint}
+        createOne={createBottomOutHint}
         updateOne={updateOne}
         updateOneEditor={updateOneEditor}
         updateOneTextDirection={updateOneTextDirection}
@@ -62,7 +68,12 @@ export const HintsAuthoring: React.FC<HintsAuthoringProps> = ({
 };
 
 interface HintProps {
-  hint: Hint;
+  hint?: Hint;
+  createOne: (attrs: {
+    content?: RichText;
+    editor?: EditorType;
+    textDirection?: TextDirection;
+  }) => void;
   projectSlug: string;
   updateOne: (id: ID, content: RichText) => void;
   updateOneEditor: (id: ID, editor: EditorType) => void;
@@ -70,6 +81,7 @@ interface HintProps {
 }
 const DeerInHeadlightsHint: React.FC<HintProps> = ({
   hint,
+  createOne,
   updateOne,
   updateOneEditor,
   updateOneTextDirection,
@@ -79,6 +91,7 @@ const DeerInHeadlightsHint: React.FC<HintProps> = ({
     title={<>{'"Deer in headlights" hint'}</>}
     placeholder="Restate the question for students who are confused by the prompt"
     hint={hint}
+    createOne={createOne}
     updateOne={updateOne}
     updateOneEditor={updateOneEditor}
     updateOneTextDirection={updateOneTextDirection}
@@ -145,6 +158,7 @@ export const CognitiveHints: React.FC<CognitiveProps> = ({
 
 const BottomOutHint: React.FC<HintProps> = ({
   hint,
+  createOne,
   updateOne,
   projectSlug,
   updateOneEditor,
@@ -154,6 +168,7 @@ const BottomOutHint: React.FC<HintProps> = ({
     title={<>{'"Bottom out" hint'}</>}
     placeholder="Explain the answer for students who are still confused"
     hint={hint}
+    createOne={createOne}
     updateOne={updateOne}
     updateOneTextDirection={updateOneTextDirection}
     projectSlug={projectSlug}

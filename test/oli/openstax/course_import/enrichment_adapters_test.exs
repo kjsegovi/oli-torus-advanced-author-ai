@@ -444,7 +444,9 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentAdaptersTest do
              GeneratedSimulation.resolve("proposal-dev",
                simulation_artifact_resolver: fn "proposal-dev" -> {:ok, artifact} end,
                simulation_artifact_url_resolver: fn ^artifact -> {:ok, expected_url} end,
-               generated_simulation_origins: [@dev_generated_origin]
+               generated_simulation_origins: [@dev_generated_origin],
+               generated_simulation_delivery_enabled: true,
+               generated_simulation_kill_switch: false
              )
 
     assert spec["src"] == expected_url

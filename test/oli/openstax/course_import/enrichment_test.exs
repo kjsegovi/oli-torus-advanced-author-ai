@@ -14,6 +14,7 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
   }
 
   alias Oli.OpenStax.CourseImport.Enrichment.{Generator, Research, Sandbox}
+  alias Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker
   alias Oli.Repo
 
   defmodule FakeStorage do
@@ -37,6 +38,131 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
     def discard(artifact, opts) do
       if pid = opts[:test_pid], do: send(pid, {:discarded, artifact.id})
       :ok
+    end
+  end
+
+  defmodule FakeWorkerGenerator do
+    @behaviour Oli.OpenStax.CourseImport.Enrichment.Generator
+
+    @impl true
+    def available?, do: true
+
+    @impl true
+    def runtime_profile, do: :audited_static
+
+    @impl true
+    def generate(_proposal, opts) do
+      attempt = Process.get(:artifact_worker_generator_attempt, 0) + 1
+      Process.put(:artifact_worker_generator_attempt, attempt)
+      Process.put(:artifact_worker_repair, opts[:repair])
+      Process.put(:artifact_worker_author_feedback, opts[:author_feedback])
+
+      {:ok,
+       %{
+         files: %{
+           "index.html" =>
+             "<!doctype html><html><head><title>Candidate #{attempt}</title></head><body></body></html>"
+         },
+         manifest: %{"entrypoint" => "index.html", "library_ids" => []},
+         capi_manifest: %{"inputs" => [], "outputs" => []},
+         metadata: %{
+           "runtime_profile" => "audited_static",
+           "generator_name" => "attempt-test-generator",
+           "generator_version" => "1",
+           "provider" => "test",
+           "model" => "deterministic",
+           "provider_usage" => %{"input_tokens" => 10, "output_tokens" => 5}
+         }
+       }}
+    end
+  end
+
+  defmodule FakeWorkerSandbox do
+    @behaviour Oli.OpenStax.CourseImport.Enrichment.Sandbox
+
+    @impl true
+    def available?, do: true
+
+    @impl true
+    def build_and_validate(bundle, _opts) do
+      attempt = Process.get(:artifact_worker_sandbox_attempt, 0) + 1
+      Process.put(:artifact_worker_sandbox_attempt, attempt)
+
+      if attempt == 1 do
+        finding = %{
+          "category" => "sample",
+          "code" => "capi_sample_failed",
+          "message" => "CAPI sample case did not match.",
+          "details" => %{
+            "sample_index" => 0,
+            "expected" => %{"pressure" => 2},
+            "actual" => %{"pressure" => 3}
+          }
+        }
+
+        {:error,
+         %{
+           code: :browser_acceptance_failed,
+           stage: :browser_validation,
+           retryable: false,
+           findings: [finding],
+           validation_payload: %{
+             "status" => "failed",
+             "validator" => "browser_container_v1",
+             "findings" => [finding]
+           }
+         }}
+      else
+        hash = String.duplicate("7", 64)
+
+        {:ok,
+         %{
+           files: bundle.files,
+           content_hash: hash,
+           byte_size: 100,
+           bundle_manifest: %{"entrypoint" => "index.html"},
+           capi_manifest: bundle.capi_manifest,
+           accessibility_metadata: %{"keyboard" => "passed"},
+           validation_payload: %{
+             "status" => "passed",
+             "validator" => "browser_container_v1"
+           }
+         }}
+      end
+    end
+  end
+
+  defmodule FakeWorkerStorage do
+    @behaviour Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage
+
+    @impl true
+    def available?, do: true
+
+    @impl true
+    def cleanup_available?, do: true
+
+    @impl true
+    def prepare(_artifact, bundle, _opts), do: {:ok, identity(bundle, "unstaged")}
+
+    @impl true
+    def stage(_artifact, bundle, _opts), do: {:ok, identity(bundle, "staged")}
+
+    @impl true
+    def resolve(_artifact, _opts), do: {:error, :not_used}
+
+    @impl true
+    def discard(_artifact, _opts), do: :ok
+
+    defp identity(bundle, state) do
+      hash = bundle.content_hash
+
+      %{
+        storage_provider: "test",
+        storage_key: "bundles/#{hash}/index.html",
+        storage_origin: "https://simulations.example.edu",
+        storage_state: state,
+        byte_size: bundle.byte_size
+      }
     end
   end
 
@@ -148,8 +274,10 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
         proposal_attrs("generated_simulation", 1)
       )
 
-    {:ok, proposal} = Enrichment.approve_proposal(proposal.id, author)
-    {:ok, artifact} = Enrichment.begin_artifact_generation(proposal.id)
+    {:ok, proposal, spec} = prepare_generated_proposal(proposal, author)
+
+    {:ok, artifact} =
+      Enrichment.begin_artifact_generation(proposal.id, artifact_start_attrs(spec))
 
     {:ok, preview} =
       Enrichment.record_artifact_generation_result(artifact.id, {:ok, preview_attrs("c")})
@@ -160,7 +288,12 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
       |> Repo.update()
 
     assert {:error, {:run_not_reviewable, :cancelled}} =
-             Enrichment.approve_artifact(preview.id, author)
+             Enrichment.approve_artifact(
+               preview.id,
+               preview.version,
+               preview.content_hash,
+               author
+             )
   end
 
   test "synchronizes at most three ranked proposals and locks after governance begins", %{
@@ -211,7 +344,7 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
              Enrichment.sync_proposals(run.id, lesson.id, attrs)
   end
 
-  test "requires both approval gates and resolves only the exact approved artifact", %{
+  test "requires evidence, spec, and exact artifact approval gates", %{
     author: author,
     run: run,
     lesson: lesson
@@ -223,16 +356,24 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
                proposal_attrs("generated_simulation", 1)
              )
 
-    assert {:error, :proposal_not_approved} =
+    assert {:error, :simulation_spec_not_approved} =
              Enrichment.begin_artifact_generation(proposal.id)
 
-    assert {:ok, proposal} = Enrichment.approve_proposal(proposal.id, author)
-    assert Enrichment.approved_but_incomplete?(run.id)
+    assert {:ok, proposal, spec} = prepare_generated_proposal(proposal, author)
+    refute Enrichment.approved_but_incomplete?(run.id)
+
+    assert {:error, :stale_simulation_spec} =
+             Enrichment.begin_artifact_generation(
+               proposal.id,
+               artifact_start_attrs(spec, simulation_spec_hash: String.duplicate("f", 64))
+             )
 
     assert {:ok, artifact_v1} =
              Enrichment.begin_artifact_generation(proposal.id, %{
                generator_name: "test-generator",
-               generator_version: "1"
+               generator_version: "1",
+               simulation_spec_id: spec.id,
+               simulation_spec_hash: spec.content_hash
              })
 
     assert {:ok, preview_v1} =
@@ -242,21 +383,22 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
              )
 
     assert preview_v1.status == "ready_for_review"
-    assert {:ok, approved_v1} = Enrichment.approve_artifact(preview_v1.id, author)
-    refute Enrichment.approved_but_incomplete?(run.id)
 
-    assert {:ok, ^approved_v1} = Enrichment.resolve_approved_artifact(proposal.id)
-
-    expected_hash = String.duplicate("a", 64)
-    expected_url = "https://simulations.example.edu/bundles/#{expected_hash}/index.html"
-
-    assert {:ok, ^expected_url} =
-             Enrichment.artifact_url(approved_v1,
-               artifact_storage: FakeStorage,
-               trusted_origin: "https://simulations.example.edu"
+    assert {:error, :stale_artifact_version} =
+             Enrichment.approve_artifact(
+               preview_v1.id,
+               preview_v1.version,
+               String.duplicate("f", 64),
+               author
              )
 
-    assert {:ok, artifact_v2} = Enrichment.begin_artifact_generation(proposal.id)
+    assert {:ok, rejected_v1} =
+             Enrichment.reject_artifact(preview_v1.id, author, "Try a clearer visual")
+
+    assert rejected_v1.status == "rejected"
+
+    assert {:ok, artifact_v2} =
+             Enrichment.begin_artifact_generation(proposal.id, artifact_start_attrs(spec))
 
     assert {:ok, preview_v2} =
              Enrichment.record_artifact_generation_result(
@@ -264,11 +406,195 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
                {:ok, preview_attrs("b")}
              )
 
-    assert {:ok, approved_v2} = Enrichment.approve_artifact(preview_v2.id, author)
+    assert {:ok, approved_v2} =
+             Enrichment.approve_artifact(
+               preview_v2.id,
+               preview_v2.version,
+               preview_v2.content_hash,
+               author
+             )
+
     assert approved_v2.version == 2
+    refute Enrichment.approved_but_incomplete?(run.id)
     assert {:ok, %{id: approved_id}} = Enrichment.resolve_approved_artifact(proposal.id)
     assert approved_id == approved_v2.id
-    assert Repo.get!(SimulationArtifact, approved_v1.id).status == "superseded"
+
+    assert {:error, {:invalid_artifact_status, "approved"}} =
+             Enrichment.reject_artifact(approved_v2.id, author, "Approved versions are immutable")
+
+    expected_hash = String.duplicate("b", 64)
+    expected_url = "https://simulations.example.edu/bundles/#{expected_hash}/index.html"
+
+    assert {:ok, ^expected_url} =
+             Enrichment.artifact_url(approved_v2,
+               artifact_storage: FakeStorage,
+               trusted_origin: "https://simulations.example.edu"
+             )
+  end
+
+  test "new research supersedes unfinished specs and artifacts", %{
+    author: author,
+    run: run,
+    lesson: lesson
+  } do
+    assert {:ok, proposal} =
+             Enrichment.create_proposal(
+               run.id,
+               lesson.id,
+               proposal_attrs("generated_simulation", 1)
+             )
+
+    assert {:ok, proposal, spec} = prepare_generated_proposal(proposal, author)
+
+    assert {:ok, artifact} =
+             Enrichment.begin_artifact_generation(proposal.id, artifact_start_attrs(spec))
+
+    assert {:ok, preview} =
+             Enrichment.record_artifact_generation_result(artifact.id, {:ok, preview_attrs("c")})
+
+    assert {:ok, restarted} = Enrichment.mark_research_running(proposal.id)
+    assert restarted.state == "researching"
+    assert restarted.research_version == 2
+    assert Repo.reload!(spec).status == "superseded"
+    assert Repo.reload!(preview).status == "superseded"
+  end
+
+  test "artifact candidate attempts append immutable ordered validation evidence", %{
+    author: author,
+    run: run,
+    lesson: lesson
+  } do
+    {:ok, proposal} =
+      Enrichment.create_proposal(
+        run.id,
+        lesson.id,
+        proposal_attrs("generated_simulation", 1)
+      )
+
+    {:ok, proposal, spec} = prepare_generated_proposal(proposal, author)
+
+    {:ok, artifact} =
+      Enrichment.begin_artifact_generation(proposal.id, artifact_start_attrs(spec))
+
+    assert {:ok, first} =
+             Enrichment.record_artifact_attempt(artifact.id, %{
+               status: "validation_failed",
+               source_hash: String.duplicate("1", 64),
+               findings: [
+                 %{
+                   code: "capi_sample_failed",
+                   details: %{sample_index: 0, expected: %{y: 4}, actual: %{y: 5}}
+                 }
+               ],
+               validation_summary: %{status: "failed", validator: "browser_container_v1"},
+               model_usage: %{generator: %{input_tokens: 10, output_tokens: 5}}
+             })
+
+    assert {:ok, second} =
+             Enrichment.record_artifact_attempt(artifact.id, %{
+               status: "accepted",
+               source_hash: String.duplicate("2", 64),
+               content_hash: String.duplicate("3", 64),
+               validation_summary: %{status: "passed", validator: "browser_container_v1"},
+               criticism: %{approved: true, confidence: 1.0}
+             })
+
+    assert first.attempt_number == 1
+    assert second.attempt_number == 2
+    assert first.findings |> hd() |> get_in(["details", "sample_index"]) == 0
+
+    assert [persisted_first, persisted_second] =
+             Enrichment.list_artifact_attempts(artifact.id)
+
+    assert persisted_first.id == first.id
+    assert persisted_second.id == second.id
+
+    assert [%{attempts: [_, _]}] = Enrichment.list_artifacts(proposal.id)
+
+    assert {:ok, fetched} = Enrichment.fetch_proposal(proposal.id)
+    assert [%{attempts: attempts}] = fetched.simulation_artifacts
+    assert Enum.map(attempts, & &1.id) |> MapSet.new() == MapSet.new([first.id, second.id])
+  end
+
+  test "generation worker persists every candidate and sends exact findings to repair", %{
+    author: author,
+    run: run,
+    lesson: lesson
+  } do
+    previous_generator = Application.get_env(:oli, :openstax_enrichment_generator)
+    previous_sandbox = Application.get_env(:oli, :openstax_enrichment_sandbox)
+    previous_storage = Application.get_env(:oli, :openstax_enrichment_artifact_storage)
+
+    Application.put_env(:oli, :openstax_enrichment_generator, FakeWorkerGenerator)
+    Application.put_env(:oli, :openstax_enrichment_sandbox, FakeWorkerSandbox)
+    Application.put_env(:oli, :openstax_enrichment_artifact_storage, FakeWorkerStorage)
+
+    on_exit(fn ->
+      Application.put_env(:oli, :openstax_enrichment_generator, previous_generator)
+      Application.put_env(:oli, :openstax_enrichment_sandbox, previous_sandbox)
+      Application.put_env(:oli, :openstax_enrichment_artifact_storage, previous_storage)
+    end)
+
+    Process.put(:artifact_worker_generator_attempt, 0)
+    Process.put(:artifact_worker_sandbox_attempt, 0)
+    Process.delete(:artifact_worker_repair)
+    Process.delete(:artifact_worker_author_feedback)
+
+    {:ok, proposal} =
+      Enrichment.create_proposal(
+        run.id,
+        lesson.id,
+        proposal_attrs("generated_simulation", 1)
+      )
+
+    {:ok, proposal, spec} = prepare_generated_proposal(proposal, author)
+
+    {:ok, artifact} =
+      Enrichment.begin_artifact_generation(
+        proposal.id,
+        spec
+        |> artifact_start_attrs()
+        |> Map.put(:generation_metadata, %{
+          "author_feedback" => "Show the evidence table before the chart."
+        })
+      )
+
+    job = %Oban.Job{
+      args: %{"artifact_id" => artifact.id, "run_id" => run.id},
+      attempt: 1,
+      max_attempts: 3
+    }
+
+    assert :ok = SimulationGenerationWorker.perform(job)
+    assert Process.get(:artifact_worker_generator_attempt) == 2
+    assert Process.get(:artifact_worker_sandbox_attempt) == 2
+
+    assert Process.get(:artifact_worker_author_feedback) ==
+             "Show the evidence table before the chart."
+
+    assert %{findings: [repair_finding]} = Process.get(:artifact_worker_repair)
+    assert repair_finding["code"] == "capi_sample_failed"
+    assert repair_finding["details"]["sample_index"] == 0
+    assert repair_finding["details"]["expected"] == %{"pressure" => 2}
+    assert repair_finding["details"]["actual"] == %{"pressure" => 3}
+
+    assert [failed_attempt, accepted_attempt] =
+             Enrichment.list_artifact_attempts(artifact.id)
+
+    assert failed_attempt.status == "validation_failed"
+    assert failed_attempt.findings == [repair_finding]
+    assert accepted_attempt.status == "accepted"
+    assert accepted_attempt.content_hash == String.duplicate("7", 64)
+    assert failed_attempt.source_hash != accepted_attempt.source_hash
+
+    saved = Repo.get!(SimulationArtifact, artifact.id)
+    assert saved.status == "ready_for_review"
+    assert saved.validation_status == "passed"
+    assert get_in(saved.generation_metadata, ["builder_repair_count"]) == 1
+    assert length(saved.generation_metadata["builder_history"]) == 2
+
+    assert saved.generation_metadata["author_feedback"] ==
+             "Show the evidence table before the chart."
   end
 
   test "approved incomplete generation can be cancelled without blocking core compilation", %{
@@ -283,13 +609,12 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
         proposal_attrs("generated_simulation", 1)
       )
 
-    {:ok, proposal} = Enrichment.approve_proposal(proposal.id, author)
-    {:ok, artifact} = Enrichment.begin_artifact_generation(proposal.id)
+    {:ok, proposal, spec} = prepare_generated_proposal(proposal, author)
 
-    assert {:error, {:approved_enrichment_incomplete, [proposal_id]}} =
-             Enrichment.ensure_generation_complete(run.id)
+    {:ok, artifact} =
+      Enrichment.begin_artifact_generation(proposal.id, artifact_start_attrs(spec))
 
-    assert proposal_id == proposal.id
+    assert :ok = Enrichment.ensure_generation_complete(run.id)
 
     assert {:ok, cancelled} =
              Enrichment.cancel_proposal(proposal.id, author, "Proceed without the simulation")
@@ -359,8 +684,10 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
         proposal_attrs("generated_simulation", 1)
       )
 
-    {:ok, proposal} = Enrichment.approve_proposal(proposal.id, author)
-    {:ok, artifact} = Enrichment.begin_artifact_generation(proposal.id)
+    {:ok, proposal, spec} = prepare_generated_proposal(proposal, author)
+
+    {:ok, artifact} =
+      Enrichment.begin_artifact_generation(proposal.id, artifact_start_attrs(spec))
 
     assert {:ok, failed} =
              Enrichment.record_artifact_generation_result(
@@ -398,8 +725,10 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
         proposal_attrs("generated_simulation", 1)
       )
 
-    {:ok, proposal} = Enrichment.approve_proposal(proposal.id, author)
-    {:ok, artifact} = Enrichment.begin_artifact_generation(proposal.id)
+    {:ok, proposal, spec} = prepare_generated_proposal(proposal, author)
+
+    {:ok, artifact} =
+      Enrichment.begin_artifact_generation(proposal.id, artifact_start_attrs(spec))
 
     {:ok, failed_validation} =
       Enrichment.record_artifact_generation_result(
@@ -444,7 +773,7 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
   end
 
   defp proposal_attrs(kind, rank) do
-    %{
+    attrs = %{
       kind: kind,
       rank: rank,
       instructional_rationale: "Let learners test the section's central model.",
@@ -453,6 +782,114 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
       placement: %{"after_block_id" => "block-1"},
       learner_task: "Predict the result, inspect the evidence, and explain the outcome."
     }
+
+    if kind == "generated_simulation" do
+      Map.put(attrs, :metadata, %{
+        "planner_id" => "sim-#{rank}",
+        "domain" => "chemistry",
+        "research_query" => "primary sources for gas pressure and volume relationships",
+        "misconception_target" => "Pressure and volume always increase together",
+        "expected_instructional_value" => "Learners can compare prediction to evidence."
+      })
+    else
+      attrs
+    end
+  end
+
+  defp prepare_generated_proposal(proposal, author) do
+    source_hash = String.duplicate("d", 64)
+    content_hash = String.duplicate("e", 64)
+
+    assert {:ok, _running} = Enrichment.mark_research_running(proposal.id)
+
+    assert {:ok, _review} =
+             Enrichment.record_research_result(
+               proposal.id,
+               {:ok,
+                %{
+                  evidence: %{
+                    "retrieved_sources" => [
+                      %{
+                        "url" =>
+                          "https://openstax.org/books/chemistry-2e/pages/9-2-relating-pressure-volume-amount-and-temperature-the-ideal-gas-law",
+                        "title" => "OpenStax gas law"
+                      },
+                      %{
+                        "url" => "https://physics.nist.gov/cuu/Constants/",
+                        "title" => "NIST constants"
+                      }
+                    ],
+                    "proposed_sources" => [
+                      %{
+                        "url" =>
+                          "https://openstax.org/books/chemistry-2e/pages/9-2-relating-pressure-volume-amount-and-temperature-the-ideal-gas-law",
+                        "title" => "OpenStax gas law"
+                      },
+                      %{
+                        "url" => "https://physics.nist.gov/cuu/Constants/",
+                        "title" => "NIST constants"
+                      }
+                    ],
+                    "claims" => [
+                      %{
+                        "paraphrase" =>
+                          "At fixed amount and temperature, pressure varies inversely with volume.",
+                        "citation_urls" => [
+                          "https://openstax.org/books/chemistry-2e/pages/9-2-relating-pressure-volume-amount-and-temperature-the-ideal-gas-law"
+                        ]
+                      }
+                    ],
+                    "search_count" => 1,
+                    "source_count" => 2,
+                    "provider" => "test",
+                    "model" => "deterministic-fixture",
+                    "source_hash" => source_hash,
+                    "content_hash" => content_hash,
+                    "accessed_at" => DateTime.utc_now() |> DateTime.to_iso8601()
+                  }
+                }}
+             )
+
+    research =
+      proposal.id
+      |> Enrichment.fetch_proposal()
+      |> elem(1)
+      |> Map.fetch!(:research_sets)
+      |> Enum.find(&(&1.status == "evidence_review"))
+
+    assert {:ok, approved_research} =
+             Enrichment.approve_evidence(
+               proposal.id,
+               research.id,
+               research.content_hash,
+               author
+             )
+
+    assert {:ok, spec} = Enrichment.begin_spec_generation(proposal.id)
+
+    spec_hash = String.duplicate("9", 64)
+
+    assert {:ok, ready_spec} =
+             Enrichment.record_spec_result(
+               spec.id,
+               {:ok,
+                %{
+                  spec: %{"domain" => "chemistry", "sample_cases" => []},
+                  content_hash: spec_hash,
+                  provider: "test",
+                  model: "deterministic-fixture",
+                  validation: %{"status" => "passed"}
+                }}
+             )
+
+    assert approved_research.content_hash == ready_spec.evidence_hash
+    {:ok, elem(Enrichment.fetch_proposal(proposal.id), 1), ready_spec}
+  end
+
+  defp artifact_start_attrs(spec, overrides \\ []) do
+    [simulation_spec_id: spec.id, simulation_spec_hash: spec.content_hash]
+    |> Keyword.merge(overrides)
+    |> Map.new()
   end
 
   defp preview_attrs(hash_character) do

@@ -20,6 +20,7 @@ defmodule Oli.OpenStax.CourseImport do
     Compiler,
     Enrichment,
     EnrichmentProposal,
+    EnrichmentResearchSet,
     FullSource,
     Lesson,
     LessonCheck,
@@ -31,6 +32,7 @@ defmodule Oli.OpenStax.CourseImport do
     RichSource,
     Run,
     SimulationArtifact,
+    SimulationSpec,
     SourceAsset,
     Telemetry,
     Unit
@@ -44,7 +46,8 @@ defmodule Oli.OpenStax.CourseImport do
     MediaWorker,
     OutlineWorker,
     PreflightWorker,
-    SimulationGenerationWorker
+    SimulationGenerationWorker,
+    SimulationSpecGenerationWorker
   }
 
   alias Oli.OpenStax.CourseImport.Enrichment.{ArtifactStorage, Generator, Research, Sandbox}
@@ -112,8 +115,35 @@ defmodule Oli.OpenStax.CourseImport do
   @spec enrichment_capabilities(Project.t()) :: map()
   def enrichment_capabilities(%Project{} = project) do
     generated_enabled =
-      Application.get_env(:oli, :openstax_generated_enrichment_enabled, false) or
-        ScopedFeatureFlags.enabled?(:openstax_generated_enrichment, project)
+      project_feature_enabled?(
+        project,
+        :openstax_generated_enrichment,
+        :openstax_generated_enrichment_enabled
+      )
+
+    web_research_enabled =
+      project_feature_enabled?(
+        project,
+        :openstax_simulation_web_research,
+        :openstax_web_research_enabled
+      )
+
+    three_d_enabled =
+      project_feature_enabled?(
+        project,
+        :openstax_simulation_3d_generation,
+        :openstax_three_d_generation_enabled
+      )
+
+    delivery_enabled =
+      project_feature_enabled?(
+        project,
+        :openstax_generated_simulation_delivery,
+        :openstax_generated_simulation_delivery_enabled
+      )
+
+    kill_switch =
+      Application.get_env(:oli, :openstax_generated_simulation_kill_switch, true) == true
 
     generator_available = Generator.available?()
     sandbox_available = Sandbox.available?()
@@ -121,34 +151,54 @@ defmodule Oli.OpenStax.CourseImport do
 
     %{
       generated_enabled: generated_enabled,
+      web_research_enabled: web_research_enabled,
+      three_d_enabled: three_d_enabled,
+      delivery_enabled: delivery_enabled,
+      delivery_kill_switch: kill_switch,
       generator_available: generator_available,
       sandbox_available: sandbox_available,
       storage_available: storage_available,
       generated_available:
         generated_enabled and generator_available and sandbox_available and storage_available,
-      research_available: Research.available?()
+      research_available: generated_enabled and web_research_enabled and Research.available?(),
+      delivery_available: generated_enabled and delivery_enabled and not kill_switch
     }
   rescue
     _ ->
       %{
         generated_enabled: false,
+        web_research_enabled: false,
+        three_d_enabled: false,
+        delivery_enabled: false,
+        delivery_kill_switch: true,
         generator_available: false,
         sandbox_available: false,
         storage_available: false,
         generated_available: false,
-        research_available: false
+        research_available: false,
+        delivery_available: false
       }
   end
 
   def enrichment_capabilities(_),
     do: %{
       generated_enabled: false,
+      web_research_enabled: false,
+      three_d_enabled: false,
+      delivery_enabled: false,
+      delivery_kill_switch: true,
       generator_available: false,
       sandbox_available: false,
       storage_available: false,
       generated_available: false,
-      research_available: false
+      research_available: false,
+      delivery_available: false
     }
+
+  defp project_feature_enabled?(project, scoped_feature, application_key) do
+    Application.get_env(:oli, application_key, false) == true or
+      ScopedFeatureFlags.enabled?(scoped_feature, project)
+  end
 
   @spec start_import(Project.t(), Revision.t() | integer(), Author.t(), String.t()) ::
           {:ok, Run.t()} | {:error, term()}
@@ -232,7 +282,8 @@ defmodule Oli.OpenStax.CourseImport do
                where:
                  run.project_id == ^project.id and run.author_id == ^author.id and
                    run.target_root_container_resource_id == ^target_resource_id and
-                   run.status in ^@active_statuses and run.plan_schema_version == 6,
+                   run.status in ^@active_statuses and run.source_schema_version == 3 and
+                   run.plan_schema_version == 6,
                order_by: [desc: run.inserted_at],
                limit: 1
              )
@@ -242,6 +293,25 @@ defmodule Oli.OpenStax.CourseImport do
       end
     end
   end
+
+  @doc "Returns whether this project has an unfinished pre-v6 import without mutating it."
+  @spec unfinished_legacy_run?(Project.t(), Author.t()) :: boolean()
+  def unfinished_legacy_run?(%Project{} = project, %Author{} = author) do
+    with :ok <- authorize_project(project, author) do
+      Repo.exists?(
+        from(run in Run,
+          where:
+            run.project_id == ^project.id and run.author_id == ^author.id and
+              run.status in ^@active_statuses and
+              (run.source_schema_version != 3 or run.plan_schema_version != 6)
+        )
+      )
+    else
+      _ -> false
+    end
+  end
+
+  def unfinished_legacy_run?(_, _), do: false
 
   @spec load_run_details(Ecto.UUID.t(), Author.t()) :: {:ok, Run.t()} | {:error, term()}
   def load_run_details(run_id, %Author{} = author) when is_binary(run_id) do
@@ -274,7 +344,7 @@ defmodule Oli.OpenStax.CourseImport do
              from(run in Run,
                where:
                  run.project_id == ^project_id and run.author_id == ^author.id and
-                   run.plan_schema_version == 6,
+                   run.source_schema_version == 3 and run.plan_schema_version == 6,
                order_by: [desc: run.inserted_at],
                limit: ^limit
              )
@@ -782,6 +852,68 @@ defmodule Oli.OpenStax.CourseImport do
 
   def approve_enrichment_proposal(_, _, _), do: {:error, :invalid_input}
 
+  @spec approve_enrichment_evidence(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          String.t(),
+          Author.t()
+        ) :: {:ok, EnrichmentResearchSet.t()} | {:error, term()}
+  def approve_enrichment_evidence(
+        run_id,
+        proposal_id,
+        research_set_id,
+        content_hash,
+        %Author{} = author
+      )
+      when is_binary(run_id) and is_binary(proposal_id) and is_binary(research_set_id) and
+             is_binary(content_hash) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval),
+         {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
+         true <- proposal.run_id == run.id,
+         :ok <- ensure_generated_proposal_enabled(run, proposal) do
+      Enrichment.approve_evidence(proposal.id, research_set_id, content_hash, author)
+    else
+      false -> {:error, :not_found}
+      {:error, _} = error -> error
+    end
+  end
+
+  def approve_enrichment_evidence(_, _, _, _, _), do: {:error, :invalid_input}
+
+  @spec reject_enrichment_evidence(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          String.t(),
+          Author.t(),
+          String.t()
+        ) :: {:ok, EnrichmentResearchSet.t()} | {:error, term()}
+  def reject_enrichment_evidence(
+        run_id,
+        proposal_id,
+        research_set_id,
+        content_hash,
+        %Author{} = author,
+        reason
+      )
+      when is_binary(run_id) and is_binary(proposal_id) and is_binary(research_set_id) and
+             is_binary(content_hash) and is_binary(reason) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval),
+         {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
+         true <- proposal.run_id == run.id,
+         :ok <- ensure_generated_proposal_enabled(run, proposal) do
+      Enrichment.reject_evidence(proposal.id, research_set_id, content_hash, author, reason)
+    else
+      false -> {:error, :not_found}
+      {:error, _} = error -> error
+    end
+  end
+
+  def reject_enrichment_evidence(_, _, _, _, _, _), do: {:error, :invalid_input}
+
   @spec request_enrichment_research(Ecto.UUID.t(), Ecto.UUID.t(), Author.t()) ::
           {:ok, EnrichmentProposal.t()} | {:error, term()}
   def request_enrichment_research(run_id, proposal_id, %Author{} = author)
@@ -790,8 +922,17 @@ defmodule Oli.OpenStax.CourseImport do
          :ok <- ensure_status(run.status, :awaiting_lesson_approval),
          true <- enrichment_capabilities(run_project(run)).research_available,
          {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
-         true <- proposal.run_id == run.id and proposal.state == "proposed",
-         true <- proposal.research_status not in ["running", "completed"],
+         true <-
+           proposal.run_id == run.id and
+             proposal.state in [
+               "proposed",
+               "researching",
+               "evidence_review",
+               "designing",
+               "artifact_review",
+               "failed"
+             ],
+         true <- proposal.research_status != "running",
          {:ok, _job} <-
            Oban.insert(
              EnrichmentResearchWorker.new(%{
@@ -834,19 +975,105 @@ defmodule Oli.OpenStax.CourseImport do
 
   def omit_enrichment_proposal(_, _, _, _), do: {:error, :invalid_input}
 
-  @spec request_simulation_generation(Ecto.UUID.t(), Ecto.UUID.t(), Author.t()) ::
-          {:ok, SimulationArtifact.t()} | {:error, term()}
-  def request_simulation_generation(run_id, proposal_id, %Author{} = author)
+  @spec request_simulation_spec(Ecto.UUID.t(), Ecto.UUID.t(), Author.t()) ::
+          {:ok, SimulationSpec.t()} | {:error, term()}
+  def request_simulation_spec(run_id, proposal_id, %Author{} = author)
       when is_binary(run_id) and is_binary(proposal_id) do
     with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval),
+         {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
+         true <- proposal.run_id == run.id and proposal.state == "designing",
+         :ok <- ensure_generated_proposal_enabled(run, proposal),
+         false <- active_simulation_spec?(proposal.id) do
+      case Repo.transaction(fn ->
+             with {:ok, spec} <- Enrichment.begin_spec_generation(proposal.id),
+                  {:ok, _job} <-
+                    Oban.insert(
+                      SimulationSpecGenerationWorker.new(%{
+                        "spec_id" => spec.id,
+                        "run_id" => run.id
+                      })
+                    ) do
+               spec
+             else
+               {:error, reason} -> Repo.rollback(reason)
+             end
+           end) do
+        {:ok, spec} -> {:ok, spec}
+        {:error, reason} -> {:error, reason}
+      end
+    else
+      false -> {:error, :simulation_spec_generation_unavailable}
+      true -> {:error, :simulation_spec_generation_in_progress}
+      {:error, _} = error -> error
+    end
+  end
+
+  def request_simulation_spec(_, _, _), do: {:error, :invalid_input}
+
+  @spec request_simulation_generation(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          String.t(),
+          Author.t()
+        ) ::
+          {:ok, SimulationArtifact.t()} | {:error, term()}
+  def request_simulation_generation(
+        run_id,
+        proposal_id,
+        simulation_spec_id,
+        simulation_spec_hash,
+        %Author{} = author
+      ) do
+    request_simulation_generation(
+      run_id,
+      proposal_id,
+      simulation_spec_id,
+      simulation_spec_hash,
+      nil,
+      author
+    )
+  end
+
+  def request_simulation_generation(_, _, _, _, _), do: {:error, :invalid_input}
+
+  @spec request_simulation_generation(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          String.t(),
+          String.t() | nil,
+          Author.t()
+        ) ::
+          {:ok, SimulationArtifact.t()} | {:error, term()}
+  def request_simulation_generation(
+        run_id,
+        proposal_id,
+        simulation_spec_id,
+        simulation_spec_hash,
+        author_feedback,
+        %Author{} = author
+      )
+      when is_binary(run_id) and is_binary(proposal_id) and is_binary(simulation_spec_id) and
+             is_binary(simulation_spec_hash) do
+    with {:ok, author_feedback} <- normalize_simulation_author_feedback(author_feedback),
+         {:ok, run} <- authorized_run(run_id, author),
          :ok <- ensure_status(run.status, :awaiting_lesson_approval),
          true <- enrichment_capabilities(run_project(run)).generated_available,
          {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
          true <- proposal.run_id == run.id,
-         true <- proposal.kind == "generated_simulation" and proposal.state == "approved",
+         true <-
+           proposal.kind == "generated_simulation" and
+             proposal.state in ["designing", "artifact_review"],
          false <- active_simulation_artifact?(proposal.id) do
       case Repo.transaction(fn ->
-             with {:ok, artifact} <- Enrichment.begin_artifact_generation(proposal.id),
+             with {:ok, artifact} <-
+                    Enrichment.begin_artifact_generation(proposal.id, %{
+                      simulation_spec_id: simulation_spec_id,
+                      simulation_spec_hash: simulation_spec_hash,
+                      generation_metadata: simulation_generation_metadata(author_feedback)
+                    }),
                   {:ok, _job} <-
                     Oban.insert(
                       SimulationGenerationWorker.new(%{
@@ -874,16 +1101,24 @@ defmodule Oli.OpenStax.CourseImport do
     end
   end
 
-  def request_simulation_generation(_, _, _), do: {:error, :invalid_input}
+  def request_simulation_generation(_, _, _, _, _, _), do: {:error, :invalid_input}
 
-  @spec approve_simulation_artifact(Ecto.UUID.t(), Ecto.UUID.t(), Author.t()) ::
+  @spec approve_simulation_artifact(
+          Ecto.UUID.t(),
+          Ecto.UUID.t(),
+          pos_integer(),
+          String.t(),
+          Author.t()
+        ) ::
           {:ok, SimulationArtifact.t()} | {:error, term()}
-  def approve_simulation_artifact(run_id, artifact_id, %Author{} = author)
-      when is_binary(run_id) and is_binary(artifact_id) do
+  def approve_simulation_artifact(run_id, artifact_id, version, content_hash, %Author{} = author)
+      when is_binary(run_id) and is_binary(artifact_id) and is_integer(version) and version > 0 and
+             is_binary(content_hash) do
     with {:ok, run} <- authorized_run(run_id, author),
          :ok <- ensure_status(run.status, :awaiting_lesson_approval),
          %SimulationArtifact{run_id: ^run_id} <- Repo.get(SimulationArtifact, artifact_id),
-         {:ok, artifact} <- Enrichment.approve_artifact(artifact_id, author) do
+         {:ok, artifact} <-
+           Enrichment.approve_artifact(artifact_id, version, content_hash, author) do
       maybe_advance_after_enrichment_decision(run)
       {:ok, artifact}
     else
@@ -893,7 +1128,7 @@ defmodule Oli.OpenStax.CourseImport do
     end
   end
 
-  def approve_simulation_artifact(_, _, _), do: {:error, :invalid_input}
+  def approve_simulation_artifact(_, _, _, _, _), do: {:error, :invalid_input}
 
   @spec reject_simulation_artifact(Ecto.UUID.t(), Ecto.UUID.t(), Author.t(), String.t()) ::
           {:ok, SimulationArtifact.t()} | {:error, term()}
@@ -974,7 +1209,9 @@ defmodule Oli.OpenStax.CourseImport do
            {:ok, dry_run} <-
              Compiler.dry_run(run,
                media_urls: discovery_media_urls,
-               attribution: source_attribution(run)
+               attribution: source_attribution(run),
+               generated_simulation_delivery_enabled:
+                 enrichment_capabilities(project).delivery_available
              ),
            compiled_media_ids <- MediaIngestor.required_media_ids(dry_run),
            true <- compiled_media_ids == planned_media_ids,
@@ -2991,6 +3228,34 @@ defmodule Oli.OpenStax.CourseImport do
     end
   end
 
+  defp ensure_generated_proposal_enabled(_run, %{kind: kind})
+       when kind != "generated_simulation",
+       do: {:error, :not_generated_simulation}
+
+  defp ensure_generated_proposal_enabled(%Run{} = run, proposal) do
+    case {run_project(run), Repo.get(Lesson, proposal.lesson_id)} do
+      {%Project{} = project, %Lesson{plan_mode: "advanced", run_id: run_id}}
+      when run_id == run.id ->
+        if enrichment_capabilities(project).generated_enabled,
+          do: :ok,
+          else: {:error, :simulation_generation_unavailable}
+
+      {%Project{}, %Lesson{}} ->
+        {:error, :generated_enrichment_requires_advanced_authoring}
+
+      _ ->
+        {:error, :project_or_lesson_not_found}
+    end
+  end
+
+  defp active_simulation_spec?(proposal_id) do
+    Repo.exists?(
+      from(spec in SimulationSpec,
+        where: spec.proposal_id == ^proposal_id and spec.status == "designing"
+      )
+    )
+  end
+
   defp active_simulation_artifact?(proposal_id) do
     proposal_id
     |> Enrichment.list_artifacts()
@@ -4737,6 +5002,14 @@ defmodule Oli.OpenStax.CourseImport do
           from(proposal in EnrichmentProposal,
             order_by: [asc: proposal.lesson_id, asc: proposal.rank],
             preload: [
+              research_sets:
+                ^from(research in EnrichmentResearchSet,
+                  order_by: [desc: research.version]
+                ),
+              simulation_specs:
+                ^from(spec in SimulationSpec,
+                  order_by: [desc: spec.version]
+                ),
               simulation_artifacts:
                 ^from(artifact in SimulationArtifact,
                   order_by: [desc: artifact.version]
@@ -4887,6 +5160,25 @@ defmodule Oli.OpenStax.CourseImport do
   defp recoverable_failure?("validation", _reason), do: false
   defp recoverable_failure?(_phase, :invalid_openstax_url), do: false
   defp recoverable_failure?(_phase, _reason), do: true
+
+  defp normalize_simulation_author_feedback(nil), do: {:ok, nil}
+
+  defp normalize_simulation_author_feedback(value) when is_binary(value) do
+    value = String.trim(value)
+
+    cond do
+      value == "" -> {:ok, nil}
+      String.length(value) <= 2_000 -> {:ok, value}
+      true -> {:error, :simulation_author_feedback_too_long}
+    end
+  end
+
+  defp normalize_simulation_author_feedback(_value), do: {:error, :invalid_input}
+
+  defp simulation_generation_metadata(nil), do: %{}
+
+  defp simulation_generation_metadata(author_feedback),
+    do: %{"author_feedback" => author_feedback}
 
   defp stringify_keys(map) when is_map(map) do
     Map.new(map, fn {key, value} -> {to_string(key), value} end)

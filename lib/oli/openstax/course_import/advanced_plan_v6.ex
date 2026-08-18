@@ -3,15 +3,21 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
   Schema 6 contract for source-faithful Advanced Author Explorations.
 
   Source AST hydration remains deterministic. Models may organize source block
-  ids, stages, and activity slots, but may not rewrite source content or author
-  Torus rules.
+  ids and author source-grounded connective guidance around those immutable
+  blocks, stages, and activity slots. They may not rewrite source content or
+  author Torus rules, navigation targets, or URLs.
   """
 
   alias Oli.OpenStax.CourseImport.BasicPlanV5
 
   @schema_version 6
-  @roles ~w(orientation prediction investigation evidence interpretation transfer synthesis)
+  @roles ~w(orientation prediction investigation observation evidence interpretation transfer synthesis)
   @required_roles ~w(orientation prediction interpretation transfer synthesis)
+  @guidance_kinds ~w(prediction observation interpretation transfer synthesis)
+  @presentation_patterns ~w(
+    guided_reading predict_observe_explain evidence_comparison worked_analysis
+    transfer_challenge synthesis_discussion
+  )
   @activity_types ~w(multiple_choice dropdown slider number_input short_answer reflection)
   @minimum_minutes 45
   @maximum_minutes 75
@@ -80,7 +86,18 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
                   item
               end)
 
-            Map.put(stage, "items", items)
+            native_follow_up_activity_id =
+              case stage["native_follow_up_slot_id"] do
+                slot_id when is_binary(slot_id) ->
+                  activity_by_slot |> Map.get(slot_id, %{}) |> Map.get("id")
+
+                _ ->
+                  nil
+              end
+
+            stage
+            |> Map.put("items", items)
+            |> Map.put("native_follow_up_activity_id", native_follow_up_activity_id)
           end)
 
         duration = duration_manifest(content, slots)
@@ -119,6 +136,15 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
     |> Map.put("schema_version", @schema_version)
     |> Map.put("allowed_stage_roles", @roles)
     |> Map.put("required_experience_roles", @required_roles)
+    |> Map.put("required_guidance_kinds", @guidance_kinds)
+    |> Map.put("allowed_presentation_patterns", @presentation_patterns)
+    |> Map.put("connective_material_contract", %{
+      "stage_introduction" =>
+        "Model-authored transition with body and source evidence block ids; source blocks remain immutable.",
+      "guidance" =>
+        "Prediction, observation, interpretation, transfer, and synthesis prompts with source evidence block ids.",
+      "forbidden" => ["raw Torus rules", "navigation targets", "URLs"]
+    })
     |> Map.put("allowed_activity_types", @activity_types)
     |> Map.put("duration_range_minutes", [@minimum_minutes, @maximum_minutes])
   end
@@ -127,7 +153,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
   def valid?(%{"schema_version" => @schema_version, "authoring_mode" => "advanced"} = content) do
     blueprint = content["experience_blueprint"] || %{}
 
-    is_binary(blueprint["driving_question"]) and List.wrap(blueprint["stages"]) != [] and
+    is_binary(blueprint["driving_question"]) and rich_stages?(blueprint["stages"]) and
       List.wrap(blueprint["activities"]) != [] and
       get_in(blueprint, ["duration_manifest", "total_minutes"]) in @minimum_minutes..@maximum_minutes
   end
@@ -142,8 +168,8 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
       base |> Map.get("objective_catalog", []) |> Enum.map(& &1["id"]) |> MapSet.new()
 
     source_ids = BasicPlanV5.source_blocks(lesson) |> Enum.map(& &1["id"]) |> MapSet.new()
-    stages = normalize_stages(raw["stages"])
     slots = normalize_slots(raw["activity_slots"])
+    stages = normalize_stages(raw["stages"])
 
     findings =
       []
@@ -153,13 +179,19 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
         "$",
         "Add one source-grounded driving question."
       )
-      |> Kernel.++(validate_stages(stages, group_ids, slots))
+      |> maybe_finding(
+        contains_forbidden_authoring_material?(raw),
+        "forbidden_advanced_authoring_material",
+        "$.experience_blueprint",
+        "Use only high-level instructional intent; do not author rules, navigation targets, or URLs."
+      )
+      |> Kernel.++(validate_stages(stages, group_ids, slots, source_ids))
       |> Kernel.++(validate_slots(slots, group_ids, objective_ids, source_ids))
       |> Kernel.++(validate_group_stage_coverage(stages, group_ids))
 
     case findings do
       [] ->
-        duration = duration_manifest(base, slots)
+        duration = duration_manifest(base, slots, stages)
 
         if duration["total_minutes"] in @minimum_minutes..@maximum_minutes do
           {:ok,
@@ -205,16 +237,53 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
     |> normalize_maps()
     |> Enum.with_index(1)
     |> Enum.map(fn {stage, index} ->
+      guidance = normalize_guidance(stage["guidance"])
+
       %{
         "id" => present(stage["id"]) || "stage-#{index}",
         "title" => present(stage["title"]) || "Exploration stage #{index}",
         "purpose" => present(stage["purpose"]) || "Advance the central investigation.",
         "roles" => normalize_strings(stage["roles"] || [stage["role"]]),
+        "presentation_pattern" => present(stage["presentation_pattern"]),
+        "introduction" => normalize_stage_introduction(stage["introduction"]),
+        "guidance" => guidance,
+        "native_follow_up_slot_id" => present(stage["native_follow_up_slot_id"]),
         "items" =>
           stage["items"]
           |> normalize_maps()
           |> Enum.map(&Map.take(&1, ~w(kind ref_id)))
       }
+    end)
+  end
+
+  defp normalize_stage_introduction(value) when is_map(value) do
+    value = stringify_map(value)
+
+    %{
+      "heading" => present(value["heading"]) || "Prepare to investigate",
+      "body" => present(value["body"] || value["text"]),
+      "evidence_block_ids" => normalize_strings(value["evidence_block_ids"])
+    }
+  end
+
+  defp normalize_stage_introduction(_value),
+    do: %{"heading" => nil, "body" => nil, "evidence_block_ids" => []}
+
+  defp normalize_guidance(values) do
+    values
+    |> normalize_maps()
+    |> Enum.map(fn guidance ->
+      kind = present(guidance["kind"])
+
+      %{
+        "kind" => kind,
+        "heading" => present(guidance["heading"]) || guidance_heading(kind),
+        "body" => present(guidance["body"] || guidance["prompt"] || guidance["text"]),
+        "evidence_block_ids" => normalize_strings(guidance["evidence_block_ids"])
+      }
+    end)
+    |> Enum.sort_by(fn guidance ->
+      Enum.find_index(@guidance_kinds, &(&1 == guidance["kind"])) || length(@guidance_kinds)
     end)
   end
 
@@ -236,10 +305,12 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
     end)
   end
 
-  defp validate_stages(stages, group_ids, slots) do
+  defp validate_stages(stages, group_ids, slots, source_ids) do
     stage_ids = Enum.map(stages, & &1["id"])
     slot_ids = slots |> Enum.map(& &1["id"]) |> MapSet.new()
+    slot_stage_ids = Map.new(slots, &{&1["id"], &1["stage_id"]})
     roles = stages |> Enum.flat_map(& &1["roles"]) |> MapSet.new()
+    guidance_kinds = stages |> Enum.flat_map(& &1["guidance"]) |> Enum.map(& &1["kind"])
 
     []
     |> maybe_finding(
@@ -260,11 +331,25 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
       "$.experience_blueprint.stages",
       "Cover orientation, prediction, interpretation, transfer, and synthesis across the stage sequence."
     )
+    |> maybe_finding(
+      not Enum.all?(@guidance_kinds, &(&1 in guidance_kinds)),
+      "incomplete_instructional_guidance",
+      "$.experience_blueprint.stages",
+      "Author source-grounded prediction, observation, interpretation, transfer, and synthesis guidance across the experience."
+    )
     |> Kernel.++(
       stages
       |> Enum.with_index()
       |> Enum.flat_map(fn {stage, index} ->
         path = "$.experience_blueprint.stages[#{index}]"
+        introduction = stage["introduction"] || %{}
+
+        stage_slot_ids =
+          stage["items"]
+          |> Enum.filter(&(&1["kind"] == "activity_slot"))
+          |> Enum.map(& &1["ref_id"])
+
+        follow_up_slot_id = stage["native_follow_up_slot_id"]
 
         []
         |> maybe_finding(
@@ -279,6 +364,43 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
           path,
           "Every stage needs source content or an activity."
         )
+        |> maybe_finding(
+          stage["presentation_pattern"] not in @presentation_patterns,
+          "invalid_presentation_pattern",
+          path,
+          "Choose one supported high-level presentation pattern."
+        )
+        |> maybe_finding(
+          not present?(introduction["body"]),
+          "missing_stage_introduction",
+          path,
+          "Author a compact source-grounded transition into this stage."
+        )
+        |> maybe_finding(
+          introduction["evidence_block_ids"] == [] or
+            Enum.any?(
+              introduction["evidence_block_ids"],
+              &(not MapSet.member?(source_ids, &1))
+            ),
+          "invalid_stage_introduction_evidence",
+          path,
+          "Ground the stage introduction in supplied source block ids."
+        )
+        |> maybe_finding(
+          stage_slot_ids != [] and
+            (follow_up_slot_id not in stage_slot_ids or
+               slot_stage_ids[follow_up_slot_id] != stage["id"]),
+          "invalid_native_follow_up_slot",
+          path,
+          "Choose one activity slot in this stage as the explicit native follow-up."
+        )
+        |> maybe_finding(
+          stage_slot_ids == [] and not is_nil(follow_up_slot_id),
+          "orphan_native_follow_up_slot",
+          path,
+          "A stage without activity slots cannot declare a native follow-up."
+        )
+        |> Kernel.++(validate_stage_guidance(stage["guidance"], source_ids, path))
         |> Kernel.++(
           Enum.flat_map(stage["items"], fn item ->
             case item do
@@ -294,13 +416,13 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
                   ]
 
               %{"kind" => "activity_slot", "ref_id" => id} ->
-                if MapSet.member?(slot_ids, id),
+                if MapSet.member?(slot_ids, id) and slot_stage_ids[id] == stage["id"],
                   do: [],
                   else: [
                     finding(
-                      "unknown_activity_slot",
+                      "invalid_stage_activity_slot",
                       path,
-                      "Stage references an unknown activity slot."
+                      "Stage must reference an activity slot assigned to that stage."
                     )
                   ]
 
@@ -314,6 +436,46 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
                 ]
             end
           end)
+        )
+      end)
+    )
+  end
+
+  defp validate_stage_guidance(guidance, source_ids, path) do
+    kinds = Enum.map(guidance, & &1["kind"])
+
+    []
+    |> maybe_finding(
+      length(kinds) != length(Enum.uniq(kinds)),
+      "duplicate_stage_guidance",
+      path,
+      "Author each guidance kind at most once per stage."
+    )
+    |> Kernel.++(
+      guidance
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {item, index} ->
+        guidance_path = "#{path}.guidance[#{index}]"
+
+        []
+        |> maybe_finding(
+          item["kind"] not in @guidance_kinds,
+          "invalid_guidance_kind",
+          guidance_path,
+          "Use only supported instructional guidance kinds."
+        )
+        |> maybe_finding(
+          not present?(item["body"]),
+          "missing_guidance_body",
+          guidance_path,
+          "Author a substantive learner-facing prompt."
+        )
+        |> maybe_finding(
+          item["evidence_block_ids"] == [] or
+            Enum.any?(item["evidence_block_ids"], &(not MapSet.member?(source_ids, &1))),
+          "invalid_guidance_evidence",
+          guidance_path,
+          "Ground guidance in supplied source block ids."
         )
       end)
     )
@@ -528,7 +690,10 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
     )
   end
 
-  defp duration_manifest(content, slots) do
+  defp duration_manifest(content, slots),
+    do: duration_manifest(content, slots, get_in(content, ["experience_blueprint", "stages"]))
+
+  defp duration_manifest(content, slots, stages) do
     words =
       content
       |> Map.get("content_groups", [])
@@ -544,19 +709,67 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
     learner_work =
       slots |> Enum.map(& &1["estimated_minutes"]) |> Enum.filter(&is_integer/1) |> Enum.sum()
 
+    connective_words =
+      stages
+      |> List.wrap()
+      |> Enum.flat_map(fn stage ->
+        [get_in(stage, ["introduction", "body"])] ++
+          Enum.map(List.wrap(stage["guidance"]), & &1["body"])
+      end)
+      |> Enum.filter(&is_binary/1)
+      |> Enum.join(" ")
+      |> String.split(~r/\s+/u, trim: true)
+      |> length()
+
+    instructional_guidance = ceil_div(connective_words, 180)
     synthesis = 6
-    total = reading + media_analysis + learner_work + synthesis
+    total = reading + media_analysis + instructional_guidance + learner_work + synthesis
 
     %{
       "reading_minutes" => reading,
       "media_analysis_minutes" => media_analysis,
+      "instructional_guidance_minutes" => instructional_guidance,
       "learner_work_minutes" => learner_work,
       "synthesis_minutes" => synthesis,
       "total_minutes" => total,
       "range" => [@minimum_minutes, @maximum_minutes],
-      "strategy" => "deterministic_source_and_activity_estimate"
+      "strategy" => "deterministic_source_guidance_and_activity_estimate"
     }
   end
+
+  defp rich_stages?(values) do
+    stages = List.wrap(values)
+    guidance_kinds = stages |> Enum.flat_map(&List.wrap(&1["guidance"])) |> Enum.map(& &1["kind"])
+
+    stages != [] and
+      Enum.all?(stages, fn stage ->
+        present?(get_in(stage, ["introduction", "body"])) and
+          stage["presentation_pattern"] in @presentation_patterns
+      end) and Enum.all?(@guidance_kinds, &(&1 in guidance_kinds))
+  end
+
+  defp guidance_heading("prediction"), do: "Predict before you inspect"
+  defp guidance_heading("observation"), do: "Observe and record"
+  defp guidance_heading("interpretation"), do: "Interpret the evidence"
+  defp guidance_heading("transfer"), do: "Transfer the relationship"
+  defp guidance_heading("synthesis"), do: "Synthesize your explanation"
+  defp guidance_heading(_kind), do: "Investigate the evidence"
+
+  defp contains_forbidden_authoring_material?(value) when is_map(value) do
+    Enum.any?(value, fn {key, item} ->
+      to_string(key) in ~w(
+        rule rules navigation navigation_target target sequence_id url href src artifact_url
+      ) or contains_forbidden_authoring_material?(item)
+    end)
+  end
+
+  defp contains_forbidden_authoring_material?(value) when is_list(value),
+    do: Enum.any?(value, &contains_forbidden_authoring_material?/1)
+
+  defp contains_forbidden_authoring_material?(value) when is_binary(value),
+    do: Regex.match?(~r/https?:\/\//i, value)
+
+  defp contains_forbidden_authoring_material?(_value), do: false
 
   defp normalize_maps(values),
     do: values |> List.wrap() |> Enum.filter(&is_map/1) |> Enum.map(&stringify_map/1)

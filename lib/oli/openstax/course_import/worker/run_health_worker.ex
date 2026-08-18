@@ -43,7 +43,11 @@ defmodule Oli.OpenStax.CourseImport.Worker.RunHealthWorker do
   def perform(_job) do
     execution_runs =
       Run
-      |> where([run], run.status in ^@execution_statuses)
+      |> where(
+        [run],
+        run.status in ^@execution_statuses and run.source_schema_version == 3 and
+          run.plan_schema_version == 6
+      )
       |> order_by([run], asc: run.updated_at)
       |> limit(^@execution_batch_size)
       |> Repo.all()
@@ -80,7 +84,8 @@ defmodule Oli.OpenStax.CourseImport.Worker.RunHealthWorker do
     |> where(
       [run],
       run.status == :awaiting_lesson_approval and
-        run.lesson_planning_strategy == :parallel_v1
+        run.lesson_planning_strategy == :parallel_v1 and run.source_schema_version == 3 and
+        run.plan_schema_version == 6
     )
     |> where([_run], exists(subquery(unfinished_lesson)))
     |> order_by([run], asc: run.updated_at)

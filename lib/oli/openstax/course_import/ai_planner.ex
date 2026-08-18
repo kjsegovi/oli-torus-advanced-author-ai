@@ -11,7 +11,8 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   alias Oli.OpenStax.CourseImport.{
     AdvancedPipelineV6,
     AdvancedSuitabilityV6,
-    BasicPipelineV5
+    BasicPipelineV5,
+    SimulationOpportunityPipeline
   }
 
   @feature :openstax_course_import
@@ -55,7 +56,7 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
     services = basic_services(service_config, opts)
 
     with {:ok, result} <- BasicPipelineV5.plan(lesson, index, services, opts) do
-      {:ok, planning_result("basic", result, suitability)}
+      {:ok, planning_result("basic", result, suitability, [], %{})}
     else
       {:error, reason} -> {:error, {:ai_planning_failed, reason}}
     end
@@ -66,23 +67,63 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
     opts = Keyword.put(opts, :advanced_suitability, suitability)
 
     with {:ok, result} <- AdvancedPipelineV6.plan(lesson, index, services, opts) do
-      {:ok, planning_result("advanced", result, suitability)}
+      {opportunities, opportunity_metadata} =
+        maybe_plan_simulation_opportunities(lesson, result, services, opts)
+
+      {:ok,
+       planning_result(
+         "advanced",
+         result,
+         suitability,
+         opportunities,
+         opportunity_metadata
+       )}
     else
       {:error, reason} -> {:error, {:ai_planning_failed, reason}}
     end
   end
 
-  defp planning_result(mode, result, suitability) do
+  defp planning_result(mode, result, suitability, enrichment_proposals, opportunity_metadata) do
     %{
       plan_mode: mode,
       payload: %{
         "content_payload" => result.content_payload,
         "questions_payload" => result.questions_payload
       },
-      enrichment_proposals: [],
+      enrichment_proposals: enrichment_proposals,
       created_by: "ai",
-      metadata: Map.put(result.metadata, "suitability", suitability)
+      metadata:
+        result.metadata
+        |> Map.put("suitability", suitability)
+        |> Map.put("simulation_opportunities", opportunity_metadata)
     }
+  end
+
+  defp maybe_plan_simulation_opportunities(lesson, result, services, opts) do
+    approved = get_in(result.metadata, ["quality_gate", "approved"]) == true
+
+    enabled =
+      Keyword.get(
+        opts,
+        :simulation_opportunities_enabled,
+        Application.get_env(:oli, :openstax_generated_enrichment_enabled, false)
+      )
+
+    if approved and enabled do
+      opportunity_services = %{designer: services.designer, critic: services.opportunity_critic}
+
+      case SimulationOpportunityPipeline.plan(
+             lesson,
+             result.content_payload,
+             opportunity_services,
+             opts
+           ) do
+        {:ok, opportunities, metadata} -> {opportunities, Map.put(metadata, "status", "approved")}
+        {:error, reason} -> {[], %{"status" => "omitted", "reason" => inspect(reason)}}
+      end
+    else
+      {[], %{"status" => "not_requested"}}
+    end
   end
 
   defp require_current_run_schema(opts) do
@@ -174,6 +215,18 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
           base,
           "advanced-activity-critic",
           env.("OPENSTAX_ADVANCED_ACTIVITY_CRITIC_MODEL") || "gpt-5.6-sol"
+        ),
+      designer:
+        role_service_config(
+          base,
+          "simulation-opportunity-designer",
+          env.("OPENSTAX_SIMULATION_OPPORTUNITY_MODEL") || "gpt-5.6-terra"
+        ),
+      opportunity_critic:
+        role_service_config(
+          base,
+          "simulation-opportunity-critic",
+          env.("OPENSTAX_SIMULATION_OPPORTUNITY_CRITIC_MODEL") || "gpt-5.6-sol"
         )
     }
   end

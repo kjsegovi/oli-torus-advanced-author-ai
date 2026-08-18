@@ -16,9 +16,11 @@ defmodule Oli.OpenStax.CourseImport.Run do
 
   alias Oli.OpenStax.CourseImport.{
     EnrichmentProposal,
+    EnrichmentResearchSet,
     Media,
     Notification,
     SimulationArtifact,
+    SimulationSpec,
     SourceAsset,
     SourceBlock,
     SourceSection,
@@ -103,6 +105,8 @@ defmodule Oli.OpenStax.CourseImport.Run do
     has_many :source_assets, SourceAsset, foreign_key: :run_id
     has_many :media, Media, foreign_key: :run_id
     has_many :enrichment_proposals, EnrichmentProposal, foreign_key: :run_id
+    has_many :enrichment_research_sets, EnrichmentResearchSet, foreign_key: :run_id
+    has_many :simulation_specs, SimulationSpec, foreign_key: :run_id
     has_many :simulation_artifacts, SimulationArtifact, foreign_key: :run_id
 
     field :status, Ecto.Enum, values: @statuses, default: :preflighting

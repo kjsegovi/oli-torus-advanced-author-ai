@@ -1,23 +1,29 @@
 import React from 'react';
-import { Descendant } from 'slate';
-import { Hint } from 'components/activities/types';
+import { Hint, RichText } from 'components/activities/types';
 import { SlateOrMarkdownEditor } from 'components/editing/SlateOrMarkdownEditor';
 import { Card } from 'components/misc/Card';
+import { TextDirection } from 'data/content/model/elements/types';
 import { ID } from 'data/content/model/other';
 import { DEFAULT_EDITOR, EditorType } from 'data/content/resource';
 
 export const HintCard: React.FC<{
   title: JSX.Element;
   placeholder: string;
-  hint: Hint;
-  updateOne: (id: ID, content: Descendant[]) => void;
+  hint?: Hint;
+  createOne: (attrs: {
+    content?: RichText;
+    editor?: EditorType;
+    textDirection?: TextDirection;
+  }) => void;
+  updateOne: (id: ID, content: RichText) => void;
   updateOneEditor: (id: ID, editor: EditorType) => void;
-  updateOneTextDirection: (id: ID, textDirection: string) => void;
+  updateOneTextDirection: (id: ID, textDirection: TextDirection) => void;
   projectSlug: string;
 }> = ({
   title,
   placeholder,
   hint,
+  createOne,
   updateOne,
   updateOneEditor,
   updateOneTextDirection,
@@ -30,14 +36,18 @@ export const HintCard: React.FC<{
         <SlateOrMarkdownEditor
           placeholder={placeholder}
           content={hint?.content || []}
-          onEdit={(content) => updateOne(hint.id, content)}
+          onEdit={(content) => (hint ? updateOne(hint.id, content) : createOne({ content }))}
           editMode={true}
-          editorType={hint.editor || DEFAULT_EDITOR}
-          onEditorTypeChange={(editor) => updateOneEditor(hint.id, editor)}
+          editorType={hint?.editor || DEFAULT_EDITOR}
+          onEditorTypeChange={(editor) =>
+            hint ? updateOneEditor(hint.id, editor) : createOne({ editor })
+          }
           allowBlockElements={true}
           projectSlug={projectSlug}
-          textDirection={hint.textDirection}
-          onChangeTextDirection={(textDirection) => updateOneTextDirection(hint.id, textDirection)}
+          textDirection={hint?.textDirection}
+          onChangeTextDirection={(textDirection) =>
+            hint ? updateOneTextDirection(hint.id, textDirection) : createOne({ textDirection })
+          }
         />
       </Card.Content>
     </Card.Card>

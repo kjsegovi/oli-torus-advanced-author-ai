@@ -38,7 +38,25 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6Test do
 
     assert get_in(content, ["experience_blueprint", "duration_manifest", "total_minutes"]) in 45..75
 
+    assert get_in(content, [
+             "experience_blueprint",
+             "duration_manifest",
+             "instructional_guidance_minutes"
+           ]) > 0
+
     assert length(get_in(content, ["experience_blueprint", "activities"])) == 4
+
+    assert get_in(content, [
+             "experience_blueprint",
+             "stages",
+             Access.at(0),
+             "native_follow_up_activity_id"
+           ]) == "activity-3"
+
+    assert content
+           |> get_in(["experience_blueprint", "stages", Access.at(0), "guidance"])
+           |> Enum.map(& &1["kind"]) ==
+             ~w(prediction observation interpretation transfer synthesis)
 
     assert Enum.all?(
              get_in(content, ["experience_blueprint", "activities"]),
@@ -66,6 +84,31 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6Test do
 
     assert {:error, findings} = AdvancedPlanV6.attach_activities(architecture, candidate, lesson)
     assert Enum.any?(findings, &(&1["code"] == "missing_activity_feedback"))
+  end
+
+  test "requires source-grounded connective guidance and rejects renderer instructions" do
+    lesson = lesson()
+
+    missing_guidance =
+      architecture_candidate()
+      |> put_in(["experience_blueprint", "stages", Access.at(0), "guidance"], [])
+
+    assert {:error, findings} =
+             AdvancedPlanV6.build_architecture(missing_guidance, lesson, 1)
+
+    assert Enum.any?(findings, &(&1["code"] == "incomplete_instructional_guidance"))
+
+    raw_renderer_instruction =
+      architecture_candidate()
+      |> put_in(
+        ["experience_blueprint", "stages", Access.at(0), "rules"],
+        [%{"navigation" => "next"}]
+      )
+
+    assert {:error, findings} =
+             AdvancedPlanV6.build_architecture(raw_renderer_instruction, lesson, 1)
+
+    assert Enum.any?(findings, &(&1["code"] == "forbidden_advanced_authoring_material"))
   end
 
   test "current checks reject every legacy content contract" do
@@ -149,8 +192,17 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6Test do
             "id" => "investigation",
             "title" => "Investigate and decide",
             "purpose" => "Move from prediction through transfer and synthesis.",
+            "presentation_pattern" => "predict_observe_explain",
             "roles" =>
-              ~w(orientation prediction investigation evidence interpretation transfer synthesis),
+              ~w(orientation prediction investigation observation evidence interpretation transfer synthesis),
+            "introduction" => %{
+              "heading" => "Turn the model into a testable claim",
+              "body" =>
+                "Connect the source relationship to a prediction, then compare it with the recorded evidence.",
+              "evidence_block_ids" => ["evidence", "investigation"]
+            },
+            "guidance" => rich_guidance(),
+            "native_follow_up_slot_id" => "slot-3",
             "items" =>
               [%{"kind" => "content_group", "ref_id" => "evidence-group"}] ++
                 Enum.map(1..4, &%{"kind" => "activity_slot", "ref_id" => "slot-#{&1}"})
@@ -196,6 +248,31 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6Test do
           }
         end)
     }
+  end
+
+  defp rich_guidance do
+    Enum.map(
+      [
+        {"prediction", "Commit to a prediction",
+         "Predict which model should agree with the measurement."},
+        {"observation", "Record the evidence",
+         "Record the predicted and observed values with units."},
+        {"interpretation", "Explain the discrepancy",
+         "Use the discrepancy to decide which model is supported."},
+        {"transfer", "Test a changed condition",
+         "Apply the comparison when one condition changes."},
+        {"synthesis", "Answer the driving question",
+         "Combine the calculation and evidence into a model decision."}
+      ],
+      fn {kind, heading, body} ->
+        %{
+          "kind" => kind,
+          "heading" => heading,
+          "body" => body,
+          "evidence_block_ids" => ["evidence", "investigation"]
+        }
+      end
+    )
   end
 
   defp block(id, kind, text),

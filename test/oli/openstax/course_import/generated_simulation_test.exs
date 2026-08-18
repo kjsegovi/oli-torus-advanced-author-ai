@@ -13,7 +13,9 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulationTest do
                simulation_artifact_url_resolver: fn _artifact ->
                  {:ok, "https://media.example.edu/bundles/#{@hash}/index.html"}
                end,
-               generated_simulation_origins: ["https://media.example.edu"]
+               generated_simulation_origins: ["https://media.example.edu"],
+               generated_simulation_delivery_enabled: true,
+               generated_simulation_kill_switch: false
              )
 
     assert spec["securityProfile"] == "generated_simulation"
@@ -68,14 +70,18 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulationTest do
 
     assert {:error, :simulation_artifact_not_approved} =
              GeneratedSimulation.resolve(@proposal_id,
-               simulation_artifact_resolver: fn _ -> {:ok, pending} end
+               simulation_artifact_resolver: fn _ -> {:ok, pending} end,
+               generated_simulation_delivery_enabled: true,
+               generated_simulation_kill_switch: false
              )
 
     failed_validation = Map.put(artifact(), :validation_payload, %{"status" => "failed"})
 
     assert {:error, :simulation_artifact_validation_failed} =
              GeneratedSimulation.resolve(@proposal_id,
-               simulation_artifact_resolver: fn _ -> {:ok, failed_validation} end
+               simulation_artifact_resolver: fn _ -> {:ok, failed_validation} end,
+               generated_simulation_delivery_enabled: true,
+               generated_simulation_kill_switch: false
              )
   end
 
@@ -86,7 +92,9 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulationTest do
                simulation_artifact_url_resolver: fn _ ->
                  {:ok, "https://attacker.example/bundles/#{@hash}/index.html"}
                end,
-               generated_simulation_origins: ["https://media.example.edu"]
+               generated_simulation_origins: ["https://media.example.edu"],
+               generated_simulation_delivery_enabled: true,
+               generated_simulation_kill_switch: false
              )
 
     assert {:error, :simulation_artifact_origin_untrusted} =
@@ -95,7 +103,9 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulationTest do
                simulation_artifact_url_resolver: fn _ ->
                  {:ok, "https://media.example.edu/bundles/#{@hash}/index.html"}
                end,
-               generated_simulation_origins: ["https://different-media.example.edu"]
+               generated_simulation_origins: ["https://different-media.example.edu"],
+               generated_simulation_delivery_enabled: true,
+               generated_simulation_kill_switch: false
              )
 
     assert {:error, :simulation_artifact_origin_untrusted} =
@@ -104,7 +114,9 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulationTest do
                simulation_artifact_url_resolver: fn _ ->
                  {:ok, "https://media.example.edu/bundles/#{@hash}/index.html"}
                end,
-               generated_simulation_origins: []
+               generated_simulation_origins: [],
+               generated_simulation_delivery_enabled: true,
+               generated_simulation_kill_switch: false
              )
   end
 
@@ -121,7 +133,9 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulationTest do
                simulation_artifact_url_resolver: fn _ ->
                  {:ok, "https://media.example.edu/bundles/#{@hash}/index.html"}
                end,
-               generated_simulation_origins: ["https://media.example.edu"]
+               generated_simulation_origins: ["https://media.example.edu"],
+               generated_simulation_delivery_enabled: true,
+               generated_simulation_kill_switch: false
              )
   end
 
@@ -153,7 +167,9 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulationTest do
       simulation_artifact_url_resolver: fn _ ->
         {:ok, "https://media.example.edu/bundles/#{@hash}/index.html"}
       end,
-      generated_simulation_origins: ["https://media.example.edu"]
+      generated_simulation_origins: ["https://media.example.edu"],
+      generated_simulation_delivery_enabled: true,
+      generated_simulation_kill_switch: false
     )
   end
 

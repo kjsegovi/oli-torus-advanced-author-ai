@@ -16,12 +16,23 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
 
   alias Oli.OpenStax.CourseImport.{
     EnrichmentProposal,
+    EnrichmentResearchSet,
     Lesson,
     Run,
-    SimulationArtifact
+    SimulationArtifact,
+    SimulationArtifactAttempt,
+    SimulationSpec,
+    Telemetry
   }
 
-  alias Oli.OpenStax.CourseImport.Enrichment.{ArtifactStorage, Failure, Origin, Research}
+  alias Oli.OpenStax.CourseImport.Enrichment.{
+    ArtifactStorage,
+    Failure,
+    Origin,
+    Research,
+    SimulationSpecDesigner
+  }
+
   alias Oli.Repo
 
   @max_proposals_per_lesson 3
@@ -33,13 +44,20 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
     placement learner_task resource_title resource_url metadata
   )a
 
-  @artifact_start_attr_names ~w(generator_name generator_version generation_metadata)a
+  @artifact_start_attr_names ~w(
+    generator_name generator_version generation_metadata simulation_spec_id simulation_spec_hash
+  )a
 
   @artifact_result_attr_names ~w(
     generator_name generator_version generation_metadata bundle_manifest capi_manifest
     accessibility_metadata validation_status validation_version validation_payload
     content_hash byte_size storage_state storage_provider storage_key storage_origin
     failure staged_at
+  )a
+
+  @artifact_attempt_attr_names ~w(
+    status source_hash content_hash generator_name generator_version findings
+    validation_summary criticism model_usage completed_at
   )a
 
   @doc "Returns the hard upper bound applied by both the context and database."
@@ -129,7 +147,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
       proposal.run_id == ^run_id and proposal.lesson_id == ^lesson_id
     )
     |> order_by([proposal], asc: proposal.rank)
-    |> preload(:simulation_artifacts)
+    |> preload([:research_sets, :simulation_specs, simulation_artifacts: :attempts])
     |> Repo.all()
   end
 
@@ -155,7 +173,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
     EnrichmentProposal
     |> where([proposal], proposal.run_id == ^run_id)
     |> order_by([proposal], asc: proposal.lesson_id, asc: proposal.rank)
-    |> preload(:simulation_artifacts)
+    |> preload([:research_sets, :simulation_specs, simulation_artifacts: :attempts])
     |> Repo.all()
   end
 
@@ -165,8 +183,16 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
           {:ok, EnrichmentProposal.t()} | {:error, :not_found}
   def fetch_proposal(proposal_id) when is_binary(proposal_id) do
     case Repo.get(EnrichmentProposal, proposal_id) do
-      nil -> {:error, :not_found}
-      proposal -> {:ok, Repo.preload(proposal, :simulation_artifacts)}
+      nil ->
+        {:error, :not_found}
+
+      proposal ->
+        {:ok,
+         Repo.preload(proposal, [
+           :research_sets,
+           :simulation_specs,
+           simulation_artifacts: :attempts
+         ])}
     end
   end
 
@@ -175,7 +201,25 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   @spec approve_proposal(Ecto.UUID.t(), Author.t()) ::
           {:ok, EnrichmentProposal.t()} | {:error, term()}
   def approve_proposal(proposal_id, %Author{} = author) do
-    decide_proposal(proposal_id, author, :approve, nil)
+    with {:ok, proposal} <- fetch_proposal(proposal_id),
+         :ok <- ensure_run_reviewable(proposal.run_id) do
+      case proposal.kind do
+        "generated_simulation" ->
+          case latest_research_set(proposal.id, "evidence_review") do
+            %EnrichmentResearchSet{} = research ->
+              with {:ok, _approved} <-
+                     approve_evidence(proposal.id, research.id, research.content_hash, author) do
+                fetch_proposal(proposal.id)
+              end
+
+            nil ->
+              {:error, :research_not_ready_for_approval}
+          end
+
+        _ ->
+          decide_proposal(proposal_id, author, :approve, nil)
+      end
+    end
   end
 
   def approve_proposal(_, _), do: {:error, :invalid_input}
@@ -193,7 +237,9 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   def cancel_proposal(proposal_id, author, reason \\ "Cancelled by author")
 
   def cancel_proposal(proposal_id, %Author{} = author, reason) when is_binary(reason) do
-    decide_proposal(proposal_id, author, :cancel, reason)
+    proposal_id
+    |> decide_proposal(author, :cancel, reason)
+    |> emit_author_decision(:cancel_proposal)
   end
 
   def cancel_proposal(_, _, _), do: {:error, :invalid_input}
@@ -203,7 +249,9 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   def omit_proposal(proposal_id, author, reason \\ "Omitted by author")
 
   def omit_proposal(proposal_id, %Author{} = author, reason) when is_binary(reason) do
-    decide_proposal(proposal_id, author, :omit, reason)
+    proposal_id
+    |> decide_proposal(author, :omit, reason)
+    |> emit_author_decision(:omit_proposal)
   end
 
   def omit_proposal(_, _, _), do: {:error, :invalid_input}
@@ -216,20 +264,45 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
       _run = lock_reviewable_run!(scope.run_id)
       proposal = lock_proposal!(proposal_id)
 
-      unless proposal.state == "proposed" do
+      unless proposal.state in [
+               "proposed",
+               "researching",
+               "evidence_review",
+               "designing",
+               "artifact_review",
+               "failed"
+             ] do
         Repo.rollback({:invalid_proposal_state, proposal.state})
       end
 
       if proposal.research_status == "running" do
         proposal
       else
-        persist_update!(
-          EnrichmentProposal.research_changeset(proposal, %{
-            research_status: "running",
-            research_version: proposal.research_version + 1,
-            research_failure: nil
-          })
-        )
+        version = proposal.research_version + 1
+
+        attrs =
+          if proposal.kind == "generated_simulation" do
+            supersede_downstream_for_new_research!(proposal.id)
+            _research = insert_research_set!(proposal, version)
+
+            %{
+              state: "researching",
+              research_status: "running",
+              research_version: version,
+              research_evidence: %{},
+              research_failure: nil
+            }
+          else
+            %{
+              state: "proposed",
+              research_status: "running",
+              research_version: version,
+              research_evidence: %{},
+              research_failure: nil
+            }
+          end
+
+        persist_update!(EnrichmentProposal.research_changeset(proposal, attrs))
       end
     end)
   end
@@ -239,23 +312,38 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   @spec record_research_result(Ecto.UUID.t(), {:ok, map()} | {:error, term()}) ::
           {:ok, EnrichmentProposal.t()} | {:error, term()}
   def record_research_result(proposal_id, result) when is_binary(proposal_id) do
-    Repo.transaction(fn ->
-      scope = Repo.get(EnrichmentProposal, proposal_id) || Repo.rollback(:not_found)
-      _run = lock_reviewable_run!(scope.run_id)
-      proposal = lock_proposal!(proposal_id)
+    transaction_result =
+      Repo.transaction(fn ->
+        scope = Repo.get(EnrichmentProposal, proposal_id) || Repo.rollback(:not_found)
+        _run = lock_reviewable_run!(scope.run_id)
+        proposal = lock_proposal!(proposal_id)
 
-      unless proposal.state == "proposed" do
-        Repo.rollback({:invalid_proposal_state, proposal.state})
-      end
+        expected_state =
+          if proposal.kind == "generated_simulation", do: "researching", else: "proposed"
 
-      unless proposal.research_status == "running" do
-        Repo.rollback({:invalid_research_status, proposal.research_status})
-      end
+        unless proposal.state == expected_state do
+          Repo.rollback({:invalid_proposal_state, proposal.state})
+        end
 
-      attrs = research_result_attrs(result, proposal.research_version)
+        unless proposal.research_status == "running" do
+          Repo.rollback({:invalid_research_status, proposal.research_status})
+        end
 
-      persist_update!(EnrichmentProposal.research_changeset(proposal, attrs))
-    end)
+        if proposal.kind == "generated_simulation" do
+          research = lock_research_set!(proposal.id, proposal.research_version)
+          research_attrs = research_set_result_attrs(result, research)
+
+          _research =
+            persist_update!(EnrichmentResearchSet.result_changeset(research, research_attrs))
+        end
+
+        attrs = research_result_attrs(result, proposal)
+
+        persist_update!(EnrichmentProposal.research_changeset(proposal, attrs))
+      end)
+
+    emit_research_telemetry(transaction_result)
+    transaction_result
   end
 
   def record_research_result(_, _), do: {:error, :invalid_input}
@@ -268,7 +356,12 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   def research_proposal(proposal_id, opts) when is_binary(proposal_id) do
     with {:ok, proposal} <- fetch_proposal(proposal_id),
          {:ok, running} <- mark_research_running(proposal.id) do
-      result = Research.research(running, opts)
+      started_at = System.monotonic_time(:millisecond)
+
+      result =
+        running
+        |> Research.research(opts)
+        |> put_result_duration(elapsed_milliseconds(started_at))
 
       case record_research_result(proposal.id, result) do
         {:ok, researched} ->
@@ -291,8 +384,24 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
       proposal = lock_proposal!(proposal_id)
 
       if proposal.research_status == "running" do
+        case current_research_set(proposal.id, proposal.research_version) do
+          %EnrichmentResearchSet{} = research ->
+            persist_update!(
+              EnrichmentResearchSet.result_changeset(research, %{
+                status: "failed",
+                failure: Failure.sanitize(reason, "research")
+              })
+            )
+
+          nil ->
+            :ok
+        end
+
+        next_state = if proposal.kind == "generated_simulation", do: "failed", else: "proposed"
+
         persist_update!(
           EnrichmentProposal.research_changeset(proposal, %{
+            state: next_state,
             research_status: "failed",
             research_failure: Failure.sanitize(reason, "research")
           })
@@ -304,6 +413,250 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   end
 
   def fail_running_research(_, _), do: {:error, :invalid_input}
+
+  @doc "Approves one exact evidence version and hash before simulation design."
+  @spec approve_evidence(Ecto.UUID.t(), Ecto.UUID.t(), String.t(), Author.t()) ::
+          {:ok, EnrichmentResearchSet.t()} | {:error, term()}
+  def approve_evidence(proposal_id, research_set_id, content_hash, %Author{} = author)
+      when is_binary(proposal_id) and is_binary(research_set_id) and is_binary(content_hash) do
+    result =
+      Repo.transaction(fn ->
+        proposal = lock_proposal!(proposal_id)
+        _run = lock_reviewable_run!(proposal.run_id)
+        authorize_project_id!(proposal.project_id, author)
+
+        research =
+          Repo.one(
+            from(record in EnrichmentResearchSet,
+              where:
+                record.id == ^research_set_id and record.proposal_id == ^proposal.id and
+                  record.content_hash == ^content_hash,
+              lock: "FOR UPDATE"
+            )
+          ) || Repo.rollback(:stale_research_version)
+
+        unless proposal.kind == "generated_simulation" and proposal.state == "evidence_review" and
+                 research.status == "evidence_review" and
+                 proposal.research_version == research.version do
+          Repo.rollback(:research_not_ready_for_approval)
+        end
+
+        now = DateTime.utc_now()
+
+        from(other in EnrichmentResearchSet,
+          where:
+            other.proposal_id == ^proposal.id and other.status == "approved" and
+              other.id != ^research.id
+        )
+        |> Repo.update_all(set: [status: "superseded", updated_at: now])
+
+        approved =
+          persist_update!(
+            EnrichmentResearchSet.decision_changeset(research, %{
+              status: "approved",
+              approved_by_author_id: author.id,
+              approved_at: now,
+              decided_by_author_id: author.id,
+              decided_at: now,
+              decision_reason: nil,
+              approval_history:
+                append_history(
+                  research.approval_history,
+                  "approve_evidence",
+                  author,
+                  research.version,
+                  nil
+                )
+            })
+          )
+
+        persist_update!(
+          EnrichmentProposal.research_changeset(proposal, %{
+            state: "designing",
+            research_status: "completed",
+            research_failure: nil
+          })
+        )
+
+        approved
+      end)
+
+    emit_author_decision(result, :approve_evidence)
+  end
+
+  def approve_evidence(_, _, _, _), do: {:error, :invalid_input}
+
+  @doc "Rejects one exact evidence version and returns the proposal to research."
+  @spec reject_evidence(Ecto.UUID.t(), Ecto.UUID.t(), String.t(), Author.t(), String.t()) ::
+          {:ok, EnrichmentResearchSet.t()} | {:error, term()}
+  def reject_evidence(proposal_id, research_set_id, content_hash, %Author{} = author, reason)
+      when is_binary(proposal_id) and is_binary(research_set_id) and is_binary(content_hash) and
+             is_binary(reason) do
+    reason = normalize_reason(reason)
+
+    if is_nil(reason) do
+      {:error, :decision_reason_required}
+    else
+      result =
+        Repo.transaction(fn ->
+          proposal = lock_proposal!(proposal_id)
+          _run = lock_reviewable_run!(proposal.run_id)
+          authorize_project_id!(proposal.project_id, author)
+
+          research =
+            Repo.one(
+              from(record in EnrichmentResearchSet,
+                where:
+                  record.id == ^research_set_id and record.proposal_id == ^proposal.id and
+                    record.content_hash == ^content_hash and record.status == "evidence_review",
+                lock: "FOR UPDATE"
+              )
+            ) || Repo.rollback(:stale_research_version)
+
+          now = DateTime.utc_now()
+
+          rejected =
+            persist_update!(
+              EnrichmentResearchSet.decision_changeset(research, %{
+                status: "rejected",
+                decided_by_author_id: author.id,
+                decided_at: now,
+                decision_reason: reason,
+                approval_history:
+                  append_history(
+                    research.approval_history,
+                    "reject_evidence",
+                    author,
+                    research.version,
+                    reason
+                  )
+              })
+            )
+
+          persist_update!(
+            EnrichmentProposal.research_changeset(proposal, %{
+              state: "researching",
+              research_status: "not_started",
+              research_failure: nil
+            })
+          )
+
+          rejected
+        end)
+
+      emit_author_decision(result, :reject_evidence)
+    end
+  end
+
+  def reject_evidence(_, _, _, _, _), do: {:error, :invalid_input}
+
+  @spec fetch_research_set(Ecto.UUID.t()) ::
+          {:ok, EnrichmentResearchSet.t()} | {:error, :not_found}
+  def fetch_research_set(id) when is_binary(id) do
+    case Repo.get(EnrichmentResearchSet, id) do
+      nil -> {:error, :not_found}
+      research -> {:ok, research}
+    end
+  end
+
+  def fetch_research_set(_), do: {:error, :not_found}
+
+  @spec begin_spec_generation(Ecto.UUID.t()) ::
+          {:ok, SimulationSpec.t()} | {:error, term()}
+  def begin_spec_generation(proposal_id) when is_binary(proposal_id) do
+    Repo.transaction(fn ->
+      proposal = lock_proposal!(proposal_id)
+      _run = lock_reviewable_run!(proposal.run_id)
+
+      unless proposal.kind == "generated_simulation" and proposal.state == "designing" do
+        Repo.rollback(:research_approval_required)
+      end
+
+      research =
+        latest_research_set(proposal.id, "approved") ||
+          Repo.rollback(:research_approval_required)
+
+      if Repo.exists?(
+           from(spec in SimulationSpec,
+             where: spec.proposal_id == ^proposal.id and spec.status == "designing"
+           )
+         ) do
+        Repo.rollback(:simulation_spec_generation_in_progress)
+      end
+
+      versions =
+        from(spec in SimulationSpec,
+          where: spec.proposal_id == ^proposal.id,
+          select: spec.version,
+          lock: "FOR UPDATE"
+        )
+        |> Repo.all()
+
+      persist_insert!(
+        SimulationSpec.create_changeset(%SimulationSpec{}, %{
+          proposal_id: proposal.id,
+          research_set_id: research.id,
+          project_id: proposal.project_id,
+          run_id: proposal.run_id,
+          lesson_id: proposal.lesson_id,
+          version: Enum.max(versions, fn -> 0 end) + 1,
+          status: "designing",
+          evidence_hash: research.content_hash,
+          prompt_version: "simulation-spec-v1"
+        })
+      )
+    end)
+  end
+
+  def begin_spec_generation(_), do: {:error, :invalid_input}
+
+  @spec fetch_spec(Ecto.UUID.t()) :: {:ok, SimulationSpec.t()} | {:error, :not_found}
+  def fetch_spec(id) when is_binary(id) do
+    case Repo.get(SimulationSpec, id) do
+      nil -> {:error, :not_found}
+      spec -> {:ok, spec}
+    end
+  end
+
+  def fetch_spec(_), do: {:error, :not_found}
+
+  @spec record_spec_result(Ecto.UUID.t(), {:ok, map()} | {:error, term()}) ::
+          {:ok, SimulationSpec.t()} | {:error, term()}
+  def record_spec_result(spec_id, result) when is_binary(spec_id) do
+    transaction_result =
+      Repo.transaction(fn ->
+        scope = Repo.get(SimulationSpec, spec_id) || Repo.rollback(:not_found)
+        _run = lock_reviewable_run!(scope.run_id)
+        spec = lock_spec!(spec_id)
+
+        unless spec.status == "designing" do
+          Repo.rollback({:invalid_simulation_spec_status, spec.status})
+        end
+
+        attrs = simulation_spec_result_attrs(result)
+        saved = persist_update!(SimulationSpec.create_changeset(spec, attrs))
+
+        saved
+      end)
+
+    emit_spec_telemetry(transaction_result)
+    transaction_result
+  end
+
+  def record_spec_result(_, _), do: {:error, :invalid_input}
+
+  @doc "Convenience path for tests and operator tools; UI work should enqueue the spec worker."
+  def generate_spec(proposal_id, opts \\ [])
+
+  def generate_spec(proposal_id, opts) when is_binary(proposal_id) do
+    with {:ok, spec} <- begin_spec_generation(proposal_id),
+         {:ok, proposal} <- fetch_proposal(proposal_id),
+         {:ok, research} <- fetch_research_set(spec.research_set_id) do
+      record_spec_result(spec.id, SimulationSpecDesigner.generate(proposal, research, opts))
+    end
+  end
+
+  def generate_spec(_, _), do: {:error, :invalid_input}
 
   @spec begin_artifact_generation(Ecto.UUID.t(), map()) ::
           {:ok, SimulationArtifact.t()} | {:error, term()}
@@ -318,6 +671,15 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
       _run = lock_reviewable_run!(scope.run_id)
       proposal = lock_proposal!(proposal_id)
       ensure_generatable_proposal!(proposal)
+
+      spec =
+        approve_spec_for_generation!(
+          proposal,
+          attrs[:simulation_spec_id],
+          attrs[:simulation_spec_hash]
+        )
+
+      attrs = Map.drop(attrs, [:simulation_spec_id, :simulation_spec_hash])
 
       active? =
         Repo.exists?(
@@ -339,20 +701,30 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
 
       next_version = Enum.max(versions, fn -> 0 end) + 1
 
-      persist_insert!(
-        SimulationArtifact.create_changeset(
-          %SimulationArtifact{},
-          attrs
-          |> Map.merge(%{
-            proposal_id: proposal.id,
-            project_id: proposal.project_id,
-            run_id: proposal.run_id,
-            lesson_id: proposal.lesson_id,
-            version: next_version,
-            status: "generating"
-          })
+      artifact =
+        persist_insert!(
+          SimulationArtifact.create_changeset(
+            %SimulationArtifact{},
+            attrs
+            |> Map.merge(%{
+              proposal_id: proposal.id,
+              project_id: proposal.project_id,
+              run_id: proposal.run_id,
+              lesson_id: proposal.lesson_id,
+              simulation_spec_id: spec.id,
+              version: next_version,
+              status: "generating"
+            })
+          )
         )
+
+      persist_update!(
+        EnrichmentProposal.research_changeset(proposal, %{
+          state: "artifact_review"
+        })
       )
+
+      artifact
     end)
   end
 
@@ -393,28 +765,77 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
           {:ok, map()} | {:error, term()}
         ) :: {:ok, SimulationArtifact.t()} | {:error, term()}
   def record_artifact_generation_result(artifact_id, result) when is_binary(artifact_id) do
+    transaction_result =
+      Repo.transaction(fn ->
+        scope = Repo.get(SimulationArtifact, artifact_id) || Repo.rollback(:not_found)
+        _run = lock_reviewable_run!(scope.run_id)
+        artifact = lock_artifact!(artifact_id)
+
+        unless artifact.status == "generating" do
+          Repo.rollback({:invalid_artifact_status, artifact.status})
+        end
+
+        persist_update!(
+          SimulationArtifact.preview_changeset(artifact, artifact_result_attrs(result))
+        )
+      end)
+
+    emit_artifact_telemetry(transaction_result)
+    transaction_result
+  end
+
+  def record_artifact_generation_result(_, _), do: {:error, :invalid_input}
+
+  @doc "Appends one immutable generated-candidate validation or critic outcome."
+  @spec record_artifact_attempt(Ecto.UUID.t(), map()) ::
+          {:ok, SimulationArtifactAttempt.t()} | {:error, term()}
+  def record_artifact_attempt(artifact_id, attrs)
+      when is_binary(artifact_id) and is_map(attrs) do
+    attrs = normalize_attrs(attrs, @artifact_attempt_attr_names)
+
     Repo.transaction(fn ->
-      scope = Repo.get(SimulationArtifact, artifact_id) || Repo.rollback(:not_found)
-      _run = lock_reviewable_run!(scope.run_id)
       artifact = lock_artifact!(artifact_id)
 
-      unless artifact.status == "generating" do
-        Repo.rollback({:invalid_artifact_status, artifact.status})
-      end
+      next_attempt =
+        SimulationArtifactAttempt
+        |> where([attempt], attempt.artifact_id == ^artifact.id)
+        |> select([attempt], max(attempt.attempt_number))
+        |> Repo.one()
+        |> then(&((&1 || 0) + 1))
 
-      persist_update!(
-        SimulationArtifact.preview_changeset(artifact, artifact_result_attrs(result))
+      attrs =
+        attrs
+        |> stringify_attempt_payloads()
+        |> Map.merge(%{
+          artifact_id: artifact.id,
+          attempt_number: next_attempt,
+          completed_at: attrs[:completed_at] || DateTime.utc_now()
+        })
+
+      persist_insert!(
+        SimulationArtifactAttempt.create_changeset(%SimulationArtifactAttempt{}, attrs)
       )
     end)
   end
 
-  def record_artifact_generation_result(_, _), do: {:error, :invalid_input}
+  def record_artifact_attempt(_, _), do: {:error, :invalid_input}
+
+  @spec list_artifact_attempts(Ecto.UUID.t()) :: [SimulationArtifactAttempt.t()]
+  def list_artifact_attempts(artifact_id) when is_binary(artifact_id) do
+    SimulationArtifactAttempt
+    |> where([attempt], attempt.artifact_id == ^artifact_id)
+    |> order_by([attempt], asc: attempt.attempt_number)
+    |> Repo.all()
+  end
+
+  def list_artifact_attempts(_), do: []
 
   @spec list_artifacts(Ecto.UUID.t()) :: [SimulationArtifact.t()]
   def list_artifacts(proposal_id) when is_binary(proposal_id) do
     SimulationArtifact
     |> where([artifact], artifact.proposal_id == ^proposal_id)
     |> order_by([artifact], desc: artifact.version)
+    |> preload(:attempts)
     |> Repo.all()
   end
 
@@ -423,53 +844,116 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   @spec approve_artifact(Ecto.UUID.t(), Author.t()) ::
           {:ok, SimulationArtifact.t()} | {:error, term()}
   def approve_artifact(artifact_id, %Author{} = author) when is_binary(artifact_id) do
-    Repo.transaction(fn ->
-      scope = Repo.get(SimulationArtifact, artifact_id) || Repo.rollback(:not_found)
-      _run = lock_reviewable_run!(scope.run_id)
-      artifact = lock_artifact!(artifact_id)
-      proposal = lock_proposal!(artifact.proposal_id)
-      authorize_project_id!(proposal.project_id, author)
+    case Repo.get(SimulationArtifact, artifact_id) do
+      %SimulationArtifact{} = artifact ->
+        approve_artifact(artifact.id, artifact.version, artifact.content_hash, author)
 
-      unless proposal.state == "approved" do
-        Repo.rollback(:proposal_not_approved)
-      end
-
-      unless SimulationArtifact.ready_for_approval?(artifact) do
-        Repo.rollback(:artifact_invalid)
-      end
-
-      now = DateTime.utc_now()
-
-      SimulationArtifact
-      |> where(
-        [other],
-        other.proposal_id == ^proposal.id and other.status == "approved" and
-          other.id != ^artifact.id
-      )
-      |> Repo.update_all(set: [status: "superseded", updated_at: now])
-
-      persist_update!(
-        SimulationArtifact.decision_changeset(artifact, %{
-          status: "approved",
-          approved_by_author_id: author.id,
-          approved_at: now,
-          decided_by_author_id: author.id,
-          decided_at: now,
-          decision_reason: nil,
-          approval_history:
-            append_history(artifact.approval_history, "approved", author, artifact.version, nil)
-        })
-      )
-    end)
+      nil ->
+        {:error, :not_found}
+    end
   end
 
   def approve_artifact(_, _), do: {:error, :invalid_input}
+
+  @doc "Approves one exact immutable artifact version and content hash."
+  @spec approve_artifact(Ecto.UUID.t(), pos_integer(), String.t(), Author.t()) ::
+          {:ok, SimulationArtifact.t()} | {:error, term()}
+  def approve_artifact(artifact_id, version, content_hash, %Author{} = author)
+      when is_binary(artifact_id) and is_integer(version) and version > 0 and
+             is_binary(content_hash) do
+    result =
+      Repo.transaction(fn ->
+        scope = Repo.get(SimulationArtifact, artifact_id) || Repo.rollback(:not_found)
+        _run = lock_reviewable_run!(scope.run_id)
+        artifact = lock_artifact!(artifact_id)
+        proposal = lock_proposal!(artifact.proposal_id)
+        authorize_project_id!(proposal.project_id, author)
+
+        unless artifact.version == version and artifact.content_hash == content_hash do
+          Repo.rollback(:stale_artifact_version)
+        end
+
+        unless proposal.state == "artifact_review" do
+          Repo.rollback(:proposal_not_in_artifact_review)
+        end
+
+        spec =
+          Repo.get(SimulationSpec, artifact.simulation_spec_id) ||
+            Repo.rollback(:stale_simulation_spec)
+
+        unless spec.status == "approved" and spec.proposal_id == proposal.id do
+          Repo.rollback(:stale_simulation_spec)
+        end
+
+        unless SimulationArtifact.ready_for_approval?(artifact) do
+          Repo.rollback(:artifact_invalid)
+        end
+
+        now = DateTime.utc_now()
+
+        SimulationArtifact
+        |> where(
+          [other],
+          other.proposal_id == ^proposal.id and other.status == "approved" and
+            other.id != ^artifact.id
+        )
+        |> Repo.update_all(set: [status: "superseded", updated_at: now])
+
+        approved_artifact =
+          persist_update!(
+            SimulationArtifact.decision_changeset(artifact, %{
+              status: "approved",
+              approved_by_author_id: author.id,
+              approved_at: now,
+              decided_by_author_id: author.id,
+              decided_at: now,
+              decision_reason: nil,
+              approval_history:
+                append_history(
+                  artifact.approval_history,
+                  "approved",
+                  author,
+                  artifact.version,
+                  nil
+                )
+            })
+          )
+
+        persist_update!(
+          EnrichmentProposal.decision_changeset(proposal, %{
+            approved_by_author_id: author.id,
+            approved_at: now,
+            decided_by_author_id: author.id,
+            decided_at: now,
+            decision_reason: nil,
+            approved_version: proposal.version,
+            state: "approved",
+            approval_history:
+              append_history(
+                proposal.approval_history,
+                "approve_artifact",
+                author,
+                proposal.version,
+                nil
+              )
+          })
+        )
+
+        approved_artifact
+      end)
+
+    emit_author_decision(result, :approve_artifact)
+  end
+
+  def approve_artifact(_, _, _, _), do: {:error, :invalid_input}
 
   @spec reject_artifact(Ecto.UUID.t(), Author.t(), String.t()) ::
           {:ok, SimulationArtifact.t()} | {:error, term()}
   def reject_artifact(artifact_id, %Author{} = author, reason)
       when is_binary(artifact_id) and is_binary(reason) do
-    decide_artifact(artifact_id, author, :reject, reason)
+    artifact_id
+    |> decide_artifact(author, :reject, reason)
+    |> emit_author_decision(:reject_artifact)
   end
 
   def reject_artifact(_, _, _), do: {:error, :invalid_input}
@@ -480,7 +964,9 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
 
   def cancel_artifact(artifact_id, %Author{} = author, reason)
       when is_binary(artifact_id) and is_binary(reason) do
-    decide_artifact(artifact_id, author, :cancel, reason)
+    artifact_id
+    |> decide_artifact(author, :cancel, reason)
+    |> emit_author_decision(:cancel_artifact)
   end
 
   def cancel_artifact(_, _, _), do: {:error, :invalid_input}
@@ -653,7 +1139,11 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
 
       {research_count, _} =
         from(proposal in EnrichmentProposal,
-          where: proposal.research_status == "running" and proposal.updated_at < ^cutoff
+          join: run in Run,
+          on: run.id == proposal.run_id,
+          where:
+            proposal.research_status == "running" and proposal.updated_at < ^cutoff and
+              run.source_schema_version == 3 and run.plan_schema_version == 6
         )
         |> Repo.update_all(
           set: [
@@ -665,7 +1155,11 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
 
       {artifact_count, _} =
         from(artifact in SimulationArtifact,
-          where: artifact.status == "generating" and artifact.updated_at < ^cutoff
+          join: run in Run,
+          on: run.id == artifact.run_id,
+          where:
+            artifact.status == "generating" and artifact.updated_at < ^cutoff and
+              run.source_schema_version == 3 and run.plan_schema_version == 6
         )
         |> Repo.update_all(
           set: [
@@ -753,11 +1247,14 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   def cleanup_all_orphaned_artifacts(%DateTime{} = inserted_before, opts) do
     run_ids =
       from(artifact in SimulationArtifact,
+        join: run in Run,
+        on: run.id == artifact.run_id,
         where:
           artifact.status in ^@discardable_artifact_statuses and
             artifact.storage_state in ["unstaged", "staged", "promoted"] and
             not is_nil(artifact.storage_provider) and not is_nil(artifact.storage_key) and
-            not is_nil(artifact.content_hash) and
+            not is_nil(artifact.content_hash) and run.source_schema_version == 3 and
+            run.plan_schema_version == 6 and
             artifact.inserted_at < ^inserted_before,
         distinct: true,
         select: artifact.run_id
@@ -799,6 +1296,56 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
         })
       )
     )
+  end
+
+  defp insert_research_set!(proposal, version) do
+    metadata = proposal.metadata || %{}
+    domain = metadata["domain"] || metadata[:domain]
+    query = metadata["research_query"] || metadata[:research_query]
+
+    persist_insert!(
+      EnrichmentResearchSet.create_changeset(%EnrichmentResearchSet{}, %{
+        proposal_id: proposal.id,
+        project_id: proposal.project_id,
+        run_id: proposal.run_id,
+        lesson_id: proposal.lesson_id,
+        version: version,
+        status: "researching",
+        domain: domain,
+        query: query,
+        source_evidence: proposal.source_evidence,
+        prompt_version: "simulation-research-v1"
+      })
+    )
+  end
+
+  defp supersede_downstream_for_new_research!(proposal_id) do
+    now = DateTime.utc_now()
+
+    from(record in EnrichmentResearchSet,
+      where:
+        record.proposal_id == ^proposal_id and record.status in ["evidence_review", "approved"]
+    )
+    |> Repo.update_all(set: [status: "superseded", updated_at: now])
+
+    from(spec in SimulationSpec,
+      where: spec.proposal_id == ^proposal_id and spec.status not in ["failed", "superseded"]
+    )
+    |> Repo.update_all(set: [status: "superseded", updated_at: now])
+
+    from(artifact in SimulationArtifact,
+      where: artifact.proposal_id == ^proposal_id and artifact.status == "ready_for_review"
+    )
+    |> Repo.update_all(set: [status: "superseded", updated_at: now])
+
+    from(artifact in SimulationArtifact,
+      where:
+        artifact.proposal_id == ^proposal_id and
+          artifact.status in ["generating", "validation_failed"]
+    )
+    |> Repo.update_all(set: [status: "cancelled", updated_at: now])
+
+    :ok
   end
 
   defp revise_synced_proposal!(proposal, attrs) do
@@ -844,8 +1391,14 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
       |> Repo.one()
 
     case {run, lesson} do
-      {%Run{} = run, %Lesson{} = lesson} -> {run, lesson}
-      _ -> Repo.rollback(:not_found)
+      {%Run{source_schema_version: 3, plan_schema_version: 6} = run, %Lesson{} = lesson} ->
+        {run, lesson}
+
+      {%Run{}, %Lesson{}} ->
+        Repo.rollback(:unsupported_legacy_run)
+
+      _ ->
+        Repo.rollback(:not_found)
     end
   end
 
@@ -927,7 +1480,15 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   end
 
   defp ensure_proposal_transition!(proposal, action) when action in [:reject, :cancel, :omit] do
-    unless proposal.state in ["proposed", "approved"] do
+    unless proposal.state in [
+             "proposed",
+             "researching",
+             "evidence_review",
+             "designing",
+             "artifact_review",
+             "approved",
+             "failed"
+           ] do
       Repo.rollback({:invalid_proposal_state, proposal.state})
     end
 
@@ -938,7 +1499,8 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
     :ok
   end
 
-  defp ensure_proposal_approval_ready!(%{kind: "generated_simulation"}), do: :ok
+  defp ensure_proposal_approval_ready!(%{kind: "generated_simulation"}),
+    do: Repo.rollback(:research_approval_required)
 
   defp ensure_proposal_approval_ready!(proposal) do
     evidence = proposal.research_evidence
@@ -1017,7 +1579,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   end
 
   defp ensure_artifact_transition!(artifact, :reject) do
-    if artifact.status in ["ready_for_review", "validation_failed", "approved"],
+    if artifact.status in ["ready_for_review", "validation_failed"],
       do: :ok,
       else: Repo.rollback({:invalid_artifact_status, artifact.status})
   end
@@ -1030,19 +1592,74 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
 
   defp ensure_generatable_proposal!(proposal) do
     cond do
-      proposal.state != "approved" -> Repo.rollback(:proposal_not_approved)
-      proposal.kind != "generated_simulation" -> Repo.rollback(:not_generated_simulation)
-      true -> :ok
+      proposal.state not in ["designing", "artifact_review"] ->
+        Repo.rollback(:simulation_spec_not_approved)
+
+      proposal.kind != "generated_simulation" ->
+        Repo.rollback(:not_generated_simulation)
+
+      true ->
+        :ok
     end
   end
 
-  defp research_result_attrs({:ok, result}, version) when is_map(result) do
+  defp approve_spec_for_generation!(proposal, expected_id, expected_hash) do
+    spec =
+      Repo.one(
+        from(spec in SimulationSpec,
+          where:
+            spec.proposal_id == ^proposal.id and
+              spec.status in ["ready_for_review", "approved"],
+          order_by: [desc: spec.version],
+          limit: 1,
+          lock: "FOR UPDATE"
+        )
+      ) || Repo.rollback(:simulation_spec_not_ready)
+
+    unless is_binary(expected_id) and is_binary(expected_hash) and spec.id == expected_id and
+             spec.content_hash == expected_hash do
+      Repo.rollback(:stale_simulation_spec)
+    end
+
+    research =
+      latest_research_set(proposal.id, "approved") ||
+        Repo.rollback(:research_approval_required)
+
+    unless spec.research_set_id == research.id and spec.evidence_hash == research.content_hash do
+      Repo.rollback(:stale_simulation_spec)
+    end
+
+    if spec.status == "approved" do
+      spec
+    else
+      now = DateTime.utc_now()
+
+      from(other in SimulationSpec,
+        where:
+          other.proposal_id == ^proposal.id and other.status == "approved" and
+            other.id != ^spec.id
+      )
+      |> Repo.update_all(set: [status: "superseded", updated_at: now])
+
+      persist_update!(
+        SimulationSpec.create_changeset(spec, %{
+          status: "approved",
+          approved_at: now
+        })
+      )
+    end
+  end
+
+  defp research_result_attrs({:ok, result}, proposal) when is_map(result) do
     normalized =
       normalize_attrs(result, [:evidence, :resource_title, :resource_url, :delivery_mode])
 
+    state = if proposal.kind == "generated_simulation", do: "evidence_review", else: "proposed"
+
     %{
+      state: state,
       research_status: "completed",
-      research_version: version,
+      research_version: proposal.research_version,
       research_evidence: normalized[:evidence] || %{},
       research_failure: nil,
       resource_title: normalized[:resource_title],
@@ -1053,16 +1670,118 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
     |> Map.new()
   end
 
-  defp research_result_attrs({:error, reason}, version) do
+  defp research_result_attrs({:error, reason}, proposal) do
     %{
+      state: if(proposal.kind == "generated_simulation", do: "failed", else: "proposed"),
       research_status: "failed",
-      research_version: version,
+      research_version: proposal.research_version,
       research_failure: Failure.sanitize(reason, "research")
     }
   end
 
-  defp research_result_attrs(_result, version) do
-    research_result_attrs({:error, :invalid_research_result}, version)
+  defp research_result_attrs(_result, proposal) do
+    research_result_attrs({:error, :invalid_research_result}, proposal)
+  end
+
+  defp research_set_result_attrs({:ok, result}, _research) when is_map(result) do
+    normalized = normalize_attrs(result, [:evidence])
+    evidence = stringify_keys(normalized[:evidence] || %{})
+
+    %{
+      status: "evidence_review",
+      retrieved_sources: List.wrap(evidence["retrieved_sources"]),
+      proposed_sources: List.wrap(evidence["proposed_sources"]),
+      claims: List.wrap(evidence["claims"]),
+      search_count: evidence["search_count"] || 0,
+      source_count: evidence["source_count"] || 0,
+      provider: evidence["provider"],
+      model: evidence["model"],
+      source_hash: evidence["source_hash"],
+      content_hash: evidence["content_hash"],
+      accessed_at: parse_datetime(evidence["accessed_at"]),
+      validation_payload: %{
+        "status" => "passed",
+        "complete_source_list" => true,
+        "claim_count" => length(List.wrap(evidence["claims"])),
+        "provider_usage" => evidence["provider_usage"] || %{},
+        "duration_ms" => evidence["duration_ms"] || 0
+      },
+      failure: nil
+    }
+  end
+
+  defp research_set_result_attrs({:error, reason}, _research) do
+    %{
+      status: "failed",
+      failure: Failure.sanitize(reason, "research")
+    }
+  end
+
+  defp research_set_result_attrs(_result, research),
+    do: research_set_result_attrs({:error, :invalid_research_result}, research)
+
+  defp simulation_spec_result_attrs({:ok, result}) when is_map(result) do
+    validation = result[:validation] || result["validation"] || %{}
+    history = result[:history] || result["history"] || []
+    duration_ms = result[:duration_ms] || result["duration_ms"] || 0
+
+    %{
+      status: "ready_for_review",
+      spec_payload: result[:spec] || result["spec"] || %{},
+      content_hash: result[:content_hash] || result["content_hash"],
+      provider: result[:provider] || result["provider"],
+      model: result[:model] || result["model"],
+      prompt_version: result[:prompt_version] || result["prompt_version"] || "simulation-spec-v1",
+      repair_count: result[:repair_count] || result["repair_count"] || 0,
+      criticism: result[:criticism] || result["criticism"] || %{},
+      validation_payload:
+        validation
+        |> Map.put("generation_history", history)
+        |> Map.put("duration_ms", duration_ms),
+      failure: nil
+    }
+  end
+
+  defp simulation_spec_result_attrs({:error, reason}) do
+    %{
+      status: "failed",
+      failure: Failure.sanitize(reason, "simulation_spec")
+    }
+  end
+
+  defp simulation_spec_result_attrs(_),
+    do: simulation_spec_result_attrs({:error, :invalid_simulation_spec_result})
+
+  defp parse_datetime(%DateTime{} = value), do: value
+
+  defp parse_datetime(value) when is_binary(value) do
+    case DateTime.from_iso8601(value) do
+      {:ok, parsed, _offset} -> parsed
+      _ -> DateTime.utc_now()
+    end
+  end
+
+  defp parse_datetime(_), do: DateTime.utc_now()
+
+  defp put_result_duration({:ok, result}, duration_ms) when is_map(result) do
+    evidence = result[:evidence] || result["evidence"]
+
+    if is_map(evidence) do
+      key = if Map.has_key?(result, :evidence), do: :evidence, else: "evidence"
+
+      evidence_key =
+        if Enum.any?(Map.keys(evidence), &is_atom/1), do: :duration_ms, else: "duration_ms"
+
+      {:ok, Map.put(result, key, Map.put(evidence, evidence_key, duration_ms))}
+    else
+      {:ok, Map.put(result, :duration_ms, duration_ms)}
+    end
+  end
+
+  defp put_result_duration(result, _duration_ms), do: result
+
+  defp elapsed_milliseconds(started_at) do
+    max(System.monotonic_time(:millisecond) - started_at, 0)
   end
 
   defp artifact_result_attrs({:ok, result}) when is_map(result) do
@@ -1118,6 +1837,33 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
     end
   end
 
+  defp current_research_set(proposal_id, version) do
+    Repo.one(
+      from(record in EnrichmentResearchSet,
+        where: record.proposal_id == ^proposal_id and record.version == ^version
+      )
+    )
+  end
+
+  defp latest_research_set(proposal_id, status) do
+    Repo.one(
+      from(record in EnrichmentResearchSet,
+        where: record.proposal_id == ^proposal_id and record.status == ^status,
+        order_by: [desc: record.version],
+        limit: 1
+      )
+    )
+  end
+
+  defp lock_research_set!(proposal_id, version) do
+    Repo.one(
+      from(record in EnrichmentResearchSet,
+        where: record.proposal_id == ^proposal_id and record.version == ^version,
+        lock: "FOR UPDATE"
+      )
+    ) || Repo.rollback(:research_set_not_found)
+  end
+
   defp lock_artifact!(artifact_id) do
     case Repo.one(
            from(artifact in SimulationArtifact,
@@ -1130,18 +1876,58 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
     end
   end
 
+  defp lock_spec!(spec_id) do
+    Repo.one(from(spec in SimulationSpec, where: spec.id == ^spec_id, lock: "FOR UPDATE")) ||
+      Repo.rollback(:not_found)
+  end
+
   defp lock_reviewable_run!(run_id) do
     case Repo.one(from(run in Run, where: run.id == ^run_id, lock: "FOR UPDATE")) do
-      %Run{status: :awaiting_lesson_approval} = run -> run
-      %Run{status: status} -> Repo.rollback({:run_not_reviewable, status})
-      nil -> Repo.rollback(:not_found)
+      %Run{
+        status: :awaiting_lesson_approval,
+        source_schema_version: 3,
+        plan_schema_version: 6
+      } = run ->
+        run
+
+      %Run{source_schema_version: source, plan_schema_version: plan}
+      when source != 3 or plan != 6 ->
+        Repo.rollback(:unsupported_legacy_run)
+
+      %Run{status: status} ->
+        Repo.rollback({:run_not_reviewable, status})
+
+      nil ->
+        Repo.rollback(:not_found)
+    end
+  end
+
+  defp ensure_run_reviewable(run_id) do
+    case Repo.get(Run, run_id) do
+      %Run{
+        status: :awaiting_lesson_approval,
+        source_schema_version: 3,
+        plan_schema_version: 6
+      } ->
+        :ok
+
+      %Run{source_schema_version: source, plan_schema_version: plan}
+      when source != 3 or plan != 6 ->
+        {:error, :unsupported_legacy_run}
+
+      %Run{status: status} ->
+        {:error, {:run_not_reviewable, status}}
+
+      nil ->
+        {:error, :not_found}
     end
   end
 
   defp fetch_run(run_id) do
     case Repo.get(Run, run_id) do
       nil -> {:error, :not_found}
-      run -> {:ok, run}
+      %Run{source_schema_version: 3, plan_schema_version: 6} = run -> {:ok, run}
+      %Run{} -> {:error, :unsupported_legacy_run}
     end
   end
 
@@ -1172,6 +1958,191 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
     end
   rescue
     _ -> {:error, :not_authorized}
+  end
+
+  defp emit_research_telemetry(
+         {:ok, %EnrichmentProposal{kind: "generated_simulation"} = proposal}
+       ) do
+    case current_research_set(proposal.id, proposal.research_version) do
+      %EnrichmentResearchSet{} = research ->
+        usage = map_value(research.validation_payload, "provider_usage") || %{}
+
+        Telemetry.simulation_stage(
+          :research,
+          telemetry_outcome(research.status),
+          telemetry_scope(research),
+          %{
+            duration_ms: map_value(research.validation_payload, "duration_ms"),
+            input_tokens: sum_metric(usage, "input_tokens"),
+            output_tokens: sum_metric(usage, "output_tokens"),
+            web_search_calls: research.search_count,
+            source_count: research.source_count,
+            provider: research.provider,
+            model: research.model
+          }
+        )
+
+      nil ->
+        :ok
+    end
+  end
+
+  defp emit_research_telemetry(_result), do: :ok
+
+  defp emit_spec_telemetry({:ok, %SimulationSpec{} = spec}) do
+    validation = spec.validation_payload || %{}
+
+    Telemetry.simulation_stage(
+      :specification,
+      telemetry_outcome(spec.status),
+      telemetry_scope(spec),
+      %{
+        duration_ms: map_value(validation, "duration_ms"),
+        input_tokens: sum_metric(validation, "input_tokens"),
+        output_tokens: sum_metric(validation, "output_tokens"),
+        repair_count: spec.repair_count,
+        validation_failures: count_findings(validation),
+        provider: spec.provider,
+        model: spec.model,
+        rendering_mode: map_value(spec.spec_payload, "rendering_mode"),
+        library_ids: map_value(spec.spec_payload, "library_ids")
+      }
+    )
+  end
+
+  defp emit_spec_telemetry(_result), do: :ok
+
+  defp emit_artifact_telemetry({:ok, %SimulationArtifact{} = artifact}) do
+    metadata = artifact.generation_metadata || %{}
+    validation = artifact.validation_payload || %{}
+    browser = map_value(validation, "browser") || %{}
+    sample_results = List.wrap(map_value(browser, "sample_results"))
+
+    Telemetry.simulation_stage(
+      :artifact,
+      telemetry_outcome(artifact.status),
+      telemetry_scope(artifact),
+      %{
+        duration_ms: map_value(metadata, "duration_ms"),
+        input_tokens: sum_metric(metadata, "input_tokens"),
+        output_tokens: sum_metric(metadata, "output_tokens"),
+        repair_count:
+          map_value(metadata, "builder_repair_count") ||
+            map_value(metadata, "source_repair_count") || 0,
+        validation_failures: count_findings(validation),
+        artifact_bytes: artifact.byte_size,
+        capi_sample_count: length(sample_results),
+        capi_sample_failures: Enum.count(sample_results, &(map_value(&1, "passed") != true)),
+        provider: map_value(metadata, "provider"),
+        model: map_value(metadata, "model"),
+        rendering_mode: map_value(validation, "rendering_mode"),
+        library_ids: map_value(artifact.bundle_manifest, "library_ids")
+      }
+    )
+  end
+
+  defp emit_artifact_telemetry(_result), do: :ok
+
+  defp emit_author_decision({:ok, record} = result, decision) do
+    Telemetry.simulation_author_decision(decision, telemetry_scope(record))
+    result
+  end
+
+  defp emit_author_decision(result, _decision), do: result
+
+  defp telemetry_scope(%EnrichmentResearchSet{} = research) do
+    %{
+      run_id: research.run_id,
+      lesson_id: research.lesson_id,
+      proposal_id: research.proposal_id,
+      record_id: research.id,
+      version: research.version
+    }
+  end
+
+  defp telemetry_scope(%SimulationSpec{} = spec) do
+    %{
+      run_id: spec.run_id,
+      lesson_id: spec.lesson_id,
+      proposal_id: spec.proposal_id,
+      record_id: spec.id,
+      version: spec.version
+    }
+  end
+
+  defp telemetry_scope(%SimulationArtifact{} = artifact) do
+    %{
+      run_id: artifact.run_id,
+      lesson_id: artifact.lesson_id,
+      proposal_id: artifact.proposal_id,
+      record_id: artifact.id,
+      version: artifact.version
+    }
+  end
+
+  defp telemetry_scope(%EnrichmentProposal{} = proposal) do
+    %{
+      run_id: proposal.run_id,
+      lesson_id: proposal.lesson_id,
+      proposal_id: proposal.id,
+      record_id: proposal.id,
+      version: proposal.version
+    }
+  end
+
+  defp telemetry_scope(_record), do: %{}
+
+  defp telemetry_outcome("evidence_review"), do: :ready_for_review
+  defp telemetry_outcome("ready_for_review"), do: :ready_for_review
+  defp telemetry_outcome("approved"), do: :approved
+  defp telemetry_outcome("rejected"), do: :rejected
+  defp telemetry_outcome("omitted"), do: :omitted
+  defp telemetry_outcome("cancelled"), do: :cancelled
+  defp telemetry_outcome("superseded"), do: :superseded
+  defp telemetry_outcome("failed"), do: :failed
+  defp telemetry_outcome("validation_failed"), do: :failed
+  defp telemetry_outcome(_status), do: :unknown
+
+  defp sum_metric(value, metric) when is_map(value) do
+    own = map_value(value, metric)
+    own = if is_number(own) and own >= 0, do: own, else: 0
+
+    own +
+      (value
+       |> Map.values()
+       |> Enum.map(&sum_metric(&1, metric))
+       |> Enum.sum())
+  end
+
+  defp sum_metric(value, metric) when is_list(value) do
+    value |> Enum.map(&sum_metric(&1, metric)) |> Enum.sum()
+  end
+
+  defp sum_metric(_value, _metric), do: 0
+
+  defp count_findings(value) when is_map(value) do
+    own = if is_binary(map_value(value, "code")), do: 1, else: 0
+    own + (value |> Map.values() |> Enum.map(&count_findings/1) |> Enum.sum())
+  end
+
+  defp count_findings(value) when is_list(value),
+    do: value |> Enum.map(&count_findings/1) |> Enum.sum()
+
+  defp count_findings(_value), do: 0
+
+  defp map_value(value, key) when is_map(value) do
+    atom_key = if is_binary(key), do: safe_existing_atom(key), else: key
+
+    Map.get(value, key) ||
+      if(atom_key, do: Map.get(value, atom_key), else: nil)
+  end
+
+  defp map_value(_value, _key), do: nil
+
+  defp safe_existing_atom(value) do
+    String.to_existing_atom(value)
+  rescue
+    ArgumentError -> nil
   end
 
   defp normalize_ranked_proposals(proposals) do
@@ -1219,6 +2190,22 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
       end
     end)
   end
+
+  defp stringify_attempt_payloads(attrs) do
+    attrs
+    |> Map.update(:findings, [], fn findings ->
+      findings |> List.wrap() |> Enum.take(30) |> stringify_keys()
+    end)
+    |> Map.update(:validation_summary, %{}, &stringify_keys/1)
+    |> Map.update(:criticism, %{}, &stringify_keys/1)
+    |> Map.update(:model_usage, %{}, &stringify_keys/1)
+  end
+
+  defp stringify_keys(value) when is_map(value),
+    do: Map.new(value, fn {key, item} -> {to_string(key), stringify_keys(item)} end)
+
+  defp stringify_keys(value) when is_list(value), do: Enum.map(value, &stringify_keys/1)
+  defp stringify_keys(value), do: value
 
   defp validate_decision_reason(:approve, _reason), do: :ok
 

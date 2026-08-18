@@ -50,9 +50,24 @@ config :oli,
          openstax_advanced_pages_v6_default
        )
 
+pilot_default = if runtime_env == :dev, do: "true", else: "false"
+
 config :oli,
        :openstax_generated_enrichment_enabled,
-       get_env_as_boolean.("OPENSTAX_GENERATED_ENRICHMENT_ENABLED", "false")
+       get_env_as_boolean.("OPENSTAX_GENERATED_ENRICHMENT_ENABLED", pilot_default)
+
+config :oli,
+  openstax_web_research_enabled:
+    get_env_as_boolean.("OPENSTAX_WEB_RESEARCH_ENABLED", pilot_default),
+  openstax_three_d_generation_enabled:
+    get_env_as_boolean.("OPENSTAX_THREE_D_GENERATION_ENABLED", pilot_default),
+  openstax_generated_simulation_delivery_enabled:
+    get_env_as_boolean.("OPENSTAX_GENERATED_SIMULATION_DELIVERY_ENABLED", pilot_default),
+  openstax_generated_simulation_kill_switch:
+    get_env_as_boolean.(
+      "OPENSTAX_GENERATED_SIMULATION_KILL_SWITCH",
+      if(runtime_env == :dev, do: "false", else: "true")
+    )
 
 openstax_course_import_max_parallel_lessons =
   case System.get_env("OPENSTAX_COURSE_IMPORT_MAX_PARALLEL_LESSONS", "3")
@@ -470,8 +485,14 @@ if runtime_env == :prod do
 
   enrichment_generator =
     case System.get_env("OPENSTAX_ENRICHMENT_GENERATOR", "disabled") do
-      "template" -> Oli.OpenStax.CourseImport.Enrichment.Generator.Template
-      _ -> Oli.OpenStax.CourseImport.Enrichment.Generator.Disabled
+      "template" ->
+        Oli.OpenStax.CourseImport.Enrichment.Generator.Template
+
+      "untrusted_generated" ->
+        Oli.OpenStax.CourseImport.Enrichment.Generator.UntrustedGenerated
+
+      _ ->
+        Oli.OpenStax.CourseImport.Enrichment.Generator.Disabled
     end
 
   enrichment_resource_catalog =
@@ -508,9 +529,10 @@ if runtime_env == :prod do
     openstax_generated_simulation_csp_header_enforced:
       get_env_as_boolean.("GENERATED_SIMULATION_CSP_HEADER_ENFORCED", "false"),
     openstax_enrichment_generator: enrichment_generator,
-    openstax_enrichment_research: Oli.OpenStax.CourseImport.Enrichment.Research.Catalog,
+    openstax_enrichment_research:
+      Oli.OpenStax.CourseImport.Enrichment.Research.ResponsesWebSearch,
     openstax_enrichment_resource_catalog: enrichment_resource_catalog,
-    openstax_enrichment_sandbox: Oli.OpenStax.CourseImport.Enrichment.Sandbox.LocalContainer,
+    openstax_enrichment_sandbox: Oli.OpenStax.CourseImport.Enrichment.Sandbox.BrowserContainer,
     openstax_enrichment_artifact_storage:
       Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media,
     email_from_name: System.get_env("EMAIL_FROM_NAME", "OLI Torus"),

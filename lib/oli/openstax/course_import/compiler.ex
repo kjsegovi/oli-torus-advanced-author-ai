@@ -37,7 +37,13 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
 
   def dry_run(_, _), do: {:error, :invalid_run}
 
-  defp require_current_run_schema(%{plan_schema_version: 6}), do: :ok
+  defp require_current_run_schema(%{plan_schema_version: 6, source_schema_version: 3}), do: :ok
+
+  defp require_current_run_schema(%{
+         plan_schema_version: plan_version,
+         source_schema_version: source_version
+       }),
+       do: {:error, {:unsupported_openstax_schema_contract, source_version, plan_version}}
 
   defp require_current_run_schema(%{plan_schema_version: version}),
     do: {:error, {:unsupported_openstax_plan_schema, version}}
@@ -156,6 +162,9 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
         plan_mode != "advanced" ->
           {:error, :generated_enrichment_requires_advanced_authoring}
 
+        not generated_delivery_enabled?(opts) ->
+          {:ok, remove_generated_references(content)}
+
         true ->
           inject_generated_proposals_v6(content, generated)
       end
@@ -163,19 +172,144 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
   end
 
   defp inject_generated_proposals_v6(content, proposals) do
-    approved_ids = MapSet.new(proposals, & &1.id)
-    references = get_in(content, ["experience_blueprint", "enrichment_references"]) |> List.wrap()
-
-    cond do
-      references == [] ->
-        {:error, :approved_simulation_has_no_declared_v6_slot}
-
-      Enum.any?(references, &(not MapSet.member?(approved_ids, &1["proposal_id"]))) ->
-        {:error, :unapproved_v6_enrichment_reference}
-
-      true ->
-        {:ok, content}
+    with {:ok, references} <- build_generated_references(proposals),
+         {:ok, blueprint} <-
+           place_generated_references(content["experience_blueprint"], references) do
+      {:ok, Map.put(content, "experience_blueprint", blueprint)}
     end
+  end
+
+  defp build_generated_references(proposals) do
+    proposals
+    |> Enum.sort_by(& &1.rank)
+    |> Enum.reduce_while({:ok, []}, fn proposal, {:ok, references} ->
+      artifacts = Map.get(proposal, :simulation_artifacts, [])
+      specs = Map.get(proposal, :simulation_specs, [])
+      research_sets = Map.get(proposal, :research_sets, [])
+      artifact = Enum.find(artifacts, &(&1.status == "approved"))
+
+      spec =
+        case artifact do
+          nil -> nil
+          artifact -> Enum.find(specs, &(&1.id == artifact.simulation_spec_id))
+        end
+
+      research =
+        case spec do
+          nil -> nil
+          spec -> Enum.find(research_sets, &(&1.id == spec.research_set_id))
+        end
+
+      stage_id = get_in(proposal.placement || %{}, ["stage_id"])
+      planner_id = get_in(proposal.metadata || %{}, ["planner_id"])
+
+      if (artifact && spec && research && spec.status == "approved") and
+           research.status == "approved" and spec.evidence_hash == research.content_hash and
+           is_binary(stage_id) and is_binary(planner_id) do
+        reference = %{
+          "proposal_id" => proposal.id,
+          "planner_id" => planner_id,
+          "stage_id" => stage_id,
+          "simulation_spec_id" => spec.id,
+          "artifact_id" => artifact.id,
+          "native_follow_up" => true,
+          "remediation" => true
+        }
+
+        {:cont, {:ok, references ++ [reference]}}
+      else
+        {:halt, {:error, {:approved_generated_enrichment_invalid, proposal.id}}}
+      end
+    end)
+  end
+
+  defp place_generated_references(blueprint, references) when is_map(blueprint) do
+    stages = List.wrap(blueprint["stages"])
+    activities = List.wrap(blueprint["activities"])
+
+    with true <-
+           length(Enum.map(references, & &1["stage_id"])) ==
+             length(Enum.uniq(Enum.map(references, & &1["stage_id"]))),
+         {:ok, placements} <- reference_activity_placements(stages, references),
+         true <-
+           length(Enum.map(placements, &elem(&1, 0))) ==
+             length(Enum.uniq(Enum.map(placements, &elem(&1, 0)))) do
+      proposal_by_activity = Map.new(placements)
+
+      tagged =
+        Enum.map(activities, fn activity ->
+          case Map.fetch(proposal_by_activity, activity["id"]) do
+            {:ok, proposal_id} -> Map.put(activity, "enrichment_proposal_id", proposal_id)
+            :error -> activity
+          end
+        end)
+
+      {:ok,
+       blueprint
+       |> Map.put("activities", tagged)
+       |> Map.put("enrichment_references", references)}
+    else
+      false -> {:error, :generated_simulation_placement_conflict}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp place_generated_references(_blueprint, _references),
+    do: {:error, :missing_experience_blueprint}
+
+  defp reference_activity_placements(stages, references) do
+    Enum.reduce_while(references, {:ok, []}, fn reference, {:ok, placements} ->
+      stage = Enum.find(stages, &(&1["id"] == reference["stage_id"]))
+
+      activity_id =
+        stage
+        |> case do
+          %{} -> Map.get(stage, "items", [])
+          _ -> []
+        end
+        |> Enum.find_value(fn
+          %{"kind" => "activity", "ref_id" => id} when is_binary(id) -> id
+          _ -> nil
+        end)
+
+      if is_binary(activity_id) do
+        {:cont, {:ok, placements ++ [{activity_id, reference["proposal_id"]}]}}
+      else
+        {:halt, {:error, :approved_simulation_has_no_native_follow_up}}
+      end
+    end)
+  end
+
+  defp remove_generated_references(content) do
+    update_in(
+      content,
+      [Access.key("experience_blueprint", %{})],
+      fn blueprint ->
+        blueprint
+        |> Map.put("enrichment_references", [])
+        |> Map.update("activities", [], fn activities ->
+          Enum.map(List.wrap(activities), &Map.delete(&1, "enrichment_proposal_id"))
+        end)
+      end
+    )
+  end
+
+  defp generated_delivery_enabled?(opts) do
+    enabled =
+      Keyword.get(
+        opts,
+        :generated_simulation_delivery_enabled,
+        Application.get_env(:oli, :openstax_generated_simulation_delivery_enabled, false)
+      )
+
+    kill_switch =
+      Keyword.get(
+        opts,
+        :generated_simulation_kill_switch,
+        Application.get_env(:oli, :openstax_generated_simulation_kill_switch, true)
+      )
+
+    enabled and not kill_switch
   end
 
   defp put_run_plan_schema_version(opts, run) do

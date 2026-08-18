@@ -32,7 +32,8 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulation do
   def resolve(proposal_id, opts) when is_binary(proposal_id) and is_list(opts) do
     proposal_id = String.trim(proposal_id)
 
-    with true <- proposal_id != "",
+    with :ok <- require_delivery_enabled(opts),
+         true <- proposal_id != "",
          {:ok, artifact} <- resolve_artifact(proposal_id, opts),
          :ok <- validate_artifact(artifact, proposal_id),
          {:ok, artifact_url} <- resolve_artifact_url(artifact, opts),
@@ -48,6 +49,26 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulation do
   end
 
   def resolve(_, _), do: {:error, :invalid_enrichment_proposal_id}
+
+  defp require_delivery_enabled(opts) do
+    enabled =
+      Keyword.get(
+        opts,
+        :generated_simulation_delivery_enabled,
+        Application.get_env(:oli, :openstax_generated_simulation_delivery_enabled, false)
+      )
+
+    kill_switch =
+      Keyword.get(
+        opts,
+        :generated_simulation_kill_switch,
+        Application.get_env(:oli, :openstax_generated_simulation_kill_switch, true)
+      )
+
+    if enabled and not kill_switch,
+      do: :ok,
+      else: {:error, :generated_simulation_delivery_disabled}
+  end
 
   defp resolve_artifact(proposal_id, opts) do
     case Keyword.get(opts, :simulation_artifact_resolver) do

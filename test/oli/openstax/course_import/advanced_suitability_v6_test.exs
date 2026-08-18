@@ -2,6 +2,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedSuitabilityV6Test do
   use ExUnit.Case, async: true
 
   alias Oli.OpenStax.CourseImport.AdvancedSuitabilityV6
+  alias Oli.OpenStax.CourseImport.SimulationPilotCorpus
   alias Oli.OpenStax.CourseImport.V6Fixture, as: Fixture
 
   test "routes Chapter Outline to Basic regardless of length" do
@@ -51,6 +52,33 @@ defmodule Oli.OpenStax.CourseImport.AdvancedSuitabilityV6Test do
     assert assessment["maximum_supported_minutes"] in 45..75
     assert "quantitative_investigation" in assessment["affordances"]
     assert assessment["evidence_block_ids"] != []
+  end
+
+  test "calibrates two evidence-rich golden lessons in every supported domain" do
+    golden_lessons = SimulationPilotCorpus.golden_lessons()
+
+    assert golden_lessons
+           |> Enum.frequencies_by(& &1["domain"])
+           |> Map.values()
+           |> Enum.all?(&(&1 == 2))
+
+    for lesson <- golden_lessons do
+      domain = lesson["domain"]
+      title = lesson["title"]
+      assessment = AdvancedSuitabilityV6.assess(lesson)
+
+      assert assessment["candidate"], "expected #{domain} golden lesson #{title} to qualify"
+      assert assessment["mode"] == "advanced"
+      assert assessment["expected_depth_minutes"] in 45..75
+      assert "quantitative_investigation" in assessment["affordances"]
+      assert "evidence_analysis" in assessment["affordances"]
+      assert "multi_step_problem" in assessment["affordances"]
+      assert assessment["evidence_block_ids"] == lesson["expected_evidence_block_ids"]
+
+      assert Enum.all?(lesson["source_blocks"], fn block ->
+               get_in(block, ["source_locator", "url"]) == lesson["source_url"]
+             end)
+    end
   end
 
   defp block(id, kind, text),

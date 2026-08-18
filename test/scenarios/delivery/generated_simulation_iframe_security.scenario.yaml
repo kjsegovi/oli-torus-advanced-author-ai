@@ -1,126 +1,55 @@
-# Scenario: approved generated-simulation iframe metadata survives delivery.
-#
-# The adaptive activity below represents compiler output after trusted artifact
-# resolution. It deliberately exercises only directives that Oli.Scenarios
-# already supports; proposal approval and bundle generation remain covered by
-# their focused workflow tests.
+# Scenario: imported OpenStax evidence becomes one approved, validated,
+# content-addressed simulation and survives publication into learner delivery.
 
-- project:
-    name: "generated_simulation_project"
-    title: "Generated Simulation Security Project"
-    root:
-      children:
-        - page: "Observe Gas Pressure"
+scenario:
+  tags: ["openstax", "generated_simulation", "workflow"]
+  timeout_ms: 120000
+  reason: "Covers the seeded schema-6 simulation lifecycle through real Torus contexts."
 
-- create_activity:
-    project: "generated_simulation_project"
-    title: "Approved Gas Pressure Simulation"
-    virtual_id: "approved_gas_pressure_simulation"
-    scope: "embedded"
-    type: "oli_adaptive"
-    content_format: "json"
-    content:
-      custom:
-        height: 520
-        width: 1200
-      authoring:
-        parts:
-          - id: "generated_simulation_iframe"
-            type: "janus-capi-iframe"
-            owner: "aa_import_layout"
-            inherited: false
-        rules: []
-        variablesRequiredForEvaluation: []
-        activitiesRequiredForEvaluation: []
-      partsLayout:
-        - id: "generated_simulation_iframe"
-          type: "janus-capi-iframe"
-          custom:
-            src: "https://simulations.example.edu/generated-simulations/artifacts/artifact-gas-pressure-v1/v1/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/index.html"
-            title: "Gas pressure model"
-            description: "Change volume and observe the resulting pressure."
-            allowScrolling: false
-            customCssClass: ""
-            height: 360
-            maxScore: 1
-            requiresManualGrading: false
-            responsiveLayoutWidth: 960
-            width: 100
-            x: 0
-            y: 80
-            z: 0
-            securityProfile: "generated_simulation"
-            artifactIdentity:
-              proposalId: "proposal-gas-pressure"
-              artifactId: "artifact-gas-pressure-v1"
-              version: 1
-              contentHash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-              storageOrigin: "https://simulations.example.edu"
-            capiInputs:
-              - key: "volume"
-                type: "number"
-                defaultValue: 1
-            capiOutputs:
-              - key: "pressure"
-                type: "number"
-                defaultValue: 0
-            configData:
-              - key: "volume"
-                type: 1
-                value: 1
-                readonly: false
-                writeonly: false
-              - key: "pressure"
-                type: 1
-                value: 0
-                readonly: true
-                writeonly: false
-
-- edit_page:
-    project: "generated_simulation_project"
-    page: "Observe Gas Pressure"
-    content: |
-      title: "Observe Gas Pressure"
-      graded: false
-      blocks:
-        - type: prose
-          body_md: "Observe the simulation, then explain the pressure change."
-        - type: activity_reference
-          virtual_id: "approved_gas_pressure_simulation"
-
-- hook:
-    function: "Oli.Scenarios.Delivery.GeneratedSimulationIframeHooks.assert_authoring_metadata/1"
-
-- publish:
-    to: "generated_simulation_project"
-    description: "Publish approved generated simulation"
-
-- section:
-    name: "generated_simulation_section"
-    title: "Generated Simulation Security Section"
-    from: "generated_simulation_project"
-
-- user:
-    name: "simulation_student"
-    type: "student"
-    email: "simulation_student@example.com"
-
-- enroll:
-    user: "simulation_student"
-    section: "generated_simulation_section"
-    role: "student"
-
-- view_practice_page:
-    student: "simulation_student"
-    section: "generated_simulation_section"
-    page: "Observe Gas Pressure"
-
-- assert:
-    structure:
-      to: "generated_simulation_section"
+directives:
+  - project:
+      name: "generated_simulation_project"
+      title: "Generated Simulation Security Project"
       root:
         children:
           - page: "Observe Gas Pressure"
 
-- hook:
-    function: "Oli.Scenarios.Delivery.GeneratedSimulationIframeHooks.assert_delivery_metadata/1"
+  - hook:
+      function: "Oli.Scenarios.Delivery.GeneratedSimulationWorkflowHooks.generate_validate_and_attach/1"
+
+  - hook:
+      function: "Oli.Scenarios.Delivery.GeneratedSimulationIframeHooks.assert_authoring_metadata/1"
+
+  - publish:
+      to: "generated_simulation_project"
+      description: "Publish approved generated simulation"
+
+  - section:
+      name: "generated_simulation_section"
+      title: "Generated Simulation Security Section"
+      from: "generated_simulation_project"
+
+  - user:
+      name: "simulation_student"
+      type: "student"
+      email: "simulation_student@example.com"
+
+  - enroll:
+      user: "simulation_student"
+      section: "generated_simulation_section"
+      role: "student"
+
+  - view_practice_page:
+      student: "simulation_student"
+      section: "generated_simulation_section"
+      page: "Observe Gas Pressure"
+
+  - assert:
+      structure:
+        to: "generated_simulation_section"
+        root:
+          children:
+            - page: "Observe Gas Pressure"
+
+  - hook:
+      function: "Oli.Scenarios.Delivery.GeneratedSimulationIframeHooks.assert_delivery_metadata/1"

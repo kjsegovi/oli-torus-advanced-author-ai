@@ -91,8 +91,43 @@ defmodule Oli.OpenStax.CourseImport.SchemaCutoverTest do
              Oli.OpenStax.CourseImport.Parser.build_outline(snapshot, plan_schema_version: 4)
   end
 
-  test "legacy purge refuses production before reading or changing data" do
-    assert {:error, :legacy_purge_forbidden} =
-             Oli.OpenStax.CourseImport.LegacyPurge.purge_all(environment: :prod)
+  test "legacy cleanup commands and exact-v6 constraints are absent" do
+    refute File.exists?(Path.join(@root, "lib/oli/openstax/course_import/legacy_purge.ex"))
+
+    refute File.exists?(Path.join(@root, "lib/mix/tasks/openstax.purge_legacy_imports.ex"))
+
+    assert File.exists?(
+             Path.join(
+               @root,
+               "priv/repo/migrations/20260812131000_enforce_openstax_v6_cutover.exs"
+             )
+           )
+
+    migration_source =
+      @root
+      |> Path.join("priv/repo/migrations/*openstax*v6*.exs")
+      |> Path.wildcard()
+      |> Enum.map_join("\n", &File.read!/1)
+
+    refute migration_source =~ "source_schema_version = 3 AND plan_schema_version = 6"
+    refute migration_source =~ "DELETE FROM"
+    refute migration_source =~ "UPDATE course_import"
+  end
+
+  test "pilot migrations contain no legacy project, run, resource, media, job, or artifact rewrite" do
+    migration_source =
+      @root
+      |> Path.join("priv/repo/migrations/20260817*.exs")
+      |> Path.wildcard()
+      |> Enum.map_join("\n", &File.read!/1)
+
+    for table <-
+          ~w(projects course_import_runs resources revisions course_import_media oban_jobs course_import_simulation_artifacts) do
+      refute Regex.match?(
+               ~r/\b(?:UPDATE|DELETE\s+FROM|TRUNCATE)\s+#{table}\b/i,
+               migration_source
+             ),
+             "pilot migration must not rewrite or delete legacy rows in #{table}"
+    end
   end
 end

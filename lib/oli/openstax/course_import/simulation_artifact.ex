@@ -14,7 +14,13 @@ defmodule Oli.OpenStax.CourseImport.SimulationArtifact do
   alias Oli.Accounts.Author
   alias Oli.Authoring.Course.Project
 
-  alias Oli.OpenStax.CourseImport.{EnrichmentProposal, Lesson, Run}
+  alias Oli.OpenStax.CourseImport.{
+    EnrichmentProposal,
+    Lesson,
+    Run,
+    SimulationArtifactAttempt,
+    SimulationSpec
+  }
 
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
@@ -28,8 +34,11 @@ defmodule Oli.OpenStax.CourseImport.SimulationArtifact do
     belongs_to :project, Project, type: :id
     belongs_to :run, Run
     belongs_to :lesson, Lesson
+    belongs_to :simulation_spec, SimulationSpec
     belongs_to :approved_by_author, Author, type: :id
     belongs_to :decided_by_author, Author, type: :id
+
+    has_many :attempts, SimulationArtifactAttempt, foreign_key: :artifact_id
 
     field :version, :integer
     field :status, :string, default: "generating"
@@ -72,6 +81,7 @@ defmodule Oli.OpenStax.CourseImport.SimulationArtifact do
       :project_id,
       :run_id,
       :lesson_id,
+      :simulation_spec_id,
       :version,
       :status,
       :generator_name,
@@ -97,6 +107,7 @@ defmodule Oli.OpenStax.CourseImport.SimulationArtifact do
     |> foreign_key_constraint(:project_id)
     |> foreign_key_constraint(:run_id)
     |> foreign_key_constraint(:lesson_id)
+    |> foreign_key_constraint(:simulation_spec_id)
   end
 
   def preview_changeset(artifact, attrs) do

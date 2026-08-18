@@ -5,6 +5,9 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
   alias Oli.OpenStax.CourseImport.{AdvancedPlanV6, AuthoringCompiler, BasicPlanV5}
   alias Oli.OpenStax.CourseImport.V6Fixture, as: Fixture
 
+  @proposal_id "00000000-0000-4000-8000-000000000006"
+  @artifact_hash String.duplicate("c", 64)
+
   test "compiles every schema 6 activity once with a default incorrect response" do
     lesson = Fixture.lesson()
 
@@ -54,6 +57,71 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
     |> Enum.each(fn activity ->
       assert has_default_incorrect_response?(activity["model"])
     end)
+  end
+
+  test "compiles rich stages and immutable source blocks into coherent multi-part screens" do
+    content = rich_content()
+
+    assert {:ok, compiled} = compile(content, "rich-advanced-v6")
+
+    stage =
+      Enum.find(compiled["activities"], &(&1["key"] == "rich-advanced-v6:v6:stage:investigation"))
+
+    evidence =
+      Enum.find(
+        compiled["activities"],
+        &(&1["key"] == "rich-advanced-v6:v6:group:evidence-group")
+      )
+
+    assert length(get_in(stage, ["model", "partsLayout"])) == 13
+    assert length(get_in(evidence, ["model", "partsLayout"])) == 4
+
+    stage_text = Jason.encode!(stage["model"])
+    evidence_text = Jason.encode!(evidence["model"])
+
+    assert stage_text =~ "Commit to a prediction"
+    assert stage_text =~ "Record what the evidence shows"
+    assert stage_text =~ "Test a changed condition"
+    assert evidence_text =~ "Analyze quantitative data"
+    assert evidence_text =~ "First calculate the predicted value"
+
+    refute Enum.any?(compiled["activities"], &String.contains?(&1["key"], ":block:"))
+  end
+
+  test "places an approved simulation on the architect-selected native follow-up" do
+    content =
+      rich_content()
+      |> put_in(
+        ["experience_blueprint", "enrichment_references"],
+        [%{"proposal_id" => @proposal_id, "stage_id" => "investigation"}]
+      )
+      |> update_in(["experience_blueprint", "activities"], fn activities ->
+        Enum.map(activities, fn
+          %{"id" => "activity-1"} = activity ->
+            Map.put(activity, "enrichment_proposal_id", @proposal_id)
+
+          activity ->
+            activity
+        end)
+      end)
+
+    assert {:ok, compiled} =
+             compile(content, "explicit-simulation-follow-up",
+               simulation_artifact_resolver: fn @proposal_id -> {:ok, simulation_artifact()} end,
+               simulation_artifact_url_resolver: fn _artifact ->
+                 {:ok, "https://media.example.edu/bundles/#{@artifact_hash}/index.html"}
+               end,
+               generated_simulation_origins: ["https://media.example.edu"],
+               generated_simulation_delivery_enabled: true,
+               generated_simulation_kill_switch: false
+             )
+
+    first = Enum.find(compiled["activities"], &String.ends_with?(&1["key"], ":activity-1"))
+    selected = Enum.find(compiled["activities"], &String.ends_with?(&1["key"], ":activity-3"))
+
+    refute Jason.encode!(first["model"]) =~ "generated_simulation"
+    assert Jason.encode!(selected["model"]) =~ "generated_simulation"
+    assert Jason.encode!(selected["model"]) =~ @proposal_id
   end
 
   test "rejects legacy and mixed schema combinations at compilation" do
@@ -162,6 +230,10 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
       Fixture.architecture_candidate()
       |> put_in(["experience_blueprint", "activity_slots"], slots)
       |> put_in(
+        ["experience_blueprint", "stages", Access.at(0), "native_follow_up_slot_id"],
+        "type-slot-3"
+      )
+      |> put_in(
         ["experience_blueprint", "stages", Access.at(0), "items"],
         [%{"kind" => "content_group", "ref_id" => "evidence-group"}] ++
           Enum.map(1..length(types), fn index ->
@@ -223,6 +295,58 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
   end
 
   defp occurrences(text, pattern), do: length(String.split(text, pattern)) - 1
+
+  defp rich_content do
+    {:ok, architecture} =
+      AdvancedPlanV6.build_architecture(Fixture.architecture_candidate(), Fixture.lesson(), 1)
+
+    {:ok, content} =
+      AdvancedPlanV6.attach_activities(
+        architecture,
+        Fixture.activity_candidate(),
+        Fixture.lesson()
+      )
+
+    content
+  end
+
+  defp compile(content, stable_key, extra_opts \\ []) do
+    AuthoringCompiler.compile(
+      "advanced",
+      content["title"],
+      content,
+      %{"items" => []},
+      stable_key,
+      [
+        media_urls: %{
+          "figure-1" => "https://example.edu/figure-1.png",
+          "figure-2" => "https://example.edu/figure-2.png",
+          "figure-3" => "https://example.edu/figure-3.png"
+        }
+      ] ++ extra_opts
+    )
+  end
+
+  defp simulation_artifact do
+    %{
+      id: "artifact-explicit-follow-up",
+      proposal_id: @proposal_id,
+      status: "approved",
+      version: 1,
+      content_hash: @artifact_hash,
+      storage_provider: "local",
+      storage_state: "promoted",
+      storage_key: "bundles/#{@artifact_hash}/index.html",
+      storage_origin: "https://media.example.edu",
+      manifest: %{"entrypoint" => "index.html"},
+      capi_manifest: %{"inputs" => [], "outputs" => []},
+      accessibility_metadata: %{
+        "title" => "Evidence model",
+        "description" => "Change a value and observe the model response."
+      },
+      validation_payload: %{"status" => "passed"}
+    }
+  end
 
   defp has_default_incorrect_response?(value) when is_map(value) do
     default_incorrect_here? =

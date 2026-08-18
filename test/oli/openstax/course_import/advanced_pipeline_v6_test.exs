@@ -40,6 +40,49 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPipelineV6Test do
     assert_receive {:checkpoint, "advanced_approved", _}
   end
 
+  test "architect receives the rich connective-material contract without renderer authority" do
+    parent = self()
+
+    execution = fn context, messages, _service ->
+      if context.phase == :v6_experience_architect do
+        send(parent, {:architect_system_prompt, hd(messages).content})
+        send(parent, {:architect_contract, messages |> Enum.at(1) |> Map.fetch!(:content)})
+      end
+
+      candidate =
+        if context.phase == :v6_experience_architect,
+          do: Fixture.architecture_candidate(),
+          else: Fixture.activity_candidate()
+
+      {:ok, %{content: Jason.encode!(candidate), metadata: %{}}}
+    end
+
+    assert {:ok, _result} =
+             AdvancedPipelineV6.plan(Fixture.lesson(), 1, services(),
+               v6_execution_fun: execution,
+               advanced_content_critic_fun: fn _lesson, _content, _service, _opts ->
+                 {:ok, approved_review(0.97)}
+               end,
+               advanced_activity_critic_fun: fn _lesson, _content, _service, _opts ->
+                 {:ok, approved_review(0.95)}
+               end
+             )
+
+    assert_receive {:architect_system_prompt, prompt}
+    assert prompt =~ "compact connective instruction"
+    assert prompt =~ "source-grounded prediction"
+    assert prompt =~ "native_follow_up_slot_id"
+    assert prompt =~ "Do not emit rules"
+
+    assert_receive {:architect_contract, encoded_contract}
+    contract = Jason.decode!(encoded_contract)
+
+    assert contract["required_guidance_kinds"] ==
+             ~w(prediction observation interpretation transfer synthesis)
+
+    assert "predict_observe_explain" in contract["allowed_presentation_patterns"]
+  end
+
   test "never falls back when the provider fails" do
     assert {:error, {:provider_failed, :v6_experience_architect, :timeout}} =
              AdvancedPipelineV6.plan(Fixture.lesson(), 1, services(),

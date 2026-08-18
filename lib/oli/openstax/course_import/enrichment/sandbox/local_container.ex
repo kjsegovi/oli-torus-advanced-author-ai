@@ -1,6 +1,6 @@
 defmodule Oli.OpenStax.CourseImport.Enrichment.Sandbox.LocalContainer do
   @moduledoc """
-  Validates dependency-free simulation bundles in a disposable local container.
+  Validates assembled simulation bundles in a disposable local container.
 
   The container receives a read-only bundle mount, no network, no credentials,
   no Linux capabilities, a read-only root filesystem, and bounded CPU, memory,
@@ -11,12 +11,13 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Sandbox.LocalContainer do
 
   @behaviour Oli.OpenStax.CourseImport.Enrichment.Sandbox
 
+  alias Oli.OpenStax.CourseImport.Enrichment.LibraryRegistry
   alias Oli.OpenStax.CourseImport.Enrichment.Sandbox.CapiBridge
 
-  @default_image "node:22-alpine"
-  @max_files 16
-  @max_file_bytes 250_000
-  @max_bundle_bytes 500_000
+  @default_image "torus/openstax-simulation-validator:1"
+  @max_files 32
+  @max_file_bytes 2_000_000
+  @max_bundle_bytes 4_000_000
   @allowed_extensions ~w(.html .css .js .json .svg)
   @required_csp_directives %{
     "default-src" => ["'none'"],
@@ -63,7 +64,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Sandbox.LocalContainer do
     ~r/\.\s*href\s*=/i,
     ~r/\bcreateElement\s*\(/i,
     ~r/\bdocument\s*\.\s*write(?:ln)?\s*\(/i,
-    ~r/\bpostMessage\s*\([^,]+,\s*["']\*["']/i,
+    ~r/\bpostMessage\s*\(/i,
     ~r/\bimport\s*\(/i
   ]
 
@@ -87,9 +88,12 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Sandbox.LocalContainer do
     with {:ok, files} <- normalize_files(bundle),
          {:ok, files, capi_manifest} <-
            CapiBridge.prepare(files, bundle[:capi_manifest] || bundle["capi_manifest"]),
+         system_manifest <-
+           bundle[:system_library_manifest] || bundle["system_library_manifest"] || %{},
          :ok <- validate_file_set(files),
+         :ok <- validate_system_libraries(files, system_manifest),
          {:ok, document} <- validate_html(files),
-         :ok <- validate_javascript(files, capi_manifest),
+         :ok <- validate_javascript(files, capi_manifest, system_manifest),
          :ok <- validate_stylesheets(files),
          {:ok, accessibility} <- accessibility_metadata(document),
          {:ok, validation_payload} <- run_disposable_container(files, opts) do
@@ -105,7 +109,12 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Sandbox.LocalContainer do
            "entrypoint" => "index.html",
            "files" => files |> Map.keys() |> Enum.sort(),
            "content_hash" => content_hash,
-           "dependency_free" => true
+           "library_ids" =>
+             bundle
+             |> then(&(&1[:manifest] || &1["manifest"] || %{}))
+             |> then(&(&1[:library_ids] || &1["library_ids"] || [])),
+           "system_libraries" => system_manifest,
+           "runtime_network" => "none"
          },
          validation_payload: validation_payload,
          accessibility_metadata: accessibility,
@@ -392,11 +401,30 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Sandbox.LocalContainer do
     if buttons_valid? and inputs_valid?, do: :ok, else: {:error, :control_name_missing}
   end
 
-  defp validate_javascript(files, capi_manifest) do
+  defp validate_system_libraries(files, manifest) when is_map(manifest) do
+    vendor_files = files |> Map.keys() |> Enum.filter(&String.starts_with?(&1, "vendor/"))
+
+    valid? =
+      map_size(manifest) == length(vendor_files) and
+        Enum.all?(vendor_files, fn path ->
+          LibraryRegistry.trusted_file?(path, files[path], manifest)
+        end) and
+        Enum.all?(manifest, fn {path, _identity} ->
+          is_binary(path) and Map.has_key?(files, path) and String.starts_with?(path, "vendor/")
+        end)
+
+    if valid?, do: :ok, else: {:error, :untrusted_system_library}
+  end
+
+  defp validate_system_libraries(_files, _manifest),
+    do: {:error, :untrusted_system_library}
+
+  defp validate_javascript(files, capi_manifest, system_manifest) do
     javascript =
       files
       |> Enum.reject(fn {path, contents} ->
-        CapiBridge.trusted_file?(path, contents, capi_manifest)
+        CapiBridge.trusted_file?(path, contents, capi_manifest) or
+          LibraryRegistry.trusted_file?(path, contents, system_manifest)
       end)
       |> Enum.filter(fn {path, _contents} -> Path.extname(path) == ".js" end)
       |> Enum.map_join("\n", &elem(&1, 1))
@@ -454,30 +482,31 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Sandbox.LocalContainer do
           "--pids-limit",
           "64",
           "--memory",
-          "128m",
+          "512m",
           "--cpus",
-          "0.5",
+          "1",
           "--tmpfs",
           "/tmp:rw,noexec,nosuid,size=16m",
           "--mount",
           "type=bind,source=#{directory},target=/bundle,readonly",
-          Keyword.get(opts, :image, image()),
+          "--entrypoint",
           "sh",
+          Keyword.get(opts, :image, image()),
           "-eu",
           "-c",
           "test -f /bundle/index.html; test \"$(find /bundle -type f | wc -l)\" -le #{@max_files}; test -z \"$(find /bundle -type l -print -quit)\"; find /bundle -type f -name '*.js' -exec node --check {} ';'"
         ]
 
-        case run_with_timeout(runtime(), args, Keyword.get(opts, :timeout_ms, 15_000)) do
+        case run_with_timeout(runtime(), args, Keyword.get(opts, :timeout_ms, 30_000)) do
           {:ok, {_output, 0}} ->
             {:ok,
              %{
                "status" => "passed",
-               "validator" => "local_container_v1",
+               "validator" => "local_container_v2",
                "network" => "none",
                "resource_limits" => %{
-                 "memory" => "128m",
-                 "cpus" => "0.5",
+                 "memory" => "512m",
+                 "cpus" => "1",
                  "pids" => 64
                },
                "checks" => [
