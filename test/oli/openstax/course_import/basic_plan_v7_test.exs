@@ -1,7 +1,7 @@
-defmodule Oli.OpenStax.CourseImport.BasicPlanV5Test do
+defmodule Oli.OpenStax.CourseImport.BasicPlanV7Test do
   use ExUnit.Case, async: true
 
-  alias Oli.OpenStax.CourseImport.BasicPlanV5
+  alias Oli.OpenStax.CourseImport.BasicPlanV7
 
   test "hydrates every source AST block exactly once without model-authored rewriting" do
     lesson = lesson()
@@ -47,8 +47,8 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5Test do
       }
     }
 
-    assert {:ok, content} = BasicPlanV5.build(candidate, lesson, 1)
-    assert content["schema_version"] == 5
+    assert {:ok, content} = BasicPlanV7.build(candidate, lesson, 1)
+    assert content["schema_version"] == 7
     assert content["coverage_manifest"]["complete"]
 
     assert content["coverage_manifest"]["included_source_block_ids"] == [
@@ -77,6 +77,64 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5Test do
     assert hd(content["question_slots"])["placement_after_section_id"] == "models"
   end
 
+  test "reconstructs a compact repair candidate without hydrated source AST" do
+    lesson = lesson()
+
+    candidate = %{
+      "title" => "The Nature of Science",
+      "orientation" => %{"overview" => "Use the source to examine scientific knowledge."},
+      "content_groups" => [
+        %{
+          "id" => "source",
+          "title" => "Evidence and models",
+          "instructional_purpose" => "concept",
+          "transition" => nil,
+          "source_block_ids" => ["heading-1", "paragraph-1", "paragraph-2", "figure-1"]
+        }
+      ],
+      "question_slots" => [],
+      "generated_alt_text" => [
+        %{
+          "source_media_id" => "figure-media-1",
+          "alt" => "A model is revised as observations are added."
+        }
+      ],
+      "synthesis" => %{"summary" => "Evidence can revise a model."}
+    }
+
+    assert {:ok, content} = BasicPlanV7.build(candidate, lesson, 1)
+    repair_candidate = BasicPlanV7.repair_candidate(content)
+
+    refute get_in(repair_candidate, ["content_groups", Access.at(0), "source_blocks"])
+    assert repair_candidate["content_groups"] == candidate["content_groups"]
+    assert repair_candidate["generated_alt_text"] == candidate["generated_alt_text"]
+    assert {:ok, rebuilt} = BasicPlanV7.build(repair_candidate, lesson, 1)
+    assert rebuilt["coverage_manifest"]["complete"]
+  end
+
+  test "normalizes an interpretation content-group purpose to the current contract" do
+    candidate = %{
+      "content_groups" => [
+        %{
+          "id" => "interpretation",
+          "title" => "Interpret the evidence",
+          "instructional_purpose" => "interpretation",
+          "source_block_ids" => ["heading-1", "paragraph-1", "paragraph-2", "figure-1"]
+        }
+      ],
+      "question_slots" => [],
+      "generated_alt_text" => [
+        %{
+          "source_media_id" => "figure-media-1",
+          "alt" => "A model is revised as new observations are added."
+        }
+      ]
+    }
+
+    assert {:ok, content} = BasicPlanV7.build(candidate, lesson(), 1)
+    assert hd(content["content_groups"])["instructional_purpose"] == "concept"
+  end
+
   test "rejects omissions, duplicates, invented ids, and inaccessible figure descriptions" do
     candidate = %{
       "content_groups" => [
@@ -90,7 +148,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5Test do
       "question_slots" => []
     }
 
-    assert {:error, findings} = BasicPlanV5.build(candidate, lesson(), 1)
+    assert {:error, findings} = BasicPlanV7.build(candidate, lesson(), 1)
     codes = Enum.map(findings, & &1["code"])
     assert "missing_source_blocks" in codes
     assert "unknown_source_blocks" in codes
@@ -145,13 +203,13 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5Test do
       "question_slots" => []
     }
 
-    assert {:ok, content} = BasicPlanV5.build(candidate, lesson, 1)
+    assert {:ok, content} = BasicPlanV7.build(candidate, lesson, 1)
     assert content["source_block_ids"] == ["callout-parent"]
     assert content["coverage_manifest"]["included_source_block_ids"] == ["callout-parent"]
     refute Jason.encode!(content) =~ "callout-child"
   end
 
-  test "rejects generic or paragraph-only standalone example cards" do
+  test "rejects generic card titles after normalizing paragraph-only card purposes" do
     candidate = %{
       "content_groups" => [
         %{
@@ -170,10 +228,34 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5Test do
       ]
     }
 
-    assert {:error, findings} = BasicPlanV5.build(candidate, lesson(), 1)
+    assert {:error, findings} = BasicPlanV7.build(candidate, lesson(), 1)
     codes = Enum.map(findings, & &1["code"])
     assert "generic_group_title" in codes
-    assert "unsupported_card_purpose" in codes
+    refute "unsupported_card_purpose" in codes
+  end
+
+  test "keeps unsupported example and application groups in the reading flow" do
+    candidate = %{
+      "content_groups" => [
+        %{
+          "id" => "reading-flow",
+          "title" => "Observations and model revision",
+          "instructional_purpose" => "application",
+          "source_block_ids" => ["heading-1", "paragraph-1", "paragraph-2", "figure-1"]
+        }
+      ],
+      "question_slots" => [],
+      "generated_alt_text" => [
+        %{
+          "source_media_id" => "figure-media-1",
+          "alt" => "A model is revised as new observations are added."
+        }
+      ]
+    }
+
+    assert {:ok, content} = BasicPlanV7.build(candidate, lesson(), 1)
+    assert hd(content["content_groups"])["instructional_purpose"] == "reading"
+    assert content["coverage_manifest"]["complete"]
   end
 
   test "rejects multiple checkpoint slots at the same conceptual boundary" do
@@ -208,12 +290,12 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5Test do
       ]
     }
 
-    assert {:error, findings} = BasicPlanV5.build(candidate, lesson(), 1)
+    assert {:error, findings} = BasicPlanV7.build(candidate, lesson(), 1)
     assert Enum.any?(findings, &(&1["code"] == "duplicate_question_boundaries"))
   end
 
   test "publishes the exact architect vocabulary and objective ids in the prompt contract" do
-    contract = BasicPlanV5.prompt_contract(lesson())
+    contract = BasicPlanV7.prompt_contract(lesson())
 
     assert "reading" in contract["allowed_instructional_purposes"]
     assert contract["allowed_question_types"] == ["multiple_choice", "short_answer"]
@@ -252,7 +334,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5Test do
       ]
     }
 
-    assert {:ok, content} = BasicPlanV5.build(candidate, lesson(), 1)
+    assert {:ok, content} = BasicPlanV7.build(candidate, lesson(), 1)
     assert hd(content["content_groups"])["instructional_purpose"] == "reading"
 
     assert %{
@@ -293,10 +375,50 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5Test do
       ]
     }
 
-    assert {:ok, content} = BasicPlanV5.build(candidate, lesson(), 1)
+    assert {:ok, content} = BasicPlanV7.build(candidate, lesson(), 1)
     assert [group] = content["content_groups"]
     assert group["id"] == "evidence"
     assert Enum.map(group["source_blocks"], & &1["id"]) == content["source_block_ids"]
+    assert hd(group["source_blocks"])["rendering"] == "lesson_title"
+
+    assert hd(content["coverage_manifest"]["dispositions"])["rendering"] ==
+             "lesson_title"
+  end
+
+  test "suppresses the base source heading for a split lesson title" do
+    split_lesson =
+      Map.put(
+        lesson(),
+        "title",
+        "The Nature of Science — Part 1 of 2: Evidence and revision"
+      )
+
+    candidate = %{
+      "content_groups" => [
+        %{
+          "id" => "source-title",
+          "title" => "The Nature of Science",
+          "instructional_purpose" => "orientation",
+          "source_block_ids" => ["heading-1"]
+        },
+        %{
+          "id" => "evidence",
+          "title" => "How evidence changes explanations",
+          "instructional_purpose" => "reading",
+          "source_block_ids" => ["paragraph-1", "paragraph-2", "figure-1"]
+        }
+      ],
+      "question_slots" => [],
+      "generated_alt_text" => [
+        %{
+          "source_media_id" => "figure-media-1",
+          "alt" => "A model is revised as new observations are added."
+        }
+      ]
+    }
+
+    assert {:ok, content} = BasicPlanV7.build(candidate, split_lesson, 1)
+    assert [group] = content["content_groups"]
     assert hd(group["source_blocks"])["rendering"] == "lesson_title"
 
     assert hd(content["coverage_manifest"]["dispositions"])["rendering"] ==

@@ -7,6 +7,8 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
   alias Oli.GenAI.Agent.Persistence
 
   alias Oli.OpenStax.CourseImport.{
+    AIPricing,
+    AIUsageLedger,
     QuestionAgentPolicy,
     QuestionAgentToolBroker,
     QuestionAgentValidator
@@ -32,9 +34,8 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
           "Create the smallest high-value set of source-grounded formative questions for this Basic lesson.",
         plan: [
           "Choose 1 to 10 questions based on objectives and instructional density",
-          "Review the complete candidate set",
-          "Repair every deterministic finding",
-          "Submit the accepted complete set"
+          "Validate and submit the complete candidate set in one tool call",
+          "Repair every deterministic finding before the next validation call"
         ],
         service_config: service_config,
         policy: QuestionAgentPolicy,
@@ -52,9 +53,9 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
         context_summary:
           "The private tool context contains the complete lesson evidence. Never reproduce raw source in tool output.",
         budgets: %{
-          max_steps: 6,
-          max_tokens: 200_000,
-          max_cost_cents: 500,
+          max_steps: 4,
+          max_tokens: 40_000,
+          max_cost_cents: 300,
           deadline_at: DateTime.add(DateTime.utc_now(), @deadline_seconds, :second)
         },
         metadata: %{
@@ -64,7 +65,13 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
         },
         author_id: Keyword.get(opts, :author_id),
         project_id: Keyword.get(opts, :project_id),
-        max_provider_retries: 2
+        request_context_factory: fn step ->
+          AIUsageLedger.request_context(opts, :basic_question_writer, %{
+            candidate_number: step,
+            operation_id: run_id
+          })
+        end,
+        max_provider_retries: 1
       }
       |> maybe_put(:llm_bridge, Keyword.get(opts, :llm_bridge))
 
@@ -74,11 +81,12 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
          {:ok, draft} <- accepted_draft(run_id) do
       steps = Persistence.get_steps(run_id)
       payload = draft.patch["questions_payload"] || draft.patch[:questions_payload]
+      metadata = generation_metadata(result, draft, steps, service_config)
 
       {:ok,
        %{
          questions_payload: payload,
-         generation_metadata: generation_metadata(result, draft, steps)
+         generation_metadata: metadata
        }}
     else
       {:error, reason} -> {:error, classify_failure(reason, run_id)}
@@ -100,26 +108,45 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
     end
   end
 
-  defp generation_metadata(result, draft, steps) do
-    review_attempts = count_tool_steps(steps, "review_openstax_questions")
-    submission_attempts = count_tool_steps(steps, "submit_openstax_questions")
+  defp generation_metadata(result, draft, steps, service_config) do
+    validation_attempts = count_tool_steps(steps, "validate_and_submit_openstax_questions")
+
+    model = result.metadata[:model] || result.metadata["model"]
+    provider = result.metadata[:provider] || result.metadata["provider"]
+
+    service_tier =
+      case service_config do
+        %{primary_model: %{service_tier: tier}} when is_binary(tier) -> tier
+        _ -> "default"
+      end
+
+    usage = %{
+      input_tokens: result.input_tokens,
+      output_tokens: result.output_tokens,
+      cached_input_tokens: 0
+    }
 
     %{
       "run_id" => result.run_id,
       "chosen_count_rationale" => draft.metadata["count_rationale"],
       "question_count" => draft.metadata["question_count"],
       "attempts" => %{
-        "reviews" => review_attempts,
-        "submissions" => submission_attempts
+        "validations" => validation_attempts
       },
       "token_usage" => %{
         "input" => result.input_tokens,
         "output" => result.output_tokens,
-        "total" => result.tokens_used
+        "total" => result.tokens_used,
+        "cached_input" => 0,
+        "reasoning" => 0
       },
-      "cost_cents" => result.cost_cents,
-      "provider" => result.metadata[:provider] || result.metadata["provider"],
-      "model" => result.metadata[:model] || result.metadata["model"],
+      "estimated_cost_microdollars" =>
+        AIPricing.estimate_microdollars(model, service_tier, usage),
+      "pricing_version" => AIPricing.pricing_version(),
+      "provider" => provider,
+      "model" => model,
+      "service_tier" => service_tier,
+      "cache_status" => "unknown",
       "terminal_status" => to_string(result.terminal_status)
     }
   end
@@ -185,6 +212,8 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
       "approved_prior_objective_ledger" => Keyword.get(opts, :objective_ledger, []),
       "previous_questions_payload" => Keyword.get(opts, :previous_questions_payload),
       "critic_findings" => Keyword.get(opts, :critic_findings, []),
+      "regeneration_context" =>
+        prompt_repair_context(lesson["repair_context"] || lesson[:repair_context]),
       "evidence_catalog" => evidence_catalog
     })
   end
@@ -204,6 +233,19 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
     end)
   end
 
+  defp prompt_repair_context(context) when is_map(context),
+    do:
+      Map.drop(context, [
+        "previous_candidates",
+        :previous_candidates,
+        "critic_findings",
+        :critic_findings,
+        "phase_findings",
+        :phase_findings
+      ])
+
+  defp prompt_repair_context(_context), do: nil
+
   defp system_instructions do
     """
     You generate questions only for the supplied finalized Basic lesson. Quality is
@@ -212,9 +254,9 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
     learning value. One question may cover several related objective IDs; do not make
     one question per objective. Explain the chosen count only in count_rationale.
 
-    Use only review_openstax_questions and submit_openstax_questions. Propose and
-    review the entire set in one call. You must receive a valid review for the exact
-    candidate before submitting it. Repair all findings before submission.
+    Use only validate_and_submit_openstax_questions. Submit the entire proposed set
+    in one call. A valid set is persisted atomically; an invalid set returns bounded
+    findings that must all be repaired before the next call.
 
     Mix multiple-choice and short-answer only when each format serves the learning
     goal. Prompts must be distinct and source-grounded. Multiple-choice items need one
@@ -236,7 +278,11 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
     it supports the same claim and every grading and feedback field accepts it. When
     critic findings are supplied, make the smallest complete correction and re-check all
     related fields so repairing one finding cannot contradict another field.
-    For v5, place questions only in supplied question_slots. Recall questions may use
+    If regeneration_context is present, resolve its applicable author feedback and
+    generated-question findings in the new complete question set. Source-owned
+    diagnostics describe authoritative textbook input and are not question-writing
+    tasks.
+    For v7, place questions only in supplied question_slots. Recall questions may use
     only approved_prior_objective_ledger entries; never infer a prerequisite from future
     or unapproved lessons. If previous_questions_payload and critic_findings are present,
     repair that complete set and disposition every finding before review.

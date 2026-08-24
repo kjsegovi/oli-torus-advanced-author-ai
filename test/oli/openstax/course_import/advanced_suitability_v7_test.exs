@@ -1,9 +1,9 @@
-defmodule Oli.OpenStax.CourseImport.AdvancedSuitabilityV6Test do
+defmodule Oli.OpenStax.CourseImport.AdvancedSuitabilityV7Test do
   use ExUnit.Case, async: true
 
-  alias Oli.OpenStax.CourseImport.AdvancedSuitabilityV6
+  alias Oli.OpenStax.CourseImport.AdvancedSuitabilityV7
   alias Oli.OpenStax.CourseImport.SimulationPilotCorpus
-  alias Oli.OpenStax.CourseImport.V6Fixture, as: Fixture
+  alias Oli.OpenStax.CourseImport.V7Fixture, as: Fixture
 
   test "routes Chapter Outline to Basic regardless of length" do
     lesson = %{
@@ -19,7 +19,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedSuitabilityV6Test do
     }
 
     assert %{"candidate" => false, "mode" => "basic"} =
-             AdvancedSuitabilityV6.assess(lesson)
+             AdvancedSuitabilityV7.assess(lesson)
   end
 
   test "routes 1.3 The Laws of Nature to Basic when it provides exposition only" do
@@ -41,11 +41,11 @@ defmodule Oli.OpenStax.CourseImport.AdvancedSuitabilityV6Test do
              "candidate" => false,
              "mode" => "basic",
              "affordances" => []
-           } = AdvancedSuitabilityV6.assess(lesson)
+           } = AdvancedSuitabilityV7.assess(lesson)
   end
 
-  test "selects the quantitative evidence-rich Chemistry fixture for Advanced v6" do
-    assessment = AdvancedSuitabilityV6.assess(Fixture.lesson())
+  test "selects the quantitative evidence-rich Chemistry fixture for Advanced v7" do
+    assessment = AdvancedSuitabilityV7.assess(Fixture.lesson())
 
     assert assessment["candidate"]
     assert assessment["mode"] == "advanced"
@@ -65,7 +65,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedSuitabilityV6Test do
     for lesson <- golden_lessons do
       domain = lesson["domain"]
       title = lesson["title"]
-      assessment = AdvancedSuitabilityV6.assess(lesson)
+      assessment = AdvancedSuitabilityV7.assess(lesson)
 
       assert assessment["candidate"], "expected #{domain} golden lesson #{title} to qualify"
       assert assessment["mode"] == "advanced"

@@ -17,10 +17,10 @@ defmodule Oli.OpenStax.CourseImportTest do
   alias Oli.ScopedFeatureFlags
 
   defmodule DeterministicLessonPlanner do
-    alias Oli.OpenStax.CourseImport.BasicPlanV5
+    alias Oli.OpenStax.CourseImport.BasicPlanV7
 
     def plan(lesson, index, _opts) do
-      block_ids = lesson |> BasicPlanV5.source_blocks() |> Enum.map(& &1["id"])
+      block_ids = lesson |> BasicPlanV7.source_blocks() |> Enum.map(& &1["id"])
 
       candidate = %{
         "title" => lesson["title"],
@@ -43,7 +43,7 @@ defmodule Oli.OpenStax.CourseImportTest do
         }
       }
 
-      {:ok, content} = BasicPlanV5.build(candidate, lesson, index)
+      {:ok, content} = BasicPlanV7.build(candidate, lesson, index)
 
       {:ok,
        %{
@@ -262,8 +262,8 @@ defmodule Oli.OpenStax.CourseImportTest do
                "https://openstax.org/details/books/sample-book"
              )
 
-    assert run.source_schema_version == 3
-    assert run.plan_schema_version == 6
+    assert run.source_schema_version == 4
+    assert run.plan_schema_version == 7
   end
 
   test "initial chapter selection follows the convenience mode and retries preserve stored choices",
@@ -943,7 +943,7 @@ defmodule Oli.OpenStax.CourseImportTest do
     assert get_in(repaired_plan.generation_metadata, ["quality_gate", "repairs"]) != []
   end
 
-  test "an Advanced v6 lesson can be downgraded to Basic v5 without losing its source AST", %{
+  test "an Advanced v7 lesson can be changed to Basic v7 without losing its source AST", %{
     author: author,
     project: project,
     root: root
@@ -954,9 +954,9 @@ defmodule Oli.OpenStax.CourseImportTest do
 
     advanced_content =
       plan.content_payload
-      |> Map.put("schema_version", 6)
+      |> Map.put("schema_version", 7)
       |> Map.put("authoring_mode", "advanced")
-      |> Map.put("advanced_v6_contract", %{"validated" => true})
+      |> Map.put("advanced_v7_contract", %{"validated" => true})
       |> Map.put("experience_blueprint", %{
         "driving_question" => "How does the evidence support the lesson's central claim?",
         "stages" => [],
@@ -989,14 +989,14 @@ defmodule Oli.OpenStax.CourseImportTest do
 
     assert downgraded.plan_mode == "basic"
     assert downgraded.status == "needs_attention"
-    assert downgraded_plan.content_payload["schema_version"] == 5
+    assert downgraded_plan.content_payload["schema_version"] == 7
     assert downgraded_plan.content_payload["authoring_mode"] == "basic"
 
     assert downgraded_plan.content_payload["content_groups"] ==
              plan.content_payload["content_groups"]
 
     refute Map.has_key?(downgraded_plan.content_payload, "experience_blueprint")
-    refute Map.has_key?(downgraded_plan.content_payload, "advanced_v6_contract")
+    refute Map.has_key?(downgraded_plan.content_payload, "advanced_v7_contract")
     refute get_in(downgraded_plan.generation_metadata, ["quality_gate", "approved"])
   end
 

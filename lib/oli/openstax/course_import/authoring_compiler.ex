@@ -11,9 +11,12 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
   alias Oli.Activities.Model
   alias Oli.GoogleSlides.Adaptive.{PartBuilders, TrapStateRulesBuilder}
-  alias Oli.OpenStax.CourseImport.GeneratedSimulation
+  alias Oli.OpenStax.CourseImport.{GeneratedSimulation, ImportContract, SourceASTRenderer}
   alias Oli.TorusDoc.{ActivityConverter, ActivityParser}
   alias Oli.Utils.SchemaResolver
+
+  @basic_content_schema ImportContract.content_schema_version(:basic)
+  @advanced_content_schema ImportContract.content_schema_version(:advanced)
 
   @default_width 1200
   @default_height 540
@@ -38,7 +41,10 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     with :ok <- validate_current_content_contract(mode, content_payload),
          {:ok, normalized_questions} <- validate_questions(questions, mode, content_payload),
          {:ok, media_assets} <- resolve_media_assets(content_payload, opts),
-         attribution <- normalize_attribution(content_payload, opts),
+         attribution <-
+           content_payload
+           |> normalize_attribution(opts)
+           |> enrich_attribution(content_payload, media_assets),
          {:ok, artifact} <-
            compile_mode(
              mode,
@@ -58,16 +64,18 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   def compile(_, _, _, _, _, _), do: {:error, :invalid_authoring_artifact}
 
   defp validate_current_content_contract("basic", %{
-         "schema_version" => 5,
+         "schema_version" => version,
          "authoring_mode" => "basic"
-       }),
+       })
+       when version == @basic_content_schema,
        do: :ok
 
   defp validate_current_content_contract("advanced", %{
-         "schema_version" => 6,
+         "schema_version" => version,
          "authoring_mode" => "advanced",
          "experience_blueprint" => %{}
-       }),
+       })
+       when version == @advanced_content_schema,
        do: :ok
 
   defp validate_current_content_contract(mode, content),
@@ -76,15 +84,16 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   defp compile_mode(
          "advanced",
          title,
-         %{"schema_version" => 6} = content,
+         %{"schema_version" => version} = content,
          [],
          stable_key,
          media_assets,
          attribution,
          opts
-       ),
+       )
+       when version == @advanced_content_schema,
        do:
-         compile_advanced_v6(
+         compile_advanced_v7(
            title,
            content,
            stable_key,
@@ -96,13 +105,14 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   defp compile_mode(
          "basic",
          title,
-         %{"schema_version" => 5} = content,
+         %{"schema_version" => version} = content,
          questions,
          stable_key,
          media_assets,
          attribution,
-         _opts
-       ),
+         opts
+       )
+       when version == @basic_content_schema,
        do:
          compile_basic(
            title,
@@ -110,7 +120,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
            questions,
            stable_key,
            media_assets,
-           attribution
+           attribution,
+           opts
          )
 
   defp compile_mode(mode, _title, content, _questions, _stable_key, _media, _attribution, _opts),
@@ -160,36 +171,35 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end
   end
 
-  defp compile_basic(title, content, questions, stable_key, media_assets, attribution) do
+  defp compile_basic(title, content, questions, stable_key, media_assets, attribution, opts) do
     with {:ok, activity_specs} <-
-           compile_basic_questions(title, questions, stable_key, media_assets) do
-      references =
-        Enum.map(activity_specs, fn spec ->
-          {spec["placement_after_section_id"], activity_reference(spec)}
-        end)
-
-      section_ids =
-        content
-        |> Map.get("content_groups", [])
-        |> List.wrap()
-        |> Enum.map(& &1["id"])
-        |> MapSet.new()
-
-      {placed_references, final_references} =
-        Enum.split_with(references, fn {placement, _reference} ->
-          is_binary(placement) and MapSet.member?(section_ids, placement)
-        end)
-
+           compile_basic_questions(title, questions, stable_key, media_assets),
+         references <-
+           Enum.map(activity_specs, fn spec ->
+             {spec["placement_after_section_id"], activity_reference(spec)}
+           end),
+         section_ids <-
+           content
+           |> Map.get("content_groups", [])
+           |> List.wrap()
+           |> Enum.map(& &1["id"])
+           |> MapSet.new(),
+         {placed_references, final_references} <-
+           Enum.split_with(references, fn {placement, _reference} ->
+             is_binary(placement) and MapSet.member?(section_ids, placement)
+           end),
+         {:ok, instructional_blocks} <-
+           basic_instructional_blocks(
+             content,
+             stable_key,
+             media_assets,
+             attribution,
+             Map.new(section_ids, &{&1, placed_references_for(placed_references, &1)}),
+             opts
+           ) do
       page_content = %{
         "version" => "0.1.0",
-        "model" =>
-          basic_instructional_blocks(
-            content,
-            stable_key,
-            media_assets,
-            attribution,
-            Map.new(section_ids, &{&1, placed_references_for(placed_references, &1)})
-          ) ++ final_practice_blocks(final_references, stable_key)
+        "model" => instructional_blocks ++ final_practice_blocks(final_references, stable_key)
       }
 
       {:ok,
@@ -222,64 +232,75 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
          stable_key,
          media_assets,
          attribution,
-         references_by_section
+         references_by_section,
+         opts
        ) do
-    basic_v5_instructional_blocks(
+    basic_v7_instructional_blocks(
       content,
       stable_key,
       media_assets,
       attribution,
-      references_by_section
+      references_by_section,
+      opts
     )
   end
 
-  defp basic_v5_instructional_blocks(
+  defp basic_v7_instructional_blocks(
          content,
          stable_key,
          media_assets,
          attribution,
-         references_by_group
+         references_by_group,
+         opts
        ) do
-    media_lookup = v5_media_lookup(content, media_assets)
+    media_lookup = v7_media_lookup(content, media_assets)
 
-    [v5_orientation_block(content, stable_key)] ++
-      (content
-       |> Map.get("content_groups", [])
-       |> List.wrap()
-       |> Enum.with_index(1)
-       |> Enum.flat_map(fn {group, index} ->
-         v5_content_group_blocks(
-           group,
-           index,
-           stable_key,
-           media_lookup,
-           Map.get(references_by_group, group["id"], [])
-         )
-       end)) ++
-      v5_synthesis_blocks(content["synthesis"], stable_key) ++
-      attribution_blocks(attribution, stable_key)
+    groups = content |> Map.get("content_groups", []) |> List.wrap()
+
+    with {:ok, group_blocks} <-
+           groups
+           |> Enum.with_index(1)
+           |> Enum.reduce_while({:ok, []}, fn {group, index}, {:ok, blocks} ->
+             case v7_content_group_blocks(
+                    group,
+                    index,
+                    stable_key,
+                    media_lookup,
+                    Map.get(references_by_group, group["id"], []),
+                    opts
+                  ) do
+               {:ok, rendered} -> {:cont, {:ok, blocks ++ rendered}}
+               {:error, reason} -> {:halt, {:error, reason}}
+             end
+           end) do
+      {:ok,
+       [v7_orientation_block(content, stable_key)] ++
+         group_blocks ++
+         v7_synthesis_blocks(content["synthesis"], stable_key) ++
+         attribution_blocks(attribution, stable_key)}
+    end
   end
 
-  defp v5_orientation_block(content, stable_key) do
+  defp v7_orientation_block(content, stable_key) do
     overview = get_in(content, ["orientation", "overview"]) || content["narrative"]
 
     children =
-      [text_element("h2", content["title"] || "Lesson overview", "#{stable_key}:v5:title")] ++
-        paragraph_elements(overview, "#{stable_key}:v5:overview") ++
+      [text_element("h2", content["title"] || "Lesson overview", "#{stable_key}:v7:title")] ++
+        paragraph_elements(overview, "#{stable_key}:v7:overview") ++
         [
-          text_element("h3", "Learning Objectives", "#{stable_key}:v5:objectives-heading"),
+          text_element("h3", "Learning Objectives", "#{stable_key}:v7:objectives-heading"),
           string_list_element(
             "ul",
             learning_objectives(content),
-            "#{stable_key}:v5:objectives"
+            "#{stable_key}:v7:objectives"
           )
         ]
 
-    content_block(children, "#{stable_key}:v5:orientation")
+    content_block(children, "#{stable_key}:v7:orientation")
   end
 
-  defp v5_content_group_blocks(group, index, stable_key, media_lookup, references) do
-    group_key = "#{stable_key}:v5:group:#{group["id"] || index}"
+  defp v7_content_group_blocks(group, index, stable_key, media_lookup, references, opts) do
+    group_key = "#{stable_key}:v7:group:#{group["id"] || index}"
 
     heading_content =
       content_block(
@@ -288,123 +309,110 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
         "#{group_key}:heading-content"
       )
 
-    source_children =
+    source_blocks =
       group
       |> Map.get("source_blocks", [])
       |> List.wrap()
-      |> Enum.with_index(1)
-      |> Enum.flat_map(fn {source_block, block_index} ->
-        if source_block["rendering"] == "lesson_title" do
-          []
-        else
-          [
-            v5_source_block_child(
-              source_block,
-              block_index,
-              group_key,
-              media_lookup,
-              group["instructional_purpose"]
-            )
-          ]
-        end
-      end)
+      |> Enum.reject(&(&1["rendering"] == "lesson_title"))
 
-    group_block = %{
-      "id" => stable_id("v5-group", group_key),
-      "type" => "group",
-      "layout" => "vertical",
-      "purpose" => v5_group_purpose(group["instructional_purpose"]),
-      "children" => [heading_content | source_children]
-    }
+    with {:ok, source_children} <-
+           source_blocks
+           |> Enum.with_index(1)
+           |> Enum.reduce_while({:ok, []}, fn {source_block, block_index}, {:ok, children} ->
+             case v7_source_block_child(
+                    source_block,
+                    block_index,
+                    group_key,
+                    media_lookup,
+                    group["instructional_purpose"],
+                    opts
+                  ) do
+               {:ok, child} -> {:cont, {:ok, children ++ [child]}}
+               {:error, reason} -> {:halt, {:error, reason}}
+             end
+           end) do
+      group_block = %{
+        "id" => stable_id("v7-group", group_key),
+        "type" => "group",
+        "layout" => "vertical",
+        "purpose" => v7_group_purpose(group["instructional_purpose"]),
+        "children" => [heading_content | source_children]
+      }
 
-    [group_block] ++ practice_group(references, "#{group_key}:checkpoint")
+      {:ok, [group_block] ++ practice_group(references, "#{group_key}:checkpoint")}
+    end
   end
 
-  defp v5_source_block_child(
+  defp v7_source_block_child(
          source_block,
          block_index,
          group_key,
          media_lookup,
-         group_purpose
+         group_purpose,
+         opts
        ) do
     block_key = "#{group_key}:source:#{source_block["id"] || block_index}"
 
-    source_nodes =
-      source_block
-      |> Map.get("ast", [])
-      |> List.wrap()
-      |> Enum.with_index(1)
-      |> Enum.map(fn {node, node_index} ->
-        stabilize_v5_ast_node(node, "#{block_key}:#{node_index}", media_lookup)
-      end)
-      |> append_v5_figure_attribution(source_block, block_key)
+    renderer_opts =
+      Keyword.merge(opts,
+        mode: :basic,
+        stable_key: block_key,
+        media_lookup: media_lookup,
+        source_context: source_block
+      )
 
-    content = content_block(source_nodes, "#{block_key}:content")
+    ast =
+      case List.wrap(source_block["ast"]) do
+        [] -> [%{"type" => "p", "children" => [%{"text" => source_block["text"] || ""}]}]
+        values -> values
+      end
 
-    source_purpose =
-      if v5_group_purpose(group_purpose) == "none",
-        do: v5_source_block_purpose(source_block),
-        else: nil
+    case SourceASTRenderer.render(ast, renderer_opts) do
+      {:ok, source_nodes} ->
+        content = content_block(source_nodes, "#{block_key}:content")
 
-    case source_purpose do
-      nil ->
-        content
+        source_purpose =
+          if v7_group_purpose(group_purpose) == "none",
+            do: v7_source_block_purpose(source_block),
+            else: nil
 
-      purpose ->
-        %{
-          "id" => stable_id("v5-source-group", block_key),
-          "type" => "group",
-          "layout" => "vertical",
-          "purpose" => purpose,
-          "children" => [content]
-        }
+        case source_purpose do
+          nil ->
+            {:ok, content}
+
+          purpose ->
+            {:ok,
+             %{
+               "id" => stable_id("v7-source-group", block_key),
+               "type" => "group",
+               "layout" => "vertical",
+               "purpose" => purpose,
+               "children" => [content]
+             }}
+        end
+
+      {:attention, findings} ->
+        {:error, {:external_media_attention, findings}}
     end
   end
 
-  defp v5_source_block_purpose(%{"kind" => "exercise"}), do: "learnbydoing"
+  defp v7_source_block_purpose(%{"kind" => "exercise"}), do: "learnbydoing"
 
-  defp v5_source_block_purpose(%{"kind" => "callout", "callout_type" => type})
+  defp v7_source_block_purpose(%{"kind" => "callout", "callout_type" => type})
        when type in ["concepts_in_practice", "example"],
        do: "example"
 
-  defp v5_source_block_purpose(%{"kind" => kind}) when kind in ["callout", "footnotes"],
+  defp v7_source_block_purpose(%{"kind" => kind}) when kind in ["callout", "footnotes"],
     do: "learnmore"
 
-  defp v5_source_block_purpose(_source_block), do: nil
+  defp v7_source_block_purpose(_source_block), do: nil
 
-  defp append_v5_figure_attribution(nodes, %{"kind" => "figure"} = source_block, key) do
-    existing_text = v5_ast_text(nodes)
+  defp v7_group_purpose("example"), do: "example"
+  defp v7_group_purpose("application"), do: "learnbydoing"
+  defp v7_group_purpose("reference"), do: "learnmore"
+  defp v7_group_purpose(_purpose), do: "none"
 
-    [
-      {"Figure credit", source_block["credit"]},
-      {"Figure license", source_block["license"]}
-    ]
-    |> Enum.reduce(nodes, fn {label, value}, acc ->
-      if present_text?(value) and not String.contains?(existing_text, value) do
-        acc ++ paragraph_elements("#{label}: #{value}", "#{key}:#{String.downcase(label)}")
-      else
-        acc
-      end
-    end)
-  end
-
-  defp append_v5_figure_attribution(nodes, _source_block, _key), do: nodes
-
-  defp v5_ast_text(value) when is_map(value) do
-    [value["text"], v5_ast_text(value["children"])]
-    |> Enum.filter(&is_binary/1)
-    |> Enum.join(" ")
-  end
-
-  defp v5_ast_text(value) when is_list(value), do: Enum.map_join(value, " ", &v5_ast_text/1)
-  defp v5_ast_text(_value), do: ""
-
-  defp v5_group_purpose("example"), do: "example"
-  defp v5_group_purpose("application"), do: "learnbydoing"
-  defp v5_group_purpose("reference"), do: "learnmore"
-  defp v5_group_purpose(_purpose), do: "none"
-
-  defp v5_synthesis_blocks(synthesis, stable_key) when is_map(synthesis) do
+  defp v7_synthesis_blocks(synthesis, stable_key) when is_map(synthesis) do
     takeaways = normalize_strings(synthesis["takeaways"])
 
     children =
@@ -412,21 +420,21 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
         text_element(
           "h2",
           synthesis["heading"] || "Bring the ideas together",
-          "#{stable_key}:v5:synthesis-heading"
+          "#{stable_key}:v7:synthesis-heading"
         )
       ] ++
-        paragraph_elements(synthesis["summary"], "#{stable_key}:v5:synthesis") ++
+        paragraph_elements(synthesis["summary"], "#{stable_key}:v7:synthesis") ++
         if(takeaways == [],
           do: [],
-          else: [string_list_element("ul", takeaways, "#{stable_key}:v5:synthesis-takeaways")]
+          else: [string_list_element("ul", takeaways, "#{stable_key}:v7:synthesis-takeaways")]
         )
 
-    [content_block(children, "#{stable_key}:v5:synthesis")]
+    [content_block(children, "#{stable_key}:v7:synthesis")]
   end
 
-  defp v5_synthesis_blocks(_synthesis, _stable_key), do: []
+  defp v7_synthesis_blocks(_synthesis, _stable_key), do: []
 
-  defp v5_media_lookup(content, media_assets) do
+  defp v7_media_lookup(content, media_assets) do
     assets_by_id = Map.new(media_assets, &{&1.id, &1})
 
     content
@@ -455,56 +463,6 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end)
   end
 
-  defp stabilize_v5_ast_node(node, key, media_lookup) when is_map(node) do
-    type = v5_heading_type(node["type"])
-
-    node =
-      node
-      |> Map.new(fn {field, value} -> {to_string(field), value} end)
-      |> maybe_put_v5_ast_type(type)
-      |> maybe_put_v5_ast_id(type, key)
-      |> resolve_v5_ast_media(media_lookup)
-
-    case node["children"] do
-      children when is_list(children) ->
-        children =
-          children
-          |> Enum.with_index(1)
-          |> Enum.map(fn {child, index} ->
-            stabilize_v5_ast_node(child, "#{key}:#{index}", media_lookup)
-          end)
-
-        Map.put(node, "children", children)
-
-      _ ->
-        node
-    end
-  end
-
-  defp stabilize_v5_ast_node(node, _key, _media_lookup), do: node
-
-  defp v5_heading_type(type) when type in ["h1", "h2"], do: "h3"
-  defp v5_heading_type("h3"), do: "h4"
-  defp v5_heading_type("h4"), do: "h5"
-  defp v5_heading_type(type) when type in ["h5", "h6"], do: "h6"
-  defp v5_heading_type(type), do: type
-
-  defp maybe_put_v5_ast_type(node, nil), do: node
-  defp maybe_put_v5_ast_type(node, type), do: Map.put(node, "type", type)
-
-  defp maybe_put_v5_ast_id(node, nil, _key), do: node
-  defp maybe_put_v5_ast_id(%{"text" => _text} = node, _type, _key), do: node
-  defp maybe_put_v5_ast_id(node, type, key), do: Map.put_new(node, "id", stable_id(type, key))
-
-  defp resolve_v5_ast_media(%{"type" => "img", "src" => src} = node, media_lookup) do
-    case media_lookup[src] do
-      nil -> node
-      resolved -> Map.merge(node, resolved)
-    end
-  end
-
-  defp resolve_v5_ast_media(node, _media_lookup), do: node
-
   defp attribution_blocks(attribution, stable_key) do
     lines = attribution_lines(attribution)
 
@@ -514,7 +472,13 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
       {lines, links} ->
         children =
-          [text_element("h2", "Attribution", "#{stable_key}:attribution-heading")] ++
+          [
+            text_element(
+              "h2",
+              "Sources and Credits",
+              "#{stable_key}:attribution-heading"
+            )
+          ] ++
             paragraph_elements(lines, "#{stable_key}:attribution-lines") ++
             if(links == [],
               do: [],
@@ -721,9 +685,9 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     |> String.trim()
   end
 
-  defp compile_advanced_v6(title, content, stable_key, media_assets, attribution, opts) do
+  defp compile_advanced_v7(title, content, stable_key, media_assets, attribution, opts) do
     with {:ok, screens} <-
-           advanced_v6_screens(title, content, stable_key, media_assets, attribution, opts),
+           advanced_v7_screens(title, content, stable_key, media_assets, attribution, opts),
          :ok <- validate_unique_advanced_activity_keys(screens),
          {:ok, activity_specs} <- compile_advanced_screens(screens) do
       {:ok,
@@ -770,26 +734,36 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       else: {:error, :duplicate_advanced_activity_key}
   end
 
-  defp advanced_v6_screens(title, content, stable_key, media_assets, attribution, opts) do
+  defp advanced_v7_screens(title, content, stable_key, media_assets, attribution, opts) do
     blueprint = explicit_simulation_placements(content["experience_blueprint"] || %{})
     groups = Map.new(List.wrap(content["content_groups"]), &{&1["id"], &1})
     activities = Map.new(List.wrap(blueprint["activities"]), &{&1["id"], &1})
+    branch_sets = List.wrap(blueprint["branch_sets"])
+    branch_by_activity = Map.new(branch_sets, &{&1["decision_activity_id"], &1})
     stages = List.wrap(blueprint["stages"])
+    media_lookup = v7_media_lookup(content, media_assets)
 
-    orientation = advanced_v6_orientation_screen(title, content, blueprint, stable_key)
+    orientation = advanced_v7_orientation_screen(title, content, blueprint, stable_key)
 
-    content_screens_by_group =
-      Map.new(groups, fn {group_id, group} ->
-        {group_id, advanced_v6_group_screens(group, stable_key, media_assets)}
-      end)
-
-    all_content_screens = content_screens_by_group |> Map.values() |> List.flatten()
-
-    with {:ok, stage_screens} <-
+    with {:ok, content_screens_by_group} <-
+           Enum.reduce_while(groups, {:ok, %{}}, fn {group_id, group}, {:ok, compiled} ->
+             case advanced_v7_group_screens(
+                    group,
+                    stable_key,
+                    media_assets,
+                    media_lookup,
+                    opts
+                  ) do
+               {:ok, screens} -> {:cont, {:ok, Map.put(compiled, group_id, screens)}}
+               {:error, reason} -> {:halt, {:error, reason}}
+             end
+           end),
+         all_content_screens <- content_screens_by_group |> Map.values() |> List.flatten(),
+         {:ok, stage_screens} <-
            stages
            |> Enum.with_index(1)
            |> Enum.reduce_while({:ok, []}, fn {stage, stage_index}, {:ok, compiled} ->
-             stage_screen = advanced_v6_stage_screen(stage, stage_index, stable_key)
+             stage_screen = advanced_v7_stage_screen(stage, stage_index, stable_key)
 
              stage["items"]
              |> List.wrap()
@@ -799,29 +773,30 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
                  %{"kind" => "content_group", "ref_id" => group_id} ->
                    case Map.fetch(content_screens_by_group, group_id) do
                      {:ok, screens} -> {:cont, {:ok, stage_items ++ screens}}
-                     :error -> {:halt, {:error, {:unknown_v6_content_group, group_id}}}
+                     :error -> {:halt, {:error, {:unknown_v7_content_group, group_id}}}
                    end
 
                  %{"kind" => "activity", "ref_id" => activity_id} ->
                    with {:ok, activity} <- Map.fetch(activities, activity_id),
                         {:ok, screen} <-
-                          advanced_v6_activity_screen(
+                          advanced_v7_activity_screen(
                             activity,
                             stage,
                             stage_index,
                             item_index,
                             stable_key,
                             all_content_screens,
+                            branch_by_activity[activity_id],
                             opts
                           ) do
                      {:cont, {:ok, stage_items ++ [screen]}}
                    else
-                     :error -> {:halt, {:error, {:unknown_v6_activity, activity_id}}}
+                     :error -> {:halt, {:error, {:unknown_v7_activity, activity_id}}}
                      {:error, reason} -> {:halt, {:error, reason}}
                    end
 
                  _ ->
-                   {:halt, {:error, :invalid_v6_stage_item}}
+                   {:halt, {:error, :invalid_v7_stage_item}}
                end
              end)
              |> case do
@@ -829,10 +804,11 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
                {:error, reason} -> {:halt, {:error, reason}}
              end
            end) do
-      synthesis = advanced_v6_synthesis_screen(content, stable_key)
+      stage_screens = wire_branch_rejoins(stage_screens, branch_sets, stages, stable_key)
+      synthesis = advanced_v7_synthesis_screen(content, stable_key)
 
       attribution_screens =
-        advanced_attribution_screens(content, attribution, "#{stable_key}:v6:attribution")
+        advanced_attribution_screens(content, attribution, "#{stable_key}:v7:attribution")
 
       {:ok, [orientation] ++ stage_screens ++ List.wrap(synthesis) ++ attribution_screens}
     end
@@ -885,8 +861,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end
   end
 
-  defp advanced_v6_orientation_screen(title, content, blueprint, stable_key) do
-    key = "#{stable_key}:v6:orientation"
+  defp advanced_v7_orientation_screen(title, content, blueprint, stable_key) do
+    key = "#{stable_key}:v7:orientation"
     duration = get_in(blueprint, ["duration_manifest", "total_minutes"])
     overview = get_in(content, ["orientation", "overview"]) || content["narrative"] || ""
     driving_question = blueprint["driving_question"]
@@ -919,9 +895,9 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     content_screen(key, title, parts)
   end
 
-  defp advanced_v6_stage_screen(stage, stage_index, stable_key) do
+  defp advanced_v7_stage_screen(stage, stage_index, stable_key) do
     stage_id = stage["id"] || stage_index
-    key = "#{stable_key}:v6:stage:#{stage_id}"
+    key = "#{stable_key}:v7:stage:#{stage_id}"
     introduction = stage["introduction"] || %{}
 
     guidance =
@@ -948,21 +924,21 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
         |> first_present()
         |> PartBuilders.text_flow(:p, y: 96)
         |> Map.put("id", stable_id("stage-introduction", key))
-      ] ++ advanced_v6_guidance_parts(guidance, key, 184)
+      ] ++ advanced_v7_guidance_parts(guidance, key, 184)
 
     content_screen(key, stage["title"] || "Exploration stage #{stage_index}", parts)
     |> Map.put(:stage_id, stage["id"])
     |> Map.put(:presentation_pattern, stage["presentation_pattern"] || "guided_reading")
   end
 
-  defp advanced_v6_guidance_parts(guidance, stable_key, starting_y) do
+  defp advanced_v7_guidance_parts(guidance, stable_key, starting_y) do
     guidance
     |> Enum.with_index(1)
     |> Enum.flat_map(fn {item, index} ->
       y = starting_y + (index - 1) * 128
 
       [
-        (item["heading"] || advanced_v6_guidance_heading(item["kind"]))
+        (item["heading"] || advanced_v7_guidance_heading(item["kind"]))
         |> PartBuilders.text_flow(:h3, y: y)
         |> Map.put("id", stable_id("guidance-heading-#{index}", stable_key)),
         item["body"]
@@ -972,16 +948,16 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end)
   end
 
-  defp advanced_v6_guidance_heading("prediction"), do: "Predict before you inspect"
-  defp advanced_v6_guidance_heading("observation"), do: "Observe and record"
-  defp advanced_v6_guidance_heading("interpretation"), do: "Interpret the evidence"
-  defp advanced_v6_guidance_heading("transfer"), do: "Transfer the relationship"
-  defp advanced_v6_guidance_heading("synthesis"), do: "Synthesize your explanation"
-  defp advanced_v6_guidance_heading(_kind), do: "Investigate the evidence"
+  defp advanced_v7_guidance_heading("prediction"), do: "Predict before you inspect"
+  defp advanced_v7_guidance_heading("observation"), do: "Observe and record"
+  defp advanced_v7_guidance_heading("interpretation"), do: "Interpret the evidence"
+  defp advanced_v7_guidance_heading("transfer"), do: "Transfer the relationship"
+  defp advanced_v7_guidance_heading("synthesis"), do: "Synthesize your explanation"
+  defp advanced_v7_guidance_heading(_kind), do: "Investigate the evidence"
 
-  defp advanced_v6_group_screens(group, stable_key, media_assets) do
+  defp advanced_v7_group_screens(group, stable_key, media_assets, media_lookup, opts) do
     group_id = group["id"]
-    key = "#{stable_key}:v6:group:#{group_id}"
+    key = "#{stable_key}:v7:group:#{group_id}"
 
     blocks =
       group
@@ -989,34 +965,30 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       |> List.wrap()
       |> Enum.reject(&(&1["rendering"] == "lesson_title"))
 
-    source_screens =
-      case blocks do
-        [] ->
+    with {:ok, source_parts} <- advanced_v7_group_parts(group, blocks, key, media_lookup, opts) do
+      source_screens =
+        if blocks == [] do
           []
-
-        source_blocks ->
+        else
           [
-            content_screen(
-              key,
-              group["title"],
-              advanced_v6_group_parts(group, source_blocks, key)
-            )
+            content_screen(key, group["title"], source_parts)
             |> Map.put(:section_id, group_id)
           ]
-      end
+        end
 
-    media_screens =
-      advanced_media_screens(
-        media_assets,
-        group_id,
-        "#{stable_key}:v6:group:#{group_id}:media",
-        group_id
-      )
+      media_screens =
+        advanced_media_screens(
+          media_assets,
+          group_id,
+          "#{stable_key}:v7:group:#{group_id}:media",
+          group_id
+        )
 
-    source_screens ++ media_screens
+      {:ok, source_screens ++ media_screens}
+    end
   end
 
-  defp advanced_v6_group_parts(group, source_blocks, stable_key) do
+  defp advanced_v7_group_parts(group, source_blocks, stable_key, media_lookup, opts) do
     purpose = present_string(group["instructional_purpose"])
 
     heading =
@@ -1038,27 +1010,51 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
 
     starting_y = if(purpose_parts == [], do: 64, else: 144)
 
-    block_parts =
-      source_blocks
-      |> Enum.with_index(1)
-      |> Enum.map(fn {block, index} ->
-        label = advanced_v6_block_title(block, "Source evidence")
-        body = advanced_v6_block_markdown(block)
+    starting_parts = [heading] ++ purpose_parts
 
-        markdown =
-          if length(source_blocks) == 1,
-            do: body,
-            else: "#### #{label}\n\n#{body}"
+    source_blocks
+    |> Enum.with_index(1)
+    |> Enum.reduce_while({:ok, starting_parts}, fn {block, index}, {:ok, parts} ->
+      block_key = "#{stable_key}:source-block-#{block["id"] || index}"
+      ast = source_ast_or_fallback(block)
+      y = max(next_part_y(parts), starting_y)
 
-        markdown
-        |> PartBuilders.text_flow(:p, y: starting_y + (index - 1) * 104)
-        |> Map.put("id", stable_id("source-block-#{block["id"] || index}", stable_key))
-      end)
+      renderer_opts =
+        Keyword.merge(opts,
+          mode: :advanced,
+          stable_key: block_key,
+          media_lookup: media_lookup,
+          source_context:
+            Map.put(block, "title", advanced_v7_block_title(block, "Source evidence")),
+          y: y,
+          vertical_gap: 112
+        )
 
-    [heading] ++ purpose_parts ++ block_parts
+      case SourceASTRenderer.render(ast, renderer_opts) do
+        {:ok, rendered} -> {:cont, {:ok, parts ++ rendered}}
+        {:attention, findings} -> {:halt, {:error, {:external_media_attention, findings}}}
+      end
+    end)
   end
 
-  defp advanced_v6_block_title(block, fallback) do
+  defp source_ast_or_fallback(block) do
+    case List.wrap(block["ast"]) do
+      [] ->
+        [
+          %{
+            "type" => "p",
+            "children" => [
+              %{"text" => block["text"] || "Source content retained for this stage."}
+            ]
+          }
+        ]
+
+      ast ->
+        ast
+    end
+  end
+
+  defp advanced_v7_block_title(block, fallback) do
     case block["kind"] do
       "equation" -> "Work with the relationship"
       "table" -> "Analyze the source table"
@@ -1069,91 +1065,174 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end
   end
 
-  defp advanced_v6_block_markdown(block) do
-    block
-    |> Map.get("ast", [])
-    |> List.wrap()
-    |> Enum.map_join("\n\n", &advanced_v6_ast_markdown/1)
-    |> present_string()
-    |> case do
-      nil -> present_string(block["text"]) || "Source content retained for this stage."
-      markdown -> markdown
-    end
-  end
-
-  defp advanced_v6_ast_markdown(%{"type" => type, "src" => source})
-       when type in ["formula", "formula_inline"] and is_binary(source) do
-    if type == "formula", do: "\\[#{source}\\]", else: "\\(#{source}\\)"
-  end
-
-  defp advanced_v6_ast_markdown(%{"type" => "img"}), do: ""
-
-  defp advanced_v6_ast_markdown(%{"type" => type, "children" => children})
-       when type in ["ul", "ol"] do
-    children
-    |> List.wrap()
-    |> Enum.with_index(1)
-    |> Enum.map_join("\n", fn {child, index} ->
-      marker = if(type == "ol", do: "#{index}.", else: "-")
-      "#{marker} #{advanced_v6_ast_markdown(child)}"
-    end)
-  end
-
-  defp advanced_v6_ast_markdown(%{"type" => "table", "children" => rows}) do
-    rows
-    |> List.wrap()
-    |> Enum.map_join("\n", fn row ->
-      cells = row |> Map.get("children", []) |> Enum.map(&advanced_v6_ast_markdown/1)
-      "| #{Enum.join(cells, " | ")} |"
-    end)
-  end
-
-  defp advanced_v6_ast_markdown(%{"type" => type, "children" => children})
-       when type in ["h1", "h2", "h3", "h4", "h5", "h6"] do
-    "### #{Enum.map_join(List.wrap(children), "", &advanced_v6_ast_markdown/1)}"
-  end
-
-  defp advanced_v6_ast_markdown(%{"type" => "a", "href" => href, "children" => children}) do
-    label = Enum.map_join(List.wrap(children), "", &advanced_v6_ast_markdown/1)
-    if present_text?(href), do: "[#{label}](#{href})", else: label
-  end
-
-  defp advanced_v6_ast_markdown(%{"children" => children}),
-    do: Enum.map_join(List.wrap(children), "", &advanced_v6_ast_markdown/1)
-
-  defp advanced_v6_ast_markdown(%{"text" => text} = leaf) when is_binary(text) do
-    cond do
-      leaf["bold"] == true -> "**#{text}**"
-      leaf["italic"] == true -> "*#{text}*"
-      leaf["code"] == true -> "`#{text}`"
-      true -> text
-    end
-  end
-
-  defp advanced_v6_ast_markdown(_node), do: ""
-
-  defp advanced_v6_activity_screen(
+  defp advanced_v7_activity_screen(
          activity,
          stage,
          stage_index,
          item_index,
          stable_key,
          content_screens,
+         branch_set,
          opts
        ) do
-    activity = advanced_v6_activity_as_internal_screen(activity, stage)
+    activity = advanced_v7_activity_as_internal_screen(activity, stage)
 
-    adaptive_activity_screen(
-      activity,
-      stage_index * 100 + item_index,
-      "#{stable_key}:v6",
-      [],
-      content_screens,
-      opts
-    )
+    with {:ok, screen} <-
+           adaptive_activity_screen(
+             activity,
+             stage_index * 100 + item_index,
+             "#{stable_key}:v7",
+             [],
+             content_screens,
+             opts
+           ),
+         {:ok, screen} <-
+           add_answer_branch_rules(screen, activity, branch_set, content_screens, stable_key) do
+      {:ok, screen}
+    end
   end
 
-  defp advanced_v6_activity_as_internal_screen(activity, stage) do
+  defp add_answer_branch_rules(screen, _activity, nil, _content_screens, _stable_key),
+    do: {:ok, screen}
+
+  defp add_answer_branch_rules(screen, activity, branch_set, content_screens, stable_key) do
+    interaction =
+      Enum.find(screen.parts, &(&1["type"] in ["janus-mcq", "janus-dropdown"]))
+
+    choices = List.wrap(activity["choices"])
+
+    branch_set["pathways"]
+    |> List.wrap()
+    |> Enum.with_index(1)
+    |> Enum.reduce_while({:ok, []}, fn {pathway, pathway_index}, {:ok, rules} ->
+      choice_index = Enum.find_index(choices, &(&1["id"] == pathway["choice_id"]))
+
+      target =
+        Enum.find(content_screens, &(&1[:section_id] == pathway["target_content_group_id"]))
+
+      case {interaction, choice_index, target} do
+        {%{"id" => part_id, "type" => type}, choice_index, %{key: target_key}}
+        when is_integer(choice_index) ->
+          rule_key = "#{stable_key}:branch:#{branch_set["id"]}:#{pathway_index}"
+
+          condition = %{
+            "fact" => branch_fact(type, part_id),
+            "operator" => "equal",
+            "value" => to_string(choice_index + 1),
+            "type" => 1
+          }
+
+          actions =
+            generated_capi_feedback_actions(pathway["feedback"], rule_key) ++
+              [
+                %{
+                  "type" => "navigation",
+                  "params" => %{"target" => stable_id("sequence", target_key)}
+                }
+              ]
+
+          rule = %{
+            "id" => stable_id("rule", rule_key),
+            "name" => "answer-branch-#{pathway_index}",
+            "disabled" => false,
+            "additionalScore" => 0.0,
+            "forceProgress" => true,
+            "default" => false,
+            "correct" => choice_correct?(activity, pathway["choice_id"], choice_index),
+            "conditions" => %{"all" => [condition]},
+            "event" => %{
+              "type" => stable_id("event", rule_key),
+              "params" => %{"actions" => actions}
+            }
+          }
+
+          {:cont, {:ok, rules ++ [rule]}}
+
+        {nil, _choice_index, _target} ->
+          {:halt, {:error, {:branch_interaction_missing, branch_set["id"]}}}
+
+        {_interaction, nil, _target} ->
+          {:halt, {:error, {:branch_choice_missing, pathway["choice_id"]}}}
+
+        {_interaction, _choice_index, nil} ->
+          {:halt, {:error, {:branch_target_missing, pathway["target_content_group_id"]}}}
+      end
+    end)
+    |> case do
+      {:ok, branch_rules} ->
+        {:ok,
+         screen
+         |> Map.put(:rules, branch_rules ++ screen.rules)
+         |> Map.put(:branch_set_id, branch_set["id"])
+         |> Map.put(:branch_rejoin_stage_id, branch_set["rejoin_stage_id"])}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp branch_fact("janus-mcq", part_id), do: "stage.#{part_id}.selectedChoice"
+  defp branch_fact("janus-dropdown", part_id), do: "stage.#{part_id}.selectedIndex"
+
+  defp choice_correct?(activity, choice_id, choice_index) do
+    activity["correct_choice_id"] == choice_id or
+      activity["correct_index"] == choice_index or
+      get_in(Enum.at(List.wrap(activity["choices"]), choice_index) || %{}, ["correct"]) == true
+  end
+
+  defp wire_branch_rejoins(screens, branch_sets, stages, stable_key) do
+    stage_ids = MapSet.new(Enum.map(stages, & &1["id"]))
+
+    Enum.reduce(branch_sets, screens, fn branch_set, updated_screens ->
+      rejoin_stage_id = branch_set["rejoin_stage_id"]
+
+      if MapSet.member?(stage_ids, rejoin_stage_id) do
+        rejoin_target =
+          stable_id("sequence", "#{stable_key}:v7:stage:#{rejoin_stage_id}")
+
+        branch_set["pathways"]
+        |> List.wrap()
+        |> Enum.map(& &1["target_content_group_id"])
+        |> Enum.uniq()
+        |> Enum.reduce(updated_screens, fn target_group_id, path_screens ->
+          last_index =
+            path_screens
+            |> Enum.with_index()
+            |> Enum.filter(fn {screen, _index} -> screen[:section_id] == target_group_id end)
+            |> List.last()
+            |> case do
+              {_screen, index} -> index
+              nil -> nil
+            end
+
+          if is_integer(last_index) do
+            List.update_at(path_screens, last_index, fn screen ->
+              Map.update!(screen, :rules, &put_rejoin_navigation(&1, rejoin_target))
+            end)
+          else
+            path_screens
+          end
+        end)
+      else
+        updated_screens
+      end
+    end)
+  end
+
+  defp put_rejoin_navigation(rules, target) do
+    Enum.map(rules, fn
+      %{"name" => "correct"} = rule ->
+        update_in(rule, ["event", "params", "actions"], fn actions ->
+          actions = Enum.reject(List.wrap(actions), &(&1["type"] == "navigation"))
+          actions ++ [%{"type" => "navigation", "params" => %{"target" => target}}]
+        end)
+
+      rule ->
+        rule
+    end)
+  end
+
+  defp advanced_v7_activity_as_internal_screen(activity, stage) do
     type = activity["interaction_type"]
     interaction_type = if(type in ["short_answer", "reflection"], do: "text", else: type)
     context = present_string(activity["context"])
@@ -1171,10 +1250,10 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     |> Map.put("remediation_section_id", activity["remediation_content_group_id"])
   end
 
-  defp advanced_v6_synthesis_screen(content, stable_key) do
+  defp advanced_v7_synthesis_screen(content, stable_key) do
     synthesis = content["synthesis"] || %{}
     takeaways = normalize_strings(synthesis["takeaways"])
-    key = "#{stable_key}:v6:synthesis"
+    key = "#{stable_key}:v7:synthesis"
 
     parts =
       titled_content_parts(
@@ -1753,7 +1832,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
         |> Map.put("id", stable_id("image", key))
 
       caption =
-        [asset.caption, asset.credit]
+        [asset.caption, asset.proximal_attribution]
         |> Enum.filter(&present_text?/1)
         |> Enum.join(" — ")
 
@@ -1793,8 +1872,8 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
         [
           content_screen(
             stable_key,
-            "Sources and attribution",
-            titled_list_parts("Sources and attribution", normalized_lines, stable_key)
+            "Sources and Credits",
+            titled_list_parts("Sources and Credits", normalized_lines, stable_key)
           )
         ]
     end
@@ -2100,6 +2179,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
            alt: alt,
            caption: caption,
            credit: credit,
+           proximal_attribution: normalized_entry.proximal_attribution,
            title: title,
            height: height
          }}
@@ -2113,6 +2193,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       alt: nil,
       caption: nil,
       credit: nil,
+      proximal_attribution: nil,
       title: nil,
       height: nil
     }
@@ -2146,6 +2227,11 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
           map_value(entry, "attribution"),
           map_value(entry, "source")
         ]),
+      proximal_attribution:
+        if(map_value(entry, "proximal_attribution_required") == true,
+          do: first_present([map_value(entry, "byline"), map_value(entry, "credit")]),
+          else: nil
+        ),
       title: first_present([map_value(entry, "title"), map_value(entry, "heading")]),
       height: map_value(entry, "height")
     }
@@ -2161,6 +2247,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
       alt: nil,
       caption: nil,
       credit: nil,
+      proximal_attribution: nil,
       title: nil,
       height: nil
     }
@@ -2182,13 +2269,26 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
           map_value(value, "attribution"),
           map_value(value, "source")
         ]),
+      proximal_attribution:
+        if(map_value(value, "proximal_attribution_required") == true,
+          do: first_present([map_value(value, "byline"), map_value(value, "credit")]),
+          else: nil
+        ),
       title: first_present([map_value(value, "title"), map_value(value, "heading")]),
       height: map_value(value, "height")
     }
   end
 
   defp normalize_media_override(_value) do
-    %{url: nil, alt: nil, caption: nil, credit: nil, title: nil, height: nil}
+    %{
+      url: nil,
+      alt: nil,
+      caption: nil,
+      credit: nil,
+      proximal_attribution: nil,
+      title: nil,
+      height: nil
+    }
   end
 
   defp fetch_media_override(media_urls, media_id) do
@@ -2288,6 +2388,46 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
     end
   end
 
+  defp enrich_attribution(attribution, content, media_assets) do
+    source_blocks =
+      content
+      |> Map.get("content_groups", [])
+      |> List.wrap()
+      |> Enum.flat_map(&List.wrap(&1["source_blocks"]))
+
+    source_credit_lines =
+      source_blocks
+      |> Enum.flat_map(fn block ->
+        label = first_present([block["title"], block["caption"], block["id"], "Source item"])
+
+        [
+          if(present_text?(block["credit"]), do: "#{label} — #{block["credit"]}"),
+          if(present_text?(block["license"]), do: "#{label} — License: #{block["license"]}")
+        ]
+      end)
+
+    media_credit_lines =
+      media_assets
+      |> Enum.flat_map(fn asset ->
+        if present_text?(asset.credit) do
+          ["#{asset.title || asset.caption || asset.id} — #{asset.credit}"]
+        else
+          []
+        end
+      end)
+
+    source_links = normalize_source_links(content["source_evidence_links"])
+
+    %{
+      attribution
+      | lines:
+          (attribution.lines ++ source_credit_lines ++ media_credit_lines)
+          |> normalize_strings()
+          |> Enum.uniq(),
+        links: Enum.uniq_by(attribution.links ++ source_links, & &1.url)
+    }
+  end
+
   defp attribution_labeled_value(_label, nil), do: nil
 
   defp attribution_labeled_value(label, value) when is_list(value) do
@@ -2380,11 +2520,11 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompiler do
   defp questions(items) when is_list(items), do: items
   defp questions(_), do: []
 
-  defp validate_questions(questions, "basic", %{"schema_version" => 5})
+  defp validate_questions(questions, "basic", %{"schema_version" => 7})
        when length(questions) in 0..10,
        do: normalize_questions_for_compile(questions)
 
-  defp validate_questions([], "advanced", %{"schema_version" => 6}), do: {:ok, []}
+  defp validate_questions([], "advanced", %{"schema_version" => 7}), do: {:ok, []}
 
   defp validate_questions(_, _, _), do: {:error, :invalid_question_count}
 

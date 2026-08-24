@@ -4,10 +4,16 @@ defmodule OliWeb.Endpoint do
   @session_options [
     store: :cookie,
     key: "_oli_key",
-    signing_salt: "KydU49lB",
-    same_site: "None",
-    secure: true
+    signing_salt: "KydU49lB"
   ]
+
+  # LTI needs a cross-site cookie on HTTPS, while browsers reject that cookie on local HTTP.
+  @http_session_options Plug.Session.init(
+                          Keyword.merge(@session_options, same_site: "Lax", secure: false)
+                        )
+  @https_session_options Plug.Session.init(
+                           Keyword.merge(@session_options, same_site: "None", secure: true)
+                         )
 
   socket("/v1/api/state", OliWeb.UserSocket,
     websocket: true,
@@ -75,7 +81,15 @@ defmodule OliWeb.Endpoint do
   # The session will be stored in the cookie and signed,
   # this means its contents can be read but not tampered with.
   # Set :encryption_salt if you would also like to encrypt it.
-  plug(Plug.Session, @session_options)
+  plug(:session)
 
   plug(OliWeb.Router)
+
+  defp session(%Plug.Conn{scheme: :https} = conn, _opts) do
+    Plug.Session.call(conn, @https_session_options)
+  end
+
+  defp session(conn, _opts) do
+    Plug.Session.call(conn, @http_session_options)
+  end
 end

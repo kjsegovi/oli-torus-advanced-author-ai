@@ -13,18 +13,19 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Generator.UntrustedGenerated do
   alias Oli.GenAI.Execution
 
   alias Oli.OpenStax.CourseImport.{
+    AIUsageLedger,
     EnrichmentProposal,
     EnrichmentResearchSet,
     GeneratedSimulation,
+    ModelRoutingPolicy,
     SimulationSpec
   }
 
   alias Oli.OpenStax.CourseImport.Enrichment.LibraryRegistry
 
-  @feature :openstax_course_import
   @prompt_version "simulation-bundle-v1"
   @default_model "gpt-5.6-sol"
-  @max_candidates 4
+  @max_candidates 2
 
   @impl true
   def available? do
@@ -191,8 +192,20 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Generator.UntrustedGenerated do
       end
 
     service = Keyword.get(opts, :service) || service()
+
+    service =
+      ModelRoutingPolicy.service_config(service, :simulation_bundle_builder,
+        first_pass: is_nil(Keyword.get(opts, :repair))
+      )
+
     execution = Keyword.get(opts, :execution_fun, &Execution.generate_with_metadata/4)
-    context = %{request_type: :generate, feature: @feature, phase: :simulation_bundle_builder}
+
+    context =
+      AIUsageLedger.request_context(opts, :simulation_bundle_builder, %{
+        candidate_number: if(is_nil(Keyword.get(opts, :repair)), do: 1, else: 2),
+        operation_id: Keyword.get(opts, :operation_id),
+        cost_scope: :simulation
+      })
 
     result =
       case Function.info(execution, :arity) do

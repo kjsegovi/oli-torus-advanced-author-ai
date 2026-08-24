@@ -5,7 +5,7 @@ defmodule Oli.OpenStax.CourseImport.MediaWorkerTest do
   alias Oli.OpenStax.CourseImport
 
   alias Oli.OpenStax.CourseImport.{
-    BasicPlanV5,
+    BasicPlanV7,
     Lesson,
     LessonPlan,
     RichSource,
@@ -231,7 +231,7 @@ defmodule Oli.OpenStax.CourseImport.MediaWorkerTest do
     }
 
     {:ok, content} =
-      BasicPlanV5.build(
+      BasicPlanV7.build(
         %{
           "title" => "Media lesson",
           "orientation" => %{"overview" => "Interpret the selected source diagram."},

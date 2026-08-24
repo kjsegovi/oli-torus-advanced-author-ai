@@ -98,13 +98,17 @@ defmodule Oli.GenAI.Agent.LLMBridge do
     tools = Map.get(opts, :tools, ToolBroker.tools_for_completion())
     completion_functions = convert_tools_to_completion_functions(tools)
 
-    request_ctx = %{
-      request_type: :generate,
-      feature: :agent,
-      section_id: Map.get(opts, :section_id),
-      actor_id: Map.get(opts, :actor_id),
-      service_config_id: config.id
-    }
+    request_ctx =
+      Map.merge(
+        %{
+          request_type: :generate,
+          feature: :agent,
+          section_id: Map.get(opts, :section_id),
+          actor_id: Map.get(opts, :actor_id),
+          service_config_id: config.id
+        },
+        Map.get(opts, :request_ctx, %{})
+      )
 
     Execution.generate_with_metadata(
       request_ctx,

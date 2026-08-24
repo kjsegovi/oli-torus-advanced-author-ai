@@ -64,6 +64,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
        poll_timer: nil,
        pubsub_refresh_timer: nil,
        subscribed_run_id: nil,
+       selected_lesson_id: nil,
        editing_lesson_id: nil,
        rejecting_lesson_id: nil,
        scope_selected_ids: []
@@ -71,10 +72,14 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   end
 
   @impl Phoenix.LiveView
-  def handle_params(%{"run_id" => run_id}, _uri, socket) do
+  def handle_params(%{"run_id" => run_id} = params, _uri, socket) do
     case CourseImport.get_run(socket.assigns.project, socket.assigns.author, run_id) do
       {:ok, run} ->
-        {:noreply, socket |> assign(error_message: nil) |> assign_run(run)}
+        {:noreply,
+         socket
+         |> assign(error_message: nil)
+         |> assign_run(run)
+         |> select_lesson_from_params(params)}
 
       {:error, :not_found} ->
         {:noreply,
@@ -140,7 +145,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
            socket,
            error_message:
              gettext(
-               "This project contains an unfinished legacy import. It remains unchanged; start a new v6 import in a new project."
+               "This project contains an unfinished legacy import. It remains unchanged; start a new v7 import in a new project."
              )
          )}
 
@@ -288,6 +293,30 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
          {:ok, refreshed} <-
            CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
       {:noreply, socket |> assign(error_message: nil) |> assign_run(refreshed)}
+    else
+      {:error, reason} -> {:noreply, assign(socket, error_message: course_import_error(reason))}
+      _ -> {:noreply, socket}
+    end
+  end
+
+  def handle_event("regenerate_blocked_lessons", _params, socket) do
+    with %{} = run <- socket.assigns.run,
+         {:ok, count} <-
+           CourseImport.regenerate_blocked_lessons(run.id, socket.assigns.author),
+         {:ok, refreshed} <-
+           CourseImport.get_run(socket.assigns.project, socket.assigns.author, run.id) do
+      message =
+        ngettext(
+          "One blocked lesson is queued for automatic repair.",
+          "%{count} blocked lessons are queued for automatic repair.",
+          count
+        )
+
+      {:noreply,
+       socket
+       |> assign(error_message: nil)
+       |> put_flash(:info, message)
+       |> assign_run(refreshed)}
     else
       {:error, reason} -> {:noreply, assign(socket, error_message: course_import_error(reason))}
       _ -> {:noreply, socket}
@@ -572,7 +601,9 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
              checkpoint.id
            ) do
         {:ok, detailed_run} ->
-          assign_run(socket, detailed_run)
+          socket
+          |> clear_error_after_status_change(current, detailed_run)
+          |> assign_run(detailed_run)
 
         {:error, reason} ->
           socket
@@ -582,12 +613,18 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     end
   end
 
+  defp clear_error_after_status_change(socket, %{status: status}, %{status: status}), do: socket
+
+  defp clear_error_after_status_change(socket, _current, _refreshed),
+    do: assign(socket, error_message: nil)
+
   defp assign_run(socket, run) do
     socket
     |> cancel_poll()
     |> cancel_pubsub_refresh()
     |> subscribe_to_run(run)
     |> assign(run: run, run_estimate: Estimator.estimate(run))
+    |> ensure_selected_lesson(run)
     |> assign_scope_selection(run)
     |> schedule_poll(run)
   end
@@ -661,12 +698,22 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
 
   defp maybe_patch_run_path(socket, run) do
     if connected?(socket),
-      do: push_patch(socket, to: run_path(socket.assigns.project.slug, run.id), replace: true),
+      do:
+        push_patch(socket,
+          to: run_path(socket.assigns.project.slug, run.id, socket.assigns.selected_lesson_id),
+          replace: true
+        ),
       else: socket
   end
 
   defp run_path(project_slug, run_id),
     do: ~p"/workspaces/course_author/#{project_slug}/curriculum/import/openstax?run_id=#{run_id}"
+
+  defp run_path(project_slug, run_id, nil), do: run_path(project_slug, run_id)
+
+  defp run_path(project_slug, run_id, lesson_id),
+    do:
+      ~p"/workspaces/course_author/#{project_slug}/curriculum/import/openstax?run_id=#{run_id}&lesson_id=#{lesson_id}"
 
   defp import_form, do: Component.to_form(%{"source_url" => ""}, as: @form_name)
   defp form_with_errors(attrs), do: Component.to_form(attrs, as: @form_name)
@@ -981,6 +1028,138 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   defp lessons_for_unit(%{lessons: lessons}) when is_list(lessons), do: lessons
   defp lessons_for_unit(_), do: []
 
+  defp lesson_tabs(run) do
+    run
+    |> units_for_run()
+    |> Enum.flat_map(fn unit -> Enum.map(lessons_for_unit(unit), &{unit, &1}) end)
+    |> Enum.with_index(1)
+    |> Enum.map(fn {{unit, lesson}, ordinal} ->
+      %{
+        unit: unit,
+        lesson: lesson,
+        ordinal: ordinal,
+        state: lesson_tab_state(lesson)
+      }
+    end)
+  end
+
+  defp ensure_selected_lesson(socket, run) do
+    selected = socket.assigns[:selected_lesson_id]
+    tabs = lesson_tabs(run)
+
+    selected =
+      case Enum.find(tabs, &(to_string(&1.lesson.id) == to_string(selected))) do
+        nil -> default_lesson_tab(tabs)
+        tab -> tab
+      end
+
+    assign(socket, selected_lesson_id: selected && to_string(selected.lesson.id))
+  end
+
+  defp select_lesson_from_params(socket, %{"lesson_id" => lesson_id}) do
+    case find_lesson(socket.assigns.run, lesson_id) do
+      nil -> ensure_selected_lesson(assign(socket, selected_lesson_id: nil), socket.assigns.run)
+      lesson -> assign(socket, selected_lesson_id: to_string(lesson.id))
+    end
+  end
+
+  defp select_lesson_from_params(socket, _params), do: socket
+
+  defp default_lesson_tab(tabs) do
+    Enum.find(tabs, &(&1.state == :error)) ||
+      Enum.find(tabs, &(&1.state == :attention)) || List.first(tabs)
+  end
+
+  defp lesson_tab_state(lesson) do
+    cond do
+      lesson_planning_failed?(lesson) or Map.get(lesson, :status) == "failed" or
+          v7_quality_findings(lesson, "hard_blocker") != [] ->
+        :error
+
+      lesson_busy?(lesson) ->
+        :active
+
+      lesson_needs_author_review?(lesson) or v7_quality_findings(lesson, "repair") != [] ->
+        :attention
+
+      current_lesson_approvable?(lesson) or
+          Map.get(lesson, :status) in ["approved", "compiled", "applied"] ->
+        :passed
+
+      true ->
+        :pending
+    end
+  end
+
+  defp lesson_tab_status(:error), do: gettext("Error")
+  defp lesson_tab_status(:active), do: gettext("Generation active")
+  defp lesson_tab_status(:attention), do: gettext("Needs attention")
+  defp lesson_tab_status(:passed), do: gettext("Checks passed")
+  defp lesson_tab_status(:pending), do: gettext("Pending review")
+
+  defp lesson_tab_icon(:error), do: "hero-x-circle"
+  defp lesson_tab_icon(:active), do: "hero-arrow-path"
+  defp lesson_tab_icon(:attention), do: "hero-exclamation-triangle"
+  defp lesson_tab_icon(:passed), do: "hero-check-circle"
+  defp lesson_tab_icon(:pending), do: "hero-clock"
+
+  defp lesson_tab_icon_class(:active), do: "h-5 w-5 shrink-0 animate-spin"
+  defp lesson_tab_icon_class(_state), do: "h-5 w-5 shrink-0"
+
+  defp lesson_tab_class(state, selected?) do
+    status_class =
+      case state do
+        :error -> "border-red-300 bg-red-50 text-red-900"
+        :active -> "border-blue-300 bg-blue-50 text-blue-900"
+        :attention -> "border-amber-300 bg-amber-50 text-amber-950"
+        :passed -> "border-green-300 bg-green-50 text-green-900"
+        :pending -> "border-slate-300 bg-slate-50 text-slate-700"
+      end
+
+    selected_class =
+      if selected?,
+        do: "ring-2 ring-primary ring-offset-2",
+        else: "hover:border-slate-500"
+
+    [
+      "group inline-flex min-w-48 max-w-64 shrink-0 items-center gap-2 rounded-md border px-3 py-2 text-left text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
+      status_class,
+      selected_class
+    ]
+  end
+
+  defp active_unit_for_run(run, lesson_id) do
+    run
+    |> lesson_tabs()
+    |> Enum.find(&(to_string(&1.lesson.id) == to_string(lesson_id)))
+    |> case do
+      nil -> []
+      tab -> [tab.unit]
+    end
+  end
+
+  defp active_lessons_for_unit(unit, lesson_id) do
+    unit
+    |> lessons_for_unit()
+    |> Enum.filter(&(to_string(&1.id) == to_string(lesson_id)))
+  end
+
+  defp adjacent_lesson(run, lesson_id, offset) do
+    tabs = lesson_tabs(run)
+    index = Enum.find_index(tabs, &(to_string(&1.lesson.id) == to_string(lesson_id)))
+
+    case is_integer(index) && Enum.at(tabs, index + offset) do
+      %{lesson: lesson} -> lesson
+      _ -> nil
+    end
+  end
+
+  defp unsaved_tab_confirmation(editing_lesson_id, rejecting_lesson_id) do
+    if editing_lesson_id || rejecting_lesson_id,
+      do: gettext("Discard your unsaved lesson changes and switch pages?"),
+      else: nil
+  end
+
   defp lesson_count(unit), do: unit |> lessons_for_unit() |> length()
 
   defp total_lesson_count(run) do
@@ -1085,10 +1264,8 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     planning = lesson_planning_summary(run)
 
     [
-      gettext("%{completed} of %{total} ready",
-        completed: planning.completed,
-        total: planning.total
-      ),
+      lesson_planning_completion_text(run, planning),
+      lesson_attention_count_text(run),
       planning_count_text(planning.running, "generating"),
       planning_count_text(planning.queued, "queued"),
       planning_count_text(planning.retrying, "retrying"),
@@ -1097,6 +1274,29 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     |> Enum.reject(&is_nil/1)
     |> Enum.join(" · ")
   end
+
+  defp lesson_planning_completion_text(%{status: :awaiting_lesson_approval}, planning) do
+    gettext("%{completed} of %{total} generated",
+      completed: planning.completed,
+      total: planning.total
+    )
+  end
+
+  defp lesson_planning_completion_text(_run, planning) do
+    gettext("%{completed} of %{total} ready",
+      completed: planning.completed,
+      total: planning.total
+    )
+  end
+
+  defp lesson_attention_count_text(%{status: :awaiting_lesson_approval} = run) do
+    case attention_lesson_count(run) do
+      0 -> nil
+      count -> ngettext("1 needs attention", "%{count} need attention", count)
+    end
+  end
+
+  defp lesson_attention_count_text(_run), do: nil
 
   defp planning_count_text(0, _state), do: nil
 
@@ -1208,18 +1408,33 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   end
 
   defp regenerate_button_label(lesson) do
-    if lesson_planning_failed?(lesson) and Map.get(lesson, :planning_operation) == "regenerate",
-      do: gettext("Retry regeneration"),
-      else: gettext("Regenerate")
+    cond do
+      lesson_planning_failed?(lesson) and Map.get(lesson, :planning_operation) == "regenerate" ->
+        gettext("Retry repair")
+
+      lesson_needs_author_review?(lesson) ->
+        gettext("Fix with AI")
+
+      true ->
+        gettext("Regenerate")
+    end
   end
 
   defp lesson_planning_error_message(lesson) do
     error = Map.get(lesson, :planning_error) || %{}
+    category = map_string_key(error, "category", nil)
     message = map_string_key(error, "message", nil) || map_string_key(error, "reason", nil)
 
-    if is_binary(message) and String.trim(message) != "",
-      do: message,
-      else: gettext("The lesson could not be regenerated. Its previous plan is still available.")
+    cond do
+      category == "ai_cost_limit_exceeded" ->
+        gettext("Generation paused for support review.")
+
+      is_binary(message) and String.trim(message) != "" ->
+        message
+
+      true ->
+        gettext("The lesson could not be regenerated. Its previous plan is still available.")
+    end
   end
 
   defp lesson_planning_failure_categories(run) do
@@ -1264,6 +1479,9 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   defp lesson_planning_failure_category_label("provider_timeout"),
     do: gettext("Content provider timeout")
 
+  defp lesson_planning_failure_category_label("ai_cost_limit_exceeded"),
+    do: gettext("Generation paused for support review")
+
   defp lesson_planning_failure_category_label("rate_limited"),
     do: gettext("Content provider throttling")
 
@@ -1287,6 +1505,18 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
 
   defp lesson_planning_failure_category_label("unclassified_generation_failure"),
     do: gettext("Unexpected generation response")
+
+  defp lesson_planning_failure_category_label("advanced_content_contract_exhausted"),
+    do: gettext("Advanced lesson structure validation exhausted")
+
+  defp lesson_planning_failure_category_label("advanced_content_contract_stalled"),
+    do: gettext("Advanced lesson structure repair stalled")
+
+  defp lesson_planning_failure_category_label("advanced_activity_contract_exhausted"),
+    do: gettext("Advanced activity validation exhausted")
+
+  defp lesson_planning_failure_category_label("advanced_activity_contract_stalled"),
+    do: gettext("Advanced activity repair stalled")
 
   defp lesson_planning_failure_category_label("lesson_plan_persistence_failed"),
     do: gettext("Lesson plan could not be saved")
@@ -1517,9 +1747,17 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     end
   end
 
-  defp v5_lesson?(lesson), do: plan_content(lesson, "schema_version", 0) == 5
-  defp v6_lesson?(lesson), do: plan_content(lesson, "schema_version", 0) == 6
-  defp current_lesson?(lesson), do: v5_lesson?(lesson) or v6_lesson?(lesson)
+  defp basic_v7_lesson?(lesson),
+    do:
+      plan_content(lesson, "schema_version", 0) == 7 and
+        plan_content(lesson, "authoring_mode", "") == "basic"
+
+  defp advanced_v7_lesson?(lesson),
+    do:
+      plan_content(lesson, "schema_version", 0) == 7 and
+        plan_content(lesson, "authoring_mode", "") == "advanced"
+
+  defp current_lesson?(lesson), do: basic_v7_lesson?(lesson) or advanced_v7_lesson?(lesson)
 
   defp plan_content_groups(lesson) do
     lesson
@@ -1529,50 +1767,50 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
 
   defp plan_synthesis(lesson), do: plan_content(lesson, "synthesis", %{})
 
-  defp v5_group_source_blocks(group), do: plan_item_maps(group, "source_blocks")
-  defp v5_group_media(group), do: plan_item_maps(group, "media")
+  defp v7_group_source_blocks(group), do: plan_item_maps(group, "source_blocks")
+  defp v7_group_media(group), do: plan_item_maps(group, "media")
 
-  defp v5_source_block_preview_text(block) do
+  defp v7_source_block_preview_text(block) do
     ast_text =
       block
       |> plan_item_value("ast", [])
-      |> v5_ast_preview_text()
+      |> v7_ast_preview_text()
       |> String.replace(~r/\s+/u, " ")
       |> String.trim()
 
     if ast_text == "", do: plan_item_value(block, "text"), else: ast_text
   end
 
-  defp v5_ast_preview_text(value) when is_map(value) do
+  defp v7_ast_preview_text(value) when is_map(value) do
     [
       map_string_key(value, "text", ""),
-      v5_ast_preview_text(map_string_key(value, "children", []))
+      v7_ast_preview_text(map_string_key(value, "children", []))
     ]
     |> Enum.reject(&(&1 == ""))
     |> Enum.join(" ")
   end
 
-  defp v5_ast_preview_text(value) when is_list(value),
-    do: Enum.map_join(value, " ", &v5_ast_preview_text/1)
+  defp v7_ast_preview_text(value) when is_list(value),
+    do: Enum.map_join(value, " ", &v7_ast_preview_text/1)
 
-  defp v5_ast_preview_text(_value), do: ""
+  defp v7_ast_preview_text(_value), do: ""
 
-  defp v5_generation_metadata(lesson) do
+  defp v7_generation_metadata(lesson) do
     case latest_plan(lesson) do
       %{generation_metadata: metadata} when is_map(metadata) -> metadata
       _ -> %{}
     end
   end
 
-  defp v5_quality_gate(lesson) do
+  defp v7_quality_gate(lesson) do
     lesson
-    |> v5_generation_metadata()
+    |> v7_generation_metadata()
     |> map_string_key("quality_gate", %{})
   end
 
-  defp v5_quality_confidence(lesson) do
+  defp v7_quality_confidence(lesson) do
     lesson
-    |> v5_quality_gate()
+    |> v7_quality_gate()
     |> map_string_key("confidence", 0.0)
     |> case do
       value when is_integer(value) ->
@@ -1592,13 +1830,13 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     end
   end
 
-  defp v5_quality_confidence_label(lesson) do
-    percentage = v5_quality_confidence(lesson) * 100
+  defp v7_quality_confidence_label(lesson) do
+    percentage = v7_quality_confidence(lesson) * 100
     :erlang.float_to_binary(percentage, decimals: 0) <> "%"
   end
 
-  defp v5_quality_findings(lesson, severity) do
-    gate = v5_quality_gate(lesson)
+  defp v7_quality_findings(lesson, severity) do
+    gate = v7_quality_gate(lesson)
 
     findings =
       case severity do
@@ -1611,9 +1849,9 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     normalize_plan_maps(findings)
   end
 
-  defp v5_role_rows(lesson) do
+  defp v7_role_rows(lesson) do
     lesson
-    |> v5_generation_metadata()
+    |> v7_generation_metadata()
     |> map_string_key("roles", %{})
     |> Enum.map(fn {role, identity} ->
       %{
@@ -1625,9 +1863,9 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     |> Enum.sort_by(& &1["role"])
   end
 
-  defp v5_repair_history(lesson) do
+  defp v7_repair_history(lesson) do
     lesson
-    |> v5_generation_metadata()
+    |> v7_generation_metadata()
     |> map_string_key("repair_history", %{})
     |> Enum.flat_map(fn {stage, attempts} ->
       attempts
@@ -1644,17 +1882,111 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
 
   defp current_lesson_approvable?(lesson) do
     if current_lesson?(lesson) do
-      gate = v5_quality_gate(lesson)
+      gate = v7_quality_gate(lesson)
 
       map_string_key(gate, "approved", false) == true and
-        v5_quality_confidence(lesson) >= 0.9 and
-        v5_quality_findings(lesson, "hard_blocker") == [] and
-        v5_quality_findings(lesson, "repair") == [] and
+        v7_quality_confidence(lesson) >= 0.9 and
+        v7_quality_findings(lesson, "hard_blocker") == [] and
+        v7_quality_findings(lesson, "repair") == [] and
         check_status(lesson_checks(lesson)) in ["ok", "passed"]
     else
       false
     end
   end
+
+  defp bulk_approval_ready?(run) do
+    lessons = run |> units_for_run() |> Enum.flat_map(&lessons_for_unit/1)
+    lessons != [] and Enum.all?(lessons, &bulk_approvable_lesson?/1)
+  end
+
+  defp bulk_approval_blocked_count(run) do
+    run
+    |> units_for_run()
+    |> Enum.flat_map(&lessons_for_unit/1)
+    |> Enum.count(&(not bulk_approvable_lesson?(&1)))
+  end
+
+  defp blocked_lessons(run) do
+    run
+    |> units_for_run()
+    |> Enum.flat_map(&lessons_for_unit/1)
+    |> Enum.reject(&bulk_approvable_lesson?/1)
+  end
+
+  defp bulk_repair_available?(run),
+    do: Enum.any?(blocked_lessons(run), &(not lesson_busy?(&1)))
+
+  defp lesson_resolution_kind(lesson) do
+    reason = map_string_key(v7_quality_gate(lesson), "attention_reason", "")
+
+    cond do
+      reason == "content_quality_source_owned" -> :source_diagnostic
+      String.starts_with?(reason, "activity_") -> :generated_activities
+      String.starts_with?(reason, "question_") -> :generated_questions
+      String.starts_with?(reason, "content_") -> :generated_lesson
+      lesson_planning_failed?(lesson) -> :generation_failure
+      lesson_rejection_reason(lesson) != "" -> :author_request
+      true -> :automated_checks
+    end
+  end
+
+  defp lesson_resolution_label(lesson) do
+    case lesson_resolution_kind(lesson) do
+      :source_diagnostic -> gettext("Textbook source diagnostic")
+      :generated_activities -> gettext("Generated activities")
+      :generated_questions -> gettext("Generated questions")
+      :generated_lesson -> gettext("Generated lesson structure")
+      :generation_failure -> gettext("Generation failed")
+      :author_request -> gettext("Requested changes")
+      :automated_checks -> gettext("Automated checks")
+    end
+  end
+
+  defp lesson_resolution_explanation(lesson) do
+    case lesson_resolution_kind(lesson) do
+      :source_diagnostic ->
+        gettext(
+          "This describes the imported textbook, not something you need to edit. Repair will preserve it as a visible, non-blocking advisory."
+        )
+
+      :author_request ->
+        gettext("Your requested changes will be included automatically in the repair prompt.")
+
+      :generation_failure ->
+        gettext("The current plan is safe. Retry only this lesson without restarting the import.")
+
+      _ ->
+        gettext(
+          "The current generated plan and exact findings will be sent back for a targeted repair. The lesson stays blocked unless the follow-up checks pass."
+        )
+    end
+  end
+
+  defp lesson_resolution_detail(lesson) do
+    findings =
+      v7_quality_findings(lesson, "hard_blocker") ++
+        v7_quality_findings(lesson, "repair")
+
+    case List.first(findings) do
+      %{} = finding ->
+        plan_item_value(finding, "message", gettext("This lesson needs automatic repair."))
+
+      nil ->
+        case failed_lesson_checks(lesson) |> Enum.flat_map(&check_issues/1) |> List.first() do
+          nil ->
+            case lesson_rejection_reason(lesson) do
+              "" -> gettext("This lesson needs automatic repair.")
+              reason -> reason
+            end
+
+          issue ->
+            issue
+        end
+    end
+  end
+
+  defp bulk_approvable_lesson?(lesson),
+    do: not lesson_busy?(lesson) and current_lesson_approvable?(lesson)
 
   defp plan_media(lesson) do
     lesson
@@ -2090,7 +2422,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
       |> Enum.reject(&is_nil/1)
 
     middle =
-      if v6_lesson?(lesson) do
+      if advanced_v7_lesson?(lesson) do
         lesson
         |> plan_experience_stages()
         |> Enum.map(fn stage ->
@@ -2181,7 +2513,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
       |> Enum.flat_map(fn group ->
         [
           plan_item_value(group, "title")
-          | Enum.map(v5_group_source_blocks(group), &v5_source_block_preview_text/1)
+          | Enum.map(v7_group_source_blocks(group), &v7_source_block_preview_text/1)
         ]
       end)
 
@@ -2412,8 +2744,14 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   defp run_error_message(run) do
     error = run.error || %{}
 
-    error["message"] || error[:message] || error["reason"] || error[:reason] ||
-      gettext("The import stopped before the course could be created.")
+    case map_string_key(error, "category", nil) do
+      "ai_cost_limit_exceeded" ->
+        gettext("Generation paused for support review.")
+
+      _ ->
+        error["message"] || error[:message] || error["reason"] || error[:reason] ||
+          gettext("The import stopped before the course could be created.")
+    end
   end
 
   defp run_has_error?(run), do: is_map(run.error) and map_size(run.error) > 0
@@ -2441,6 +2779,8 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     |> Enum.filter(&is_binary/1)
   end
 
+  defp attention_lesson_count(run), do: run |> attention_lesson_titles() |> length()
+
   defp lesson_sections(lesson),
     do: if(is_list(lesson.source_sections), do: lesson.source_sections, else: [])
 
@@ -2448,7 +2788,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     do: if(is_list(lesson.source_evidence_links), do: lesson.source_evidence_links, else: [])
 
   defp question_count(lesson) do
-    if v6_lesson?(lesson) do
+    if advanced_v7_lesson?(lesson) do
       length(plan_experience_activities(lesson))
     else
       lesson
@@ -2643,6 +2983,20 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   defp course_import_error(:no_lessons_to_approve),
     do: gettext("There are no lesson plans available to approve yet.")
 
+  defp course_import_error(:no_blocked_lessons_to_repair),
+    do: gettext("There are no blocked lesson plans available to repair right now.")
+
+  defp course_import_error({:bulk_lesson_repair_failed, 0, _reason}),
+    do: gettext("The blocked lesson repairs could not be started. Refresh and try again.")
+
+  defp course_import_error({:bulk_lesson_repair_failed, queued, _reason}) do
+    ngettext(
+      "One lesson was queued before another repair could not be started. Refresh and retry the remaining lesson.",
+      "%{count} lessons were queued before another repair could not be started. Refresh and retry the remaining lessons.",
+      queued
+    )
+  end
+
   defp course_import_error(:no_chapters_selected),
     do: gettext("Select at least one chapter before continuing the course plan.")
 
@@ -2661,20 +3015,40 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
         "That lesson is being regenerated. Wait for its new plan before editing, approving, or requesting another regeneration."
       )
 
-  defp course_import_error(:v5_quality_gate_not_approved),
-    do: gettext("The independent critic has not approved this Basic lesson yet.")
+  defp course_import_error(reason)
+       when reason in [:quality_gate_not_approved, :v7_quality_gate_not_approved],
+       do:
+         gettext(
+           "The independent critic has not approved every lesson. Resolve the blocking findings or regenerate the affected lessons."
+         )
 
-  defp course_import_error(:v5_quality_hard_blockers),
-    do: gettext("Resolve every hard blocker before approving this Basic lesson.")
+  defp course_import_error(reason)
+       when reason in [:quality_hard_blockers, :v7_quality_hard_blockers],
+       do: gettext("Resolve every lesson-plan hard blocker before approval.")
 
-  defp course_import_error(:v5_quality_repairs_pending),
-    do: gettext("Resolve every required critic repair before approving this Basic lesson.")
+  defp course_import_error(reason)
+       when reason in [:quality_repairs_pending, :v7_quality_repairs_pending],
+       do: gettext("Resolve every required critic repair before approval.")
 
-  defp course_import_error(:v5_source_coverage_incomplete),
-    do: gettext("The Basic lesson does not yet account for every required source block.")
+  defp course_import_error(reason)
+       when reason in [:source_coverage_incomplete, :v7_source_coverage_incomplete],
+       do: gettext("One or more lessons do not yet account for every required source block.")
 
-  defp course_import_error(:v5_quality_checks_failed),
-    do: gettext("The Basic lesson still has failed deterministic checks.")
+  defp course_import_error(reason)
+       when reason in [:quality_checks_failed, :v7_quality_checks_failed],
+       do: gettext("One or more lessons still have failed deterministic checks.")
+
+  defp course_import_error(:advanced_questions_must_be_single_sourced),
+    do: gettext("An Advanced lesson contains a conflicting standalone question payload.")
+
+  defp course_import_error(:lesson_plan_rejected),
+    do: gettext("A lesson plan has requested changes and cannot be approved yet.")
+
+  defp course_import_error(:lesson_plan_version_stale),
+    do: gettext("A lesson plan changed during review. Refresh before approving it.")
+
+  defp course_import_error(:missing_lesson_plan),
+    do: gettext("A selected lesson is missing its current plan. Regenerate that lesson first.")
 
   defp course_import_error(:plan_schema_version_mismatch),
     do: gettext("The lesson plan does not match this import's Basic-page schema version.")

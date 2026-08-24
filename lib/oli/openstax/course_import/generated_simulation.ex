@@ -140,6 +140,9 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulation do
     version = value(artifact, :version)
     content_hash = value(artifact, :content_hash)
     storage_key = value(artifact, :storage_key)
+    storage_provider = value(artifact, :storage_provider)
+    storage_bucket = value(artifact, :storage_bucket)
+    storage_identity_version = value(artifact, :storage_identity_version)
     storage_origin = value(artifact, :storage_origin)
     storage_state = value(artifact, :storage_state)
     validation_status = validation_status(artifact)
@@ -163,6 +166,11 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulation do
 
       not (is_binary(storage_key) and hash_in_path?(storage_key, content_hash)) ->
         {:error, :simulation_artifact_storage_key_invalid}
+
+      storage_provider == "s3_media" and
+          not (is_binary(storage_bucket) and String.trim(storage_bucket) != "" and
+                   storage_identity_version in [1, 2]) ->
+        {:error, :simulation_artifact_storage_identity_invalid}
 
       storage_state not in ["staged", "promoted"] ->
         {:error, :simulation_artifact_storage_state_invalid}
@@ -195,7 +203,7 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulation do
     content_hash = value(artifact, :content_hash)
     artifact_origin = normalize_origin(value(artifact, :storage_origin))
     url_origin = normalize_origin(url)
-    configured_origins = trusted_origins(opts)
+    configured_origins = trusted_origins(artifact, opts)
 
     cond do
       is_nil(url_origin) or url_origin != artifact_origin ->
@@ -212,16 +220,26 @@ defmodule Oli.OpenStax.CourseImport.GeneratedSimulation do
     end
   end
 
-  defp trusted_origins(opts) do
+  defp trusted_origins(artifact, opts) do
     opts
     |> Keyword.get(
       :generated_simulation_origins,
       Application.get_env(:oli, :generated_simulation_origins, [])
     )
     |> List.wrap()
+    |> maybe_add_legacy_artifact_origin(artifact)
     |> Enum.map(&normalize_origin/1)
     |> Enum.reject(&is_nil/1)
     |> Enum.uniq()
+  end
+
+  defp maybe_add_legacy_artifact_origin(origins, artifact) do
+    if value(artifact, :storage_provider) == "s3_media" and
+         value(artifact, :storage_identity_version) == 1 do
+      [value(artifact, :storage_origin) | origins]
+    else
+      origins
+    end
   end
 
   defp normalize_origin(value) when is_binary(value) do

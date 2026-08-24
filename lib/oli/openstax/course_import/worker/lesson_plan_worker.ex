@@ -21,6 +21,12 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
   alias Oli.OpenStax.CourseImport.AIPlanner
 
   @provider_attempt_limit 2
+  @advanced_contract_categories [
+    :advanced_content_contract_exhausted,
+    :advanced_content_contract_stalled,
+    :advanced_activity_contract_exhausted,
+    :advanced_activity_contract_stalled
+  ]
 
   @impl Oban.Worker
   def perform(%Oban.Job{args: args, id: job_id, attempt: job_attempt, max_attempts: max_attempts}) do
@@ -106,7 +112,10 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
 
     opts = [
       plan_schema_version: claim.plan_schema_version,
-      advanced_v6_enabled: claim.advanced_v6_enabled,
+      advanced_enabled: claim.advanced_enabled,
+      run_id: claim.run_id,
+      lesson_id: claim.lesson_id,
+      planning_request_id: claim.planning_request_id,
       author_id: claim.author_id,
       project_id: claim.project_id,
       generation_checkpoint: claim.generation_checkpoint,
@@ -128,9 +137,9 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
     end
   end
 
-  # Provider/network failures and malformed model responses are safe to retry.
-  # Configuration, authorization, and missing source invariants need user or
-  # operator action and should fail without repeatedly spending tokens.
+  # Only transient provider/network failures are safe to retry. Malformed model
+  # output, configuration, authorization, and source invariants stop without
+  # repeating a paid lesson request.
   defp classify_failure({:lesson_generation_failed, reason}),
     do: classify_generation_failure(reason)
 
@@ -145,6 +154,10 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
 
   defp classify_failure({:ai_planning_failed, {:content_validation_exhausted, _details}}),
     do: {:permanent, :content_validation_exhausted}
+
+  defp classify_failure({:ai_planning_failed, {category, _details}})
+       when category in @advanced_contract_categories,
+       do: {:permanent, category}
 
   defp classify_failure({:ai_planning_failed, {category, _details}})
        when category in [
@@ -200,6 +213,9 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
 
   defp classify_provider_failure(reason) do
     cond do
+      contains_atom?(reason, [:ai_cost_limit_exceeded]) ->
+        {:permanent, :ai_cost_limit_exceeded}
+
       contains_atom?(reason, [
         :step_budget_exhausted,
         :token_budget_exhausted,
@@ -243,7 +259,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
         :invalid_ai_response,
         :invalid_advanced_experience
       ]) ->
-        {:transient, :invalid_provider_response}
+        {:permanent, :invalid_provider_response}
 
       true ->
         {:permanent, :unclassified_generation_failure}
@@ -258,8 +274,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
        when category in [
               :rate_limited,
               :provider_unavailable,
-              :provider_timeout,
-              :invalid_provider_response
+              :provider_timeout
             ],
        do: @provider_attempt_limit
 
@@ -296,6 +311,26 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
   end
 
   defp failure_details({:ai_planning_failed, {category, details}})
+       when category in @advanced_contract_categories and is_map(details) do
+    findings = Map.get(details, "findings") || Map.get(details, :findings) || []
+    review_history = Map.get(details, "review_history") || Map.get(details, :review_history) || []
+
+    %{
+      "phase" => advanced_contract_phase(category),
+      "reason" => Atom.to_string(category),
+      "attempts" => length(List.wrap(review_history)),
+      "confidence" => Map.get(details, "confidence") || Map.get(details, :confidence) || 0.0,
+      "finding_codes" =>
+        findings
+        |> List.wrap()
+        |> Enum.map(&(&1["code"] || &1[:code]))
+        |> Enum.filter(&is_binary/1)
+        |> Enum.uniq()
+        |> Enum.take(20)
+    }
+  end
+
+  defp failure_details({:ai_planning_failed, {category, details}})
        when category in [
               :content_quality_exhausted,
               :content_quality_stalled,
@@ -305,8 +340,8 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
     %{
       "phase" =>
         if(category in [:content_quality_exhausted, :content_quality_stalled],
-          do: "v5_content_review",
-          else: "v5_question_review"
+          do: "v7_content_review",
+          else: "v7_question_review"
         ),
       "reason" => Atom.to_string(category),
       "attempts" => details["attempts"] || details[:attempts] || 0,
@@ -384,6 +419,12 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
     }
 
   defp failure_details(_reason), do: %{}
+
+  defp advanced_contract_phase(category)
+       when category in [:advanced_content_contract_exhausted, :advanced_content_contract_stalled],
+       do: "v7_content_contract"
+
+  defp advanced_contract_phase(_category), do: "v7_activity_contract"
 
   defp safe_provider_failure_details({:provider_failure, details}) when is_map(details) do
     Map.take(details, [

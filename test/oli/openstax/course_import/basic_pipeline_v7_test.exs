@@ -1,14 +1,14 @@
-defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
+defmodule Oli.OpenStax.CourseImport.BasicPipelineV7Test do
   use ExUnit.Case, async: true
 
-  alias Oli.OpenStax.CourseImport.BasicPipelineV5
+  alias Oli.OpenStax.CourseImport.BasicPipelineV7
 
   test "persists accepted content and question checkpoints with independent critic approval" do
     parent = self()
 
     assert {:ok, result} =
-             BasicPipelineV5.plan(lesson(), 1, services(),
-               v5_architect_execution_fun: architect_fun(valid_candidate()),
+             BasicPipelineV7.plan(lesson(), 1, services(),
+               v7_architect_execution_fun: architect_fun(valid_candidate()),
                content_critic_fun: fn _lesson, _content, _service, _opts ->
                  {:ok, approved_review(0.96)}
                end,
@@ -30,13 +30,13 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
                end
              )
 
-    assert result.content_payload["schema_version"] == 5
+    assert result.content_payload["schema_version"] == 7
     assert result.questions_payload == questions()
     assert result.metadata["quality_gate"]["approved"]
     assert result.metadata["quality_gate"]["confidence"] == 0.94
 
     assert_receive {:checkpoint, "content_approved",
-                    %{"content_payload" => %{"schema_version" => 5}}}
+                    %{"content_payload" => %{"schema_version" => 7}}}
 
     assert_receive {:checkpoint, "questions_approved",
                     %{"questions_payload" => %{"items" => [_]}}}
@@ -46,9 +46,13 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
     parent = self()
     {:ok, counter} = Agent.start_link(fn -> 0 end)
 
-    execution_fun = fn _context, _messages, _service ->
+    execution_fun = fn _context, messages, _service ->
       attempt = Agent.get_and_update(counter, &{&1 + 1, &1 + 1})
-      candidate = if attempt == 1, do: invalid_candidate(), else: valid_candidate([])
+
+      candidate =
+        if attempt == 1,
+          do: invalid_candidate(),
+          else: patch_to(valid_candidate([]), messages)
 
       {:ok,
        %{
@@ -58,8 +62,8 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
     end
 
     assert {:ok, result} =
-             BasicPipelineV5.plan(lesson(), 1, services(),
-               v5_architect_execution_fun: execution_fun,
+             BasicPipelineV7.plan(lesson(), 1, services(),
+               v7_architect_execution_fun: execution_fun,
                content_critic_fun: fn _lesson, _content, _service, _opts ->
                  {:ok, approved_review(0.97)}
                end,
@@ -81,15 +85,84 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
     assert result.questions_payload == %{"items" => []}
   end
 
-  test "stops early when deterministic hard blockers repeat without measurable progress" do
+  test "uses every repair round before declaring repeated deterministic blockers stalled" do
     assert {:error, {:content_quality_stalled, failure}} =
-             BasicPipelineV5.plan(lesson(), 1, services(),
-               v5_architect_execution_fun: architect_fun(invalid_candidate())
+             BasicPipelineV7.plan(lesson(), 1, services(),
+               v7_architect_execution_fun: architect_fun(invalid_candidate())
              )
 
     assert failure["attempts"] == 2
     assert Enum.any?(failure["findings"], &(&1["severity"] == "hard_blocker"))
     assert length(failure["review_history"]) == 2
+  end
+
+  test "guided regeneration edits the persisted candidates instead of starting over" do
+    parent = self()
+
+    guided_lesson =
+      Map.put(lesson(), "repair_context", %{
+        "author_feedback" => nil,
+        "previous_candidates" => %{
+          "content" => valid_candidate(),
+          "questions" => questions()
+        },
+        "phase_findings" => %{
+          "content" => [
+            %{
+              "severity" => "repair",
+              "code" => "weak_transition",
+              "path" => "$.content_groups[0].transition",
+              "message" => "Make the transition more specific."
+            }
+          ],
+          "questions" => [
+            %{
+              "severity" => "repair",
+              "code" => "feedback_claims_correctness",
+              "path" => "$.items[0].correct_feedback",
+              "message" => "Use neutral comparison feedback."
+            }
+          ]
+        }
+      })
+
+    execution = fn _context, messages, _service ->
+      assert messages |> Enum.at(2) |> Map.fetch!(:content) |> Jason.decode!() ==
+               valid_candidate()
+
+      repair_request = messages |> Enum.at(3) |> Map.fetch!(:content) |> Jason.decode!()
+      assert [%{"code" => "weak_transition"}] = repair_request["critic_findings"]
+      send(parent, :guided_content_candidate_received)
+
+      {:ok, %{content: Jason.encode!(patch_to(valid_candidate(), messages)), metadata: %{}}}
+    end
+
+    assert {:ok, result} =
+             BasicPipelineV7.plan(guided_lesson, 1, services(),
+               v7_architect_execution_fun: execution,
+               content_critic_fun: fn _, _, _, _ -> {:ok, approved_review(0.97)} end,
+               question_agent_fun: fn _lesson, _content, _service, opts ->
+                 assert opts[:previous_questions_payload] == questions()
+
+                 assert [%{"code" => "feedback_claims_correctness"}] =
+                          opts[:critic_findings]
+
+                 send(parent, :guided_question_candidate_received)
+
+                 {:ok,
+                  %{
+                    questions_payload: questions(),
+                    generation_metadata: %{"model" => "terra-question-writer"}
+                  }}
+               end,
+               question_critic_fun: fn _, _, _, _, _, _ ->
+                 {:ok, approved_review(0.95)}
+               end
+             )
+
+    assert result.metadata["quality_gate"]["approved"]
+    assert_receive :guided_content_candidate_received
+    assert_receive :guided_question_candidate_received
   end
 
   test "resumes an accepted questions checkpoint without invoking any specialist" do
@@ -109,9 +182,9 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
     reject = fn _context, _messages, _service -> flunk("architect should not run") end
 
     assert {:ok, result} =
-             BasicPipelineV5.plan(lesson(), 1, services(),
+             BasicPipelineV7.plan(lesson(), 1, services(),
                generation_checkpoint: checkpoint,
-               v5_architect_execution_fun: reject,
+               v7_architect_execution_fun: reject,
                question_agent_fun: fn _, _, _, _ -> flunk("question writer should not run") end,
                content_critic_fun: fn _, _, _, _ -> flunk("content critic should not run") end,
                question_critic_fun: fn _, _, _, _, _, _ ->
@@ -142,9 +215,9 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
     }
 
     assert {:ok, result} =
-             BasicPipelineV5.plan(lesson(), 1, services(),
+             BasicPipelineV7.plan(lesson(), 1, services(),
                generation_checkpoint: checkpoint,
-               v5_architect_execution_fun: fn _, _, _ -> flunk("architect should not run") end,
+               v7_architect_execution_fun: fn _, _, _ -> flunk("architect should not run") end,
                question_agent_fun: fn _, _, _, _ -> flunk("question writer should not run") end,
                content_critic_fun: fn _, _, _, _ -> flunk("content critic should not run") end,
                question_critic_fun: fn _, _, _, _, _, _ ->
@@ -195,9 +268,9 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
     }
 
     assert {:ok, result} =
-             BasicPipelineV5.plan(lesson(), 1, services(),
+             BasicPipelineV7.plan(lesson(), 1, services(),
                generation_checkpoint: checkpoint,
-               v5_architect_execution_fun: fn _, _, _ -> flunk("architect should not run") end,
+               v7_architect_execution_fun: fn _, _, _ -> flunk("architect should not run") end,
                content_critic_fun: fn _, _, _, _ -> flunk("content critic should not run") end,
                question_agent_fun: fn _lesson, _content, _service, opts ->
                  assert opts[:previous_questions_payload] == questions()
@@ -225,12 +298,12 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
                     %{"questions_payload" => %{"items" => [_]}}}
   end
 
-  test "allows three question repair rounds after the initial candidate" do
+  test "allows one targeted question repair and one final full re-review" do
     {:ok, counter} = Agent.start_link(fn -> 0 end)
 
     assert {:ok, result} =
-             BasicPipelineV5.plan(lesson(), 1, services(),
-               v5_architect_execution_fun: architect_fun(valid_candidate()),
+             BasicPipelineV7.plan(lesson(), 1, services(),
+               v7_architect_execution_fun: architect_fun(valid_candidate()),
                content_critic_fun: fn _, _, _, _ -> {:ok, approved_review(0.97)} end,
                question_agent_fun: fn _lesson, _content, _service, _opts ->
                  Agent.update(counter, &(&1 + 1))
@@ -244,7 +317,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
                question_critic_fun: fn _, _, _, _, _, _ ->
                  attempt = Agent.get(counter, & &1)
 
-                 if attempt == 4,
+                 if attempt == 2,
                    do: {:ok, approved_review(0.97)},
                    else: {:ok, repair_review("repair-#{attempt}")}
                end
@@ -252,8 +325,8 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
 
     assert result.metadata["quality_gate"]["approved"]
     assert result.metadata["quality_gate"]["outcome"] == "approved"
-    assert length(result.metadata["repair_history"]["questions"]) == 4
-    assert Agent.get(counter, & &1) == 4
+    assert length(result.metadata["repair_history"]["questions"]) == 2
+    assert Agent.get(counter, & &1) == 2
   end
 
   test "preserves a semantically valid question plan for attention after repair exhaustion" do
@@ -261,8 +334,8 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
     {:ok, counter} = Agent.start_link(fn -> 0 end)
 
     assert {:ok, result} =
-             BasicPipelineV5.plan(lesson(), 1, services(),
-               v5_architect_execution_fun: architect_fun(valid_candidate()),
+             BasicPipelineV7.plan(lesson(), 1, services(),
+               v7_architect_execution_fun: architect_fun(valid_candidate()),
                content_critic_fun: fn _, _, _, _ -> {:ok, approved_review(0.97)} end,
                question_agent_fun: fn _lesson, _content, _service, _opts ->
                  Agent.update(counter, &(&1 + 1))
@@ -286,16 +359,16 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
     assert result.metadata["quality_gate"]["outcome"] == "needs_attention"
 
     assert result.metadata["quality_gate"]["attention_reason"] ==
-             "question_quality_exhausted"
+             "question_quality_re_review_failed"
 
-    assert [%{"code" => "repair-4"}] = result.metadata["quality_gate"]["repairs"]
+    assert [%{"code" => "repair-2"}] = result.metadata["quality_gate"]["repairs"]
     assert result.questions_payload == questions()
-    assert length(result.metadata["repair_history"]["questions"]) == 4
+    assert length(result.metadata["repair_history"]["questions"]) == 2
 
     assert_receive {:checkpoint, "quality_attention",
                     %{
                       "needs_attention" => true,
-                      "attention_reason" => "question_quality_exhausted"
+                      "attention_reason" => "question_quality_re_review_failed"
                     }}
   end
 
@@ -303,8 +376,8 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
     {:ok, counter} = Agent.start_link(fn -> 0 end)
 
     assert {:ok, result} =
-             BasicPipelineV5.plan(lesson(), 1, services(),
-               v5_architect_execution_fun: architect_fun(valid_candidate()),
+             BasicPipelineV7.plan(lesson(), 1, services(),
+               v7_architect_execution_fun: architect_fun(valid_candidate()),
                content_critic_fun: fn _, _, _, _ ->
                  attempt = Agent.get_and_update(counter, &{&1 + 1, &1 + 1})
                  {:ok, repair_review("content-repair-#{attempt}")}
@@ -318,11 +391,66 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
     assert result.metadata["quality_gate"]["outcome"] == "needs_attention"
 
     assert result.metadata["quality_gate"]["attention_reason"] ==
-             "content_quality_exhausted"
+             "content_quality_re_review_failed"
 
     assert result.content_payload["coverage_manifest"]["complete"]
     assert result.questions_payload == %{"items" => []}
-    assert length(result.metadata["repair_history"]["content"]) == 4
+    assert length(result.metadata["repair_history"]["content"]) == 2
+  end
+
+  test "preserves server-owned source AST findings as advisories and continues planning" do
+    {:ok, counter} = Agent.start_link(fn -> 0 end)
+
+    execution = fn _context, _messages, _service ->
+      Agent.update(counter, &(&1 + 1))
+      {:ok, %{content: Jason.encode!(valid_candidate()), metadata: %{}}}
+    end
+
+    source_review = %{
+      "approved" => false,
+      "gate_passed" => false,
+      "confidence" => 0.97,
+      "threshold" => 0.9,
+      "findings" => [
+        %{
+          "severity" => "hard_blocker",
+          "code" => "invalid_source_formula",
+          "path" => "content_plan.content_groups[0].source_blocks[1].ast[0].src",
+          "message" => "The deterministic source formula needs source-level review."
+        }
+      ],
+      "hard_blocker_count" => 1,
+      "repair_count" => 0,
+      "advisory_count" => 0,
+      "summary" => "Source review required.",
+      "model_usage" => %{}
+    }
+
+    assert {:ok, result} =
+             BasicPipelineV7.plan(lesson(), 1, services(),
+               v7_architect_execution_fun: execution,
+               content_critic_fun: fn _, _, _, _ -> {:ok, source_review} end,
+               question_agent_fun: fn _, _, _, _ ->
+                 {:ok,
+                  %{
+                    questions_payload: questions(),
+                    generation_metadata: %{"model" => "terra-question-writer"}
+                  }}
+               end,
+               question_critic_fun: fn _, _, _, _, _, _ ->
+                 {:ok, approved_review(0.95)}
+               end
+             )
+
+    assert Agent.get(counter, & &1) == 1
+    assert result.metadata["quality_gate"]["approved"]
+    assert result.metadata["quality_gate"]["attention_reason"] == nil
+    assert result.metadata["quality_gate"]["hard_blockers"] == []
+
+    assert [advisory] = result.metadata["quality_gate"]["advisories"]
+    assert advisory["code"] == "invalid_source_formula"
+    assert advisory["source_owned"]
+    refute advisory["blocking"]
   end
 
   defp lesson do
@@ -401,7 +529,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
 
   defp accepted_content do
     {:ok, content} =
-      Oli.OpenStax.CourseImport.BasicPlanV5.build(valid_candidate(), lesson(), 1)
+      Oli.OpenStax.CourseImport.BasicPlanV7.build(valid_candidate(), lesson(), 1)
 
     content
   end
@@ -462,9 +590,30 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5Test do
   end
 
   defp architect_fun(candidate) do
-    fn _context, _messages, _service ->
-      {:ok, %{content: Jason.encode!(candidate), metadata: %{model: "terra-architect"}}}
+    fn _context, messages, _service ->
+      {:ok,
+       %{
+         content: Jason.encode!(patch_to(candidate, messages)),
+         metadata: %{model: "terra-architect"}
+       }}
     end
+  end
+
+  defp patch_to(candidate, messages) when length(messages) <= 2, do: candidate
+
+  defp patch_to(candidate, _messages) do
+    fields = ~w(title orientation content_groups question_slots synthesis)
+
+    %{
+      "patch" =>
+        Enum.map(fields, fn field ->
+          %{
+            "op" => "add",
+            "path" => "/#{field}",
+            "value" => Map.get(candidate, field)
+          }
+        end)
+    }
   end
 
   defp services do

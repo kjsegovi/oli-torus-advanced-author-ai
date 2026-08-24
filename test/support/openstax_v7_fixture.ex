@@ -1,4 +1,4 @@
-defmodule Oli.OpenStax.CourseImport.V6Fixture do
+defmodule Oli.OpenStax.CourseImport.V7Fixture do
   def lesson do
     evidence =
       "Analyze quantitative data, compare competing models, calculate a ratio, and interpret the figure. " <>
@@ -33,7 +33,7 @@ defmodule Oli.OpenStax.CourseImport.V6Fixture do
       Enum.map(1..4, fn index ->
         %{
           "id" => "slot-#{index}",
-          "stage_id" => "investigation",
+          "stage_id" => if(index == 4, do: "synthesis-stage", else: "investigation"),
           "purpose" => "Use source evidence in investigation step #{index}.",
           "objective_ids" => ["objective-1"],
           "evidence_block_ids" => ["evidence", "investigation"],
@@ -53,7 +53,13 @@ defmodule Oli.OpenStax.CourseImport.V6Fixture do
           "id" => "evidence-group",
           "title" => "Evidence for the model decision",
           "instructional_purpose" => "evidence",
-          "source_block_ids" => ["evidence", "investigation"]
+          "source_block_ids" => ["evidence"]
+        },
+        %{
+          "id" => "investigation-group",
+          "title" => "Apply the evidence to the decision",
+          "instructional_purpose" => "application",
+          "source_block_ids" => ["investigation"]
         }
       ],
       "question_slots" => [],
@@ -81,15 +87,56 @@ defmodule Oli.OpenStax.CourseImport.V6Fixture do
             },
             "guidance" => rich_guidance(),
             "native_follow_up_slot_id" => "slot-3",
-            "items" =>
-              [%{"kind" => "content_group", "ref_id" => "evidence-group"}] ++
-                Enum.map(
-                  1..4,
-                  &%{"kind" => "activity_slot", "ref_id" => "slot-#{&1}"}
-                )
+            "items" => [
+              %{"kind" => "activity_slot", "ref_id" => "slot-1"},
+              %{"kind" => "content_group", "ref_id" => "evidence-group"},
+              %{"kind" => "content_group", "ref_id" => "investigation-group"},
+              %{"kind" => "activity_slot", "ref_id" => "slot-2"},
+              %{"kind" => "activity_slot", "ref_id" => "slot-3"}
+            ]
+          },
+          %{
+            "id" => "synthesis-stage",
+            "title" => "Rejoin and synthesize",
+            "purpose" => "Bring every evidence pathway back to a shared assessment.",
+            "presentation_pattern" => "guided_reading",
+            "roles" => ["synthesis"],
+            "introduction" => %{
+              "heading" => "Compare the pathways",
+              "body" =>
+                "Use the evidence from your selected pathway to answer the shared model question.",
+              "evidence_block_ids" => ["evidence", "investigation"]
+            },
+            "guidance" => [],
+            "native_follow_up_slot_id" => "slot-4",
+            "items" => [%{"kind" => "activity_slot", "ref_id" => "slot-4"}]
           }
         ],
-        "activity_slots" => slots
+        "activity_slots" => slots,
+        "branch_sets" => [
+          %{
+            "id" => "model-evidence-path",
+            "decision_activity_slot_id" => "slot-1",
+            "objective_ids" => ["objective-1"],
+            "rejoin_stage_id" => "synthesis-stage",
+            "pathways" => [
+              %{
+                "choice_id" => "supported",
+                "label" => "Follow the matching-evidence path",
+                "target_content_group_id" => "evidence-group",
+                "feedback" => "Inspect where prediction and measurement agree.",
+                "evidence_block_ids" => ["evidence"]
+              },
+              %{
+                "choice_id" => "unsupported",
+                "label" => "Investigate the conflicting-evidence path",
+                "target_content_group_id" => "investigation-group",
+                "feedback" => "Test why the measurements challenge the original model.",
+                "evidence_block_ids" => ["investigation"]
+              }
+            ]
+          }
+        ]
       }
     }
   end

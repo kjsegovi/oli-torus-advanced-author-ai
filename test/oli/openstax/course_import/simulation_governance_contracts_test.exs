@@ -43,6 +43,8 @@ defmodule Oli.OpenStax.CourseImport.SimulationGovernanceContractsTest do
         "source_evidence" => %{"block_ids" => ["block-1"]},
         "instructional_rationale" => "Make the source relationship observable.",
         "learner_task" => "Predict, change one bounded parameter, and explain the result.",
+        "learner_controls" => ["Bounded parameter"],
+        "observable_outcome" => "Observe how the source-grounded result changes.",
         "misconception_target" => "A common causal misconception",
         "placement" => %{"stage_id" => "stage-1"},
         "research_query" => "Authoritative evidence for the bounded model",
@@ -78,6 +80,8 @@ defmodule Oli.OpenStax.CourseImport.SimulationGovernanceContractsTest do
         "instructional_rationale" =>
           "Make the cited source relationship observable before the native follow-up.",
         "learner_task" => pilot["learner_task"],
+        "learner_controls" => ["Bounded parameter"],
+        "observable_outcome" => "Observe the source-grounded response to the bounded parameter.",
         "misconception_target" => pilot["misconception"],
         "placement" => %{"stage_id" => "investigation"},
         "research_query" => "Authoritative evidence for #{pilot["title"]}",
@@ -326,26 +330,39 @@ defmodule Oli.OpenStax.CourseImport.SimulationGovernanceContractsTest do
     Process.put(:opportunity_attempt, 0)
 
     designer = fn context, messages, _functions, _service ->
-      assert context.phase == :simulation_opportunity_designer
       attempt = Process.get(:opportunity_attempt, 0) + 1
       Process.put(:opportunity_attempt, attempt)
 
-      if attempt == 2 do
-        assert Enum.any?(messages, fn message ->
-                 is_binary(message.content) and message.content =~ "unknown_simulation_evidence"
-               end)
-      end
-
-      candidate =
+      content =
         if attempt == 1 do
-          put_in(opportunity("physics"), ["source_evidence", "block_ids"], ["invented"])
+          assert context.phase == :simulation_opportunity_designer
+
+          %{
+            "opportunities" => [
+              put_in(opportunity("physics"), ["source_evidence", "block_ids"], ["invented"])
+            ]
+          }
         else
-          opportunity("physics")
+          assert context.phase == :repair_patch_writer
+
+          assert Enum.any?(messages, fn message ->
+                   is_binary(message.content) and message.content =~ "unknown_simulation_evidence"
+                 end)
+
+          %{
+            "patch" => [
+              %{
+                "op" => "replace",
+                "path" => "/opportunities/0/source_evidence/block_ids",
+                "value" => ["block-1"]
+              }
+            ]
+          }
         end
 
       {:ok,
        %{
-         content: Jason.encode!(%{"opportunities" => [candidate]}),
+         content: Jason.encode!(content),
          metadata: %{"input_tokens" => 10, "output_tokens" => 5}
        }}
     end
@@ -722,6 +739,8 @@ defmodule Oli.OpenStax.CourseImport.SimulationGovernanceContractsTest do
       "source_evidence" => %{"block_ids" => ["block-1"]},
       "instructional_rationale" => "Make the relationship observable.",
       "learner_task" => "Predict and explain.",
+      "learner_controls" => ["Bounded parameter"],
+      "observable_outcome" => "Observe the source-grounded result.",
       "misconception_target" => "A common misconception",
       "placement" => %{"stage_id" => "stage-1"},
       "research_query" => "Authoritative evidence",

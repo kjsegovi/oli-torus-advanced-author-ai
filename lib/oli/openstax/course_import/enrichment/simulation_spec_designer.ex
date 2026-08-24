@@ -5,13 +5,14 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.SimulationSpecDesigner do
   alias Oli.GenAI.Execution
 
   alias Oli.OpenStax.CourseImport.{
+    AIUsageLedger,
     EnrichmentProposal,
     EnrichmentResearchSet,
+    ModelRoutingPolicy,
     SimulationSpecV1
   }
 
-  @feature :openstax_course_import
-  @max_candidates 4
+  @max_candidates 2
   @prompt_version "simulation-spec-v1"
 
   @spec generate(EnrichmentProposal.t(), EnrichmentResearchSet.t(), keyword()) ::
@@ -27,7 +28,10 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.SimulationSpecDesigner do
   def generate(_, _, _), do: {:error, :invalid_simulation_spec_context}
 
   defp loop(proposal, research, services, opts, attempt, repair, history) do
-    with {:ok, candidate, usage} <- design(proposal, research, services.designer, repair, opts) do
+    attempt_opts = Keyword.put(opts, :candidate_number, attempt)
+
+    with {:ok, candidate, usage} <-
+           design(proposal, research, services.designer, repair, attempt_opts) do
       research_payload = research_payload(research)
 
       case SimulationSpecV1.validate(
@@ -37,7 +41,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.SimulationSpecDesigner do
            ) do
         {:ok, spec, validation} ->
           with {:ok, criticism, critic_usage} <-
-                 criticize(spec, research_payload, services.critic, opts) do
+                 criticize(spec, research_payload, services.critic, attempt_opts) do
             history =
               history ++
                 [
@@ -183,7 +187,18 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.SimulationSpecDesigner do
 
   defp execute(phase, messages, service, opts, option_name) do
     execution = Keyword.get(opts, option_name, &Execution.generate_with_metadata/4)
-    context = %{request_type: :generate, feature: @feature, phase: phase}
+
+    service =
+      ModelRoutingPolicy.service_config(service, phase,
+        first_pass: Keyword.get(opts, :candidate_number, 1) == 1
+      )
+
+    context =
+      AIUsageLedger.request_context(opts, phase, %{
+        candidate_number: Keyword.get(opts, :candidate_number, 1),
+        operation_id: Keyword.get(opts, :operation_id),
+        cost_scope: :simulation
+      })
 
     result =
       case Function.info(execution, :arity) do

@@ -34,7 +34,7 @@
     <p class="font-semibold">{gettext("Legacy OpenStax import preserved")}</p>
     <p class="mt-1">
       {gettext(
-        "This project has an unfinished import from an older schema. Torus will not resume, migrate, cancel, or delete it. Create a new project to start a v6 import."
+        "This project has an unfinished import from an older schema. Torus will not resume, migrate, cancel, or delete it. Create a new project to start a v7 import."
       )}
     </p>
   </div>
@@ -470,6 +470,8 @@
 
     <section
       :if={status == :awaiting_lesson_approval}
+      id="openstax-lesson-review"
+      phx-hook="OpenStaxLessonTabs"
       class="rounded border border-gray-200 bg-white p-6 shadow-sm"
     >
       <div class="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
@@ -477,7 +479,7 @@
           <h3 class="text-lg font-semibold text-gray-900">{gettext("Review lesson plans")}</h3>
           <p class="mt-1 text-sm text-gray-600">
             {gettext(
-              "Every lesson uses the hard-cutover source contract: Basic v5 or a reviewed Advanced v6 REAL CHEM-style Exploration."
+              "Every lesson uses the exclusive v7 source and content contract for Basic Author or a reviewed Advanced Author Exploration."
             )}
           </p>
         </div>
@@ -492,6 +494,7 @@
             variant={:secondary}
             phx-click="approve_all"
             phx-disable-with={gettext("Approving all lessons…")}
+            disabled={!bulk_approval_ready?(@run)}
             data-confirm={
               gettext(
                 "Approve every valid lesson and start course creation? This development shortcut cannot approve a partially valid set."
@@ -500,11 +503,210 @@
           >
             {gettext("Approve all lessons")}
           </.button>
+          <p
+            :if={@approve_all_enabled && bulk_approval_blocked_count(@run) > 0}
+            id="openstax-bulk-approval-blocked"
+            class="max-w-sm text-xs font-medium text-amber-800 sm:text-right"
+            role="status"
+          >
+            {ngettext(
+              "One lesson plan is not yet approvable. Resolve its blocking findings or regenerate it before using this shortcut.",
+              "%{count} lesson plans are not yet approvable. Resolve their blocking findings or regenerate them before using this shortcut.",
+              bulk_approval_blocked_count(@run)
+            )}
+          </p>
         </div>
       </div>
+      <section
+        :if={blocked_lessons(@run) != []}
+        id="openstax-lesson-resolution-center"
+        data-openstax-resolution-center
+        class="mt-5 rounded-lg border border-amber-200 bg-amber-50 p-4"
+        aria-labelledby="openstax-resolution-heading"
+      >
+        <div class="flex flex-col justify-between gap-4 lg:flex-row lg:items-start">
+          <div class="max-w-3xl">
+            <p class="text-xs font-semibold uppercase tracking-wide text-amber-800">
+              {gettext("Guided resolution")}
+            </p>
+            <h4
+              id="openstax-resolution-heading"
+              class="mt-1 text-base font-semibold text-amber-950"
+            >
+              {ngettext(
+                "Resolve one blocked lesson",
+                "Resolve %{count} blocked lessons",
+                length(blocked_lessons(@run))
+              )}
+            </h4>
+            <p class="mt-2 text-sm leading-6 text-amber-950">
+              {gettext(
+                "You do not need to locate or copy technical errors. Textbook-source issues become visible advisories; generated-content issues and your requested changes are sent back with the exact repair context automatically."
+              )}
+            </p>
+          </div>
+          <.button
+            variant={:primary}
+            phx-click="regenerate_blocked_lessons"
+            phx-disable-with={gettext("Queuing repairs…")}
+            disabled={!bulk_repair_available?(@run)}
+            data-confirm={
+              gettext(
+                "Repair every currently blocked lesson with AI? Existing plans stay available until their replacements pass generation."
+              )
+            }
+          >
+            {gettext("Repair all blocked lessons")}
+          </.button>
+        </div>
+
+        <div class="mt-4 grid gap-3 lg:grid-cols-2">
+          <article
+            :for={lesson <- blocked_lessons(@run)}
+            data-openstax-resolution-lesson={lesson.id}
+            class="rounded border border-amber-200 bg-white p-3"
+          >
+            <div class="flex flex-col justify-between gap-3 sm:flex-row sm:items-start">
+              <div class="min-w-0">
+                <p class="font-semibold text-gray-950">{lesson.title}</p>
+                <span class="mt-1 inline-flex rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-900">
+                  {lesson_resolution_label(lesson)}
+                </span>
+                <p class="mt-2 text-sm text-gray-800">{lesson_resolution_explanation(lesson)}</p>
+                <p class="mt-1 line-clamp-2 text-xs text-gray-600">
+                  {lesson_resolution_detail(lesson)}
+                </p>
+              </div>
+              <div class="flex shrink-0 flex-wrap gap-2">
+                <.link
+                  patch={run_path(@project.slug, @run.id, lesson.id)}
+                  data-openstax-focus-quality={lesson.id}
+                  class="inline-flex items-center rounded px-2 py-1 text-xs font-semibold text-blue-700 hover:bg-blue-50"
+                >
+                  {gettext("Review details")}
+                </.link>
+                <.button
+                  variant={:secondary}
+                  size={:sm}
+                  phx-click="regenerate_lesson"
+                  phx-value-lesson_id={lesson.id}
+                  phx-disable-with={gettext("Queuing…")}
+                  disabled={lesson_busy?(lesson)}
+                >
+                  {if lesson_busy?(lesson),
+                    do: gettext("Repair queued"),
+                    else: gettext("Fix with AI")}
+                </.button>
+              </div>
+            </div>
+          </article>
+        </div>
+      </section>
+      <nav
+        :if={lesson_tabs(@run) != []}
+        id="openstax-lesson-tabs"
+        class="mt-5 rounded-lg border border-slate-200 bg-white p-3"
+        aria-label={gettext("Lesson page review")}
+      >
+        <div class="flex items-center gap-2">
+          <button
+            type="button"
+            data-tab-scroll="previous"
+            class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            aria-label={gettext("Scroll lesson tabs left")}
+          >
+            <.icon name="hero-chevron-left" class="h-4 w-4" />
+          </button>
+          <div
+            data-tab-strip
+            role="tablist"
+            aria-label={gettext("Generated lesson pages")}
+            class="flex min-w-0 flex-1 gap-2 overflow-x-auto px-1 py-2 scroll-smooth"
+          >
+            <.link
+              :for={tab <- lesson_tabs(@run)}
+              patch={run_path(@project.slug, @run.id, tab.lesson.id)}
+              id={"openstax-lesson-tab-#{tab.lesson.id}"}
+              role="tab"
+              aria-selected={to_string(to_string(tab.lesson.id) == @selected_lesson_id)}
+              aria-controls={"openstax-lesson-#{tab.lesson.id}"}
+              aria-label={
+                gettext("Page %{ordinal}: %{title}, %{unit}, %{status}",
+                  ordinal: tab.ordinal,
+                  title: tab.lesson.title,
+                  unit: tab.unit.unit_name,
+                  status: lesson_tab_status(tab.state)
+                )
+              }
+              tabindex={if(to_string(tab.lesson.id) == @selected_lesson_id, do: "0", else: "-1")}
+              data-lesson-tab
+              data-selected={to_string(tab.lesson.id) == @selected_lesson_id}
+              data-confirm={unsaved_tab_confirmation(@editing_lesson_id, @rejecting_lesson_id)}
+              class={lesson_tab_class(tab.state, to_string(tab.lesson.id) == @selected_lesson_id)}
+            >
+              <.icon
+                name={lesson_tab_icon(tab.state)}
+                class={lesson_tab_icon_class(tab.state)}
+              />
+              <span class="min-w-0">
+                <span class="block text-xs font-semibold opacity-75">
+                  {tab.ordinal}. {tab.unit.unit_name}
+                </span>
+                <span class="block truncate font-semibold" title={tab.lesson.title}>
+                  {tab.lesson.title}
+                </span>
+                <span class="block text-xs opacity-80">{lesson_tab_status(tab.state)}</span>
+              </span>
+            </.link>
+          </div>
+          <button
+            type="button"
+            data-tab-scroll="next"
+            class="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            aria-label={gettext("Scroll lesson tabs right")}
+          >
+            <.icon name="hero-chevron-right" class="h-4 w-4" />
+          </button>
+        </div>
+      </nav>
       <div class="mt-5 space-y-4">
-        <div :for={unit <- units_for_run(@run)} class="rounded border border-gray-200 p-4">
-          <h4 class="font-semibold text-gray-900">{unit.unit_name}</h4>
+        <div
+          :for={unit <- active_unit_for_run(@run, @selected_lesson_id)}
+          class="rounded border border-gray-200 p-4"
+        >
+          <div class="flex flex-wrap items-center justify-between gap-3">
+            <h4 class="font-semibold text-gray-900">{unit.unit_name}</h4>
+            <div class="flex gap-2" aria-label={gettext("Lesson page navigation")}>
+              <.link
+                :if={adjacent_lesson(@run, @selected_lesson_id, -1)}
+                patch={
+                  run_path(
+                    @project.slug,
+                    @run.id,
+                    adjacent_lesson(@run, @selected_lesson_id, -1).id
+                  )
+                }
+                data-confirm={unsaved_tab_confirmation(@editing_lesson_id, @rejecting_lesson_id)}
+                class="inline-flex items-center gap-1 rounded border border-slate-300 px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                <.icon name="hero-chevron-left" class="h-4 w-4" /> {gettext("Previous page")}
+              </.link>
+              <.link
+                :if={adjacent_lesson(@run, @selected_lesson_id, 1)}
+                patch={
+                  run_path(
+                    @project.slug,
+                    @run.id,
+                    adjacent_lesson(@run, @selected_lesson_id, 1).id
+                  )
+                }
+                data-confirm={unsaved_tab_confirmation(@editing_lesson_id, @rejecting_lesson_id)}
+                class="inline-flex items-center gap-1 rounded border border-slate-300 px-3 py-1.5 text-sm font-semibold text-slate-700 hover:bg-slate-50"
+              >
+                {gettext("Next page")} <.icon name="hero-chevron-right" class="h-4 w-4" />
+              </.link>
+            </div>
+          </div>
           <aside
             :if={assessment_questions(unit) != []}
             class="mt-3 rounded border border-indigo-200 bg-indigo-50 p-4"
@@ -536,7 +738,11 @@
           </aside>
           <div class="mt-3 space-y-3">
             <article
-              :for={lesson <- lessons_for_unit(unit)}
+              :for={lesson <- active_lessons_for_unit(unit, @selected_lesson_id)}
+              id={"openstax-lesson-#{lesson.id}"}
+              role="tabpanel"
+              aria-labelledby={"openstax-lesson-tab-#{lesson.id}"}
+              data-active-lesson-panel
               class="rounded border border-gray-100 bg-gray-50 p-4"
             >
               <div class="space-y-3">
@@ -711,14 +917,14 @@
                     </section>
 
                     <section
-                      :if={v5_lesson?(lesson) && plan_content_groups(lesson) != []}
-                      data-openstax-v5-learner-preview
+                      :if={basic_v7_lesson?(lesson) && plan_content_groups(lesson) != []}
+                      data-openstax-v7-learner-preview
                       class="rounded-xl border border-slate-200 bg-slate-50 p-4"
                     >
                       <div class="flex flex-wrap items-center justify-between gap-2">
                         <div>
                           <p class="text-xs font-semibold uppercase tracking-wide text-blue-700">
-                            {gettext("Learner preview · Basic v5")}
+                            {gettext("Learner preview · Basic v7")}
                           </p>
                           <h5 class="mt-1 text-lg font-semibold text-slate-950">
                             {plan_content(lesson, "title", lesson.title)}
@@ -732,7 +938,7 @@
                       <div class="mx-auto mt-5 max-w-3xl space-y-6">
                         <article
                           :for={group <- plan_content_groups(lesson)}
-                          data-openstax-v5-content-group={plan_item_value(group, "id")}
+                          data-openstax-v7-content-group={plan_item_value(group, "id")}
                           class="rounded-lg border border-slate-200 bg-white p-5 shadow-sm"
                         >
                           <div class="flex flex-wrap items-start justify-between gap-2">
@@ -753,21 +959,21 @@
                           </p>
                           <div class="mt-4 space-y-4">
                             <article
-                              :for={block <- v5_group_source_blocks(group)}
-                              data-openstax-v5-source-block={plan_item_value(block, "id")}
+                              :for={block <- v7_group_source_blocks(group)}
+                              data-openstax-v7-source-block={plan_item_value(block, "id")}
                               class="border-l-2 border-slate-200 pl-4"
                             >
                               <p class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
                                 {humanize_check_key(plan_item_value(block, "kind", "source"))}
                               </p>
                               <p class="mt-1 whitespace-pre-line text-sm leading-7 text-slate-800">
-                                {v5_source_block_preview_text(block)}
+                                {v7_source_block_preview_text(block)}
                               </p>
                             </article>
                           </div>
-                          <div :if={v5_group_media(group) != []} class="mt-5 space-y-4">
+                          <div :if={v7_group_media(group) != []} class="mt-5 space-y-4">
                             <figure
-                              :for={media <- v5_group_media(group)}
+                              :for={media <- v7_group_media(group)}
                               class="overflow-hidden rounded-lg border border-slate-200 bg-slate-50"
                             >
                               <img
@@ -822,16 +1028,16 @@
                     </section>
 
                     <section
-                      :if={v6_lesson?(lesson)}
-                      id={"openstax-v6-preview-#{lesson.id}"}
-                      data-openstax-v6-learner-preview
+                      :if={advanced_v7_lesson?(lesson)}
+                      id={"openstax-v7-preview-#{lesson.id}"}
+                      data-openstax-v7-learner-preview
                       class="overflow-hidden rounded-xl border border-purple-200 bg-slate-100"
                     >
                       <header class="bg-purple-950 px-5 py-5 text-white">
                         <div class="flex flex-wrap items-start justify-between gap-3">
                           <div>
                             <p class="text-xs font-semibold uppercase tracking-wide text-purple-200">
-                              {gettext("Learner Preview · Advanced v6 Exploration")}
+                              {gettext("Learner Preview · Advanced v7 Exploration")}
                             </p>
                             <h5 class="mt-1 text-xl font-semibold">
                               {plan_content(lesson, "title", lesson.title)}
@@ -859,31 +1065,31 @@
                         aria-label={gettext("Advanced lesson review views")}
                       >
                         <a
-                          href={"#openstax-v6-preview-#{lesson.id}"}
+                          href={"#openstax-v7-preview-#{lesson.id}"}
                           class="rounded-full bg-purple-100 px-3 py-1"
                         >
                           {gettext("Learner Preview")}
                         </a>
                         <a
-                          href={"#openstax-v6-stage-flow-#{lesson.id}"}
+                          href={"#openstax-v7-stage-flow-#{lesson.id}"}
                           class="rounded-full bg-slate-100 px-3 py-1"
                         >
                           {gettext("Stage Flow")}
                         </a>
                         <a
-                          href={"#openstax-v6-activities-#{lesson.id}"}
+                          href={"#openstax-v7-activities-#{lesson.id}"}
                           class="rounded-full bg-slate-100 px-3 py-1"
                         >
                           {gettext("Activities and Branches")}
                         </a>
                         <a
-                          href={"#openstax-v6-coverage-#{lesson.id}"}
+                          href={"#openstax-v7-coverage-#{lesson.id}"}
                           class="rounded-full bg-slate-100 px-3 py-1"
                         >
                           {gettext("Source Coverage")}
                         </a>
                         <a
-                          href={"#openstax-v6-quality-#{lesson.id}"}
+                          href={"#openstax-v7-quality-#{lesson.id}"}
                           class="rounded-full bg-slate-100 px-3 py-1"
                         >
                           {gettext("Quality History")}
@@ -896,7 +1102,7 @@
                             {stage, stage_index} <-
                               Enum.with_index(plan_experience_stages(lesson), 1)
                           }
-                          data-openstax-v6-stage={plan_item_value(stage, "id")}
+                          data-openstax-v7-stage={plan_item_value(stage, "id")}
                           class="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6"
                         >
                           <div class="flex flex-wrap items-start justify-between gap-2">
@@ -929,14 +1135,14 @@
                               </h6>
                               <div class="mt-3 space-y-4">
                                 <div
-                                  :for={block <- v5_group_source_blocks(group || %{})}
+                                  :for={block <- v7_group_source_blocks(group || %{})}
                                   class="border-l-2 border-purple-200 pl-4"
                                 >
                                   <p class="text-[11px] font-semibold uppercase tracking-wide text-slate-500">
                                     {humanize_check_key(plan_item_value(block, "kind", "source"))}
                                   </p>
                                   <p class="mt-1 whitespace-pre-line text-sm leading-7 text-slate-800">
-                                    {v5_source_block_preview_text(block)}
+                                    {v7_source_block_preview_text(block)}
                                   </p>
                                 </div>
                               </div>
@@ -1003,7 +1209,7 @@
                         </section>
 
                         <details
-                          id={"openstax-v6-stage-flow-#{lesson.id}"}
+                          id={"openstax-v7-stage-flow-#{lesson.id}"}
                           class="rounded-xl border border-slate-200 bg-white shadow-sm"
                         >
                           <summary class="cursor-pointer px-4 py-3 font-semibold text-slate-950">
@@ -1030,7 +1236,7 @@
                         </details>
 
                         <details
-                          id={"openstax-v6-activities-#{lesson.id}"}
+                          id={"openstax-v7-activities-#{lesson.id}"}
                           class="rounded-xl border border-purple-200 bg-white shadow-sm"
                         >
                           <summary class="cursor-pointer px-4 py-3 font-semibold text-purple-950">
@@ -1970,9 +2176,9 @@
                     <details
                       :if={lesson_coverage_rows(lesson) != []}
                       id={
-                        if(v6_lesson?(lesson),
-                          do: "openstax-v6-coverage-#{lesson.id}",
-                          else: "openstax-v5-coverage-#{lesson.id}"
+                        if(advanced_v7_lesson?(lesson),
+                          do: "openstax-v7-coverage-#{lesson.id}",
+                          else: "openstax-v7-coverage-#{lesson.id}"
                         )
                       }
                       class="rounded border border-slate-200 bg-slate-50"
@@ -2008,12 +2214,12 @@
                     <section
                       :if={current_lesson?(lesson)}
                       id={
-                        if(v6_lesson?(lesson),
-                          do: "openstax-v6-quality-#{lesson.id}",
-                          else: "openstax-v5-quality-#{lesson.id}"
+                        if(advanced_v7_lesson?(lesson),
+                          do: "openstax-v7-quality-#{lesson.id}",
+                          else: "openstax-v7-quality-#{lesson.id}"
                         )
                       }
-                      data-openstax-v5-quality-review
+                      data-openstax-v7-quality-review
                       class="rounded-lg border border-indigo-200 bg-indigo-50 p-4"
                     >
                       <div class="flex flex-wrap items-start justify-between gap-3">
@@ -2029,13 +2235,13 @@
                         </div>
                         <span class={[
                           "rounded-full px-3 py-1 text-xs font-semibold",
-                          if(v5_quality_confidence(lesson) >= 0.9,
+                          if(v7_quality_confidence(lesson) >= 0.9,
                             do: "bg-emerald-100 text-emerald-800",
                             else: "bg-red-100 text-red-800"
                           )
                         ]}>
                           {gettext("%{confidence} confidence",
-                            confidence: v5_quality_confidence_label(lesson)
+                            confidence: v7_quality_confidence_label(lesson)
                           )}
                         </span>
                       </div>
@@ -2046,7 +2252,7 @@
                             {gettext("Specialist models")}
                           </p>
                           <ul class="mt-2 space-y-1 text-xs text-indigo-950">
-                            <li :for={role <- v5_role_rows(lesson)}>
+                            <li :for={role <- v7_role_rows(lesson)}>
                               <span class="font-semibold">{plan_item_value(role, "role")}:</span>
                               {plan_item_value(role, "model")}
                             </li>
@@ -2057,17 +2263,17 @@
                             {gettext("Repair history")}
                           </p>
                           <ul
-                            :if={v5_repair_history(lesson) != []}
+                            :if={v7_repair_history(lesson) != []}
                             class="mt-2 space-y-1 text-xs text-indigo-950"
                           >
-                            <li :for={attempt <- v5_repair_history(lesson)}>
+                            <li :for={attempt <- v7_repair_history(lesson)}>
                               {plan_item_value(attempt, "stage")} · {gettext("attempt %{number}",
                                 number: plan_item_value(attempt, "attempt")
                               )}
                             </li>
                           </ul>
                           <p
-                            :if={v5_repair_history(lesson) == []}
+                            :if={v7_repair_history(lesson) == []}
                             class="mt-2 text-xs text-indigo-800"
                           >
                             {gettext("No repair round was needed.")}
@@ -2076,40 +2282,40 @@
                       </div>
 
                       <div
-                        :if={v5_quality_findings(lesson, "hard_blocker") != []}
+                        :if={v7_quality_findings(lesson, "hard_blocker") != []}
                         class="mt-4 rounded border border-red-200 bg-red-50 p-3 text-xs text-red-950"
                       >
                         <p class="font-semibold">{gettext("Hard blockers")}</p>
                         <ul class="mt-2 list-disc space-y-1 pl-5">
-                          <li :for={finding <- v5_quality_findings(lesson, "hard_blocker")}>
+                          <li :for={finding <- v7_quality_findings(lesson, "hard_blocker")}>
                             {plan_item_value(finding, "message", gettext("Review required"))}
                           </li>
                         </ul>
                       </div>
 
                       <div
-                        :if={v5_quality_findings(lesson, "repair") != []}
+                        :if={v7_quality_findings(lesson, "repair") != []}
                         class="mt-4 rounded border border-amber-200 bg-amber-50 p-3 text-xs text-amber-950"
                       >
                         <p class="font-semibold">{gettext("Repairs still required")}</p>
                         <ul class="mt-2 list-disc space-y-1 pl-5">
-                          <li :for={finding <- v5_quality_findings(lesson, "repair")}>
+                          <li :for={finding <- v7_quality_findings(lesson, "repair")}>
                             {plan_item_value(finding, "message", gettext("Review required"))}
                           </li>
                         </ul>
                       </div>
 
                       <details
-                        :if={v5_quality_findings(lesson, "advisory") != []}
+                        :if={v7_quality_findings(lesson, "advisory") != []}
                         class="mt-4 rounded border border-indigo-200 bg-white"
                       >
                         <summary class="cursor-pointer px-3 py-2 text-xs font-semibold text-indigo-900">
                           {gettext("Advisories (%{count})",
-                            count: length(v5_quality_findings(lesson, "advisory"))
+                            count: length(v7_quality_findings(lesson, "advisory"))
                           )}
                         </summary>
                         <ul class="list-disc space-y-1 border-t border-indigo-100 p-3 pl-7 text-xs text-indigo-950">
-                          <li :for={finding <- v5_quality_findings(lesson, "advisory")}>
+                          <li :for={finding <- v7_quality_findings(lesson, "advisory")}>
                             {plan_item_value(finding, "message")}
                           </li>
                         </ul>
@@ -2189,7 +2395,7 @@
                       class="font-medium text-yellow-900"
                     >
                       {gettext(
-                        "Automated checks found blocking items. Resolve them or regenerate this lesson before approval."
+                        "Automated checks found blocking items. Use Fix with AI to send the exact findings back automatically."
                       )}
                     </span>
                   </div>
@@ -2326,7 +2532,7 @@
                     </select>
                     <p :if={lesson.plan_mode == "basic"} class="mt-1 text-xs text-gray-500">
                       {gettext(
-                        "Advanced Author requires a fresh schema 6 generation; editing cannot synthesize an Exploration."
+                        "Advanced Author requires a fresh schema 7 generation; editing cannot synthesize an Exploration."
                       )}
                     </p>
                   </div>

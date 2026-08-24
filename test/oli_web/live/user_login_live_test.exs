@@ -13,6 +13,26 @@ defmodule OliWeb.UserLoginLiveTest do
       assert html =~ "Forgot password?"
     end
 
+    test "sets a browser-compatible session cookie for HTTP", %{conn: conn} do
+      conn = get(conn, ~p"/users/log_in")
+      session_cookie = conn.resp_cookies["_oli_key"]
+
+      assert session_cookie.same_site == "Lax"
+      refute session_cookie.secure
+    end
+
+    test "keeps cross-site session support for HTTPS and LTI" do
+      conn =
+        :get
+        |> Plug.Test.conn("https://localhost/users/log_in")
+        |> OliWeb.Endpoint.call(OliWeb.Endpoint.init([]))
+
+      session_cookie = conn.resp_cookies["_oli_key"]
+
+      assert session_cookie.same_site == "None"
+      assert session_cookie.secure
+    end
+
     test "redirects if already logged in", %{conn: conn} do
       result =
         conn

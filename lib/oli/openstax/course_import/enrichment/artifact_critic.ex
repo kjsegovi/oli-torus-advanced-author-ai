@@ -4,9 +4,13 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactCritic do
   alias Oli.GenAI.Completions.{Message, RegisteredModel, ServiceConfig}
   alias Oli.GenAI.Execution
 
-  alias Oli.OpenStax.CourseImport.{EnrichmentResearchSet, SimulationSpec}
+  alias Oli.OpenStax.CourseImport.{
+    AIUsageLedger,
+    EnrichmentResearchSet,
+    ModelRoutingPolicy,
+    SimulationSpec
+  }
 
-  @feature :openstax_course_import
   @prompt_version "simulation-artifact-critic-v1"
   @default_model "gpt-5.6-sol"
 
@@ -79,7 +83,18 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactCritic do
     ]
 
     execution = Keyword.get(opts, :artifact_critic_fun, &Execution.generate_with_metadata/4)
-    context = %{request_type: :generate, feature: @feature, phase: :simulation_artifact_critic}
+
+    service =
+      ModelRoutingPolicy.service_config(service, :simulation_artifact_critic,
+        first_pass: Keyword.get(opts, :candidate_number, 1) == 1
+      )
+
+    context =
+      AIUsageLedger.request_context(opts, :simulation_artifact_critic, %{
+        candidate_number: Keyword.get(opts, :candidate_number, 1),
+        operation_id: Keyword.get(opts, :operation_id),
+        cost_scope: :simulation
+      })
 
     result =
       case Function.info(execution, :arity) do

@@ -3,15 +3,14 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityV1 do
   Deterministic contract for optional, source-grounded simulation opportunities.
 
   The model proposes pedagogy; this module owns identifiers, supported domains,
-  source/objective references, placement, and the zero-to-three bound.
+  source/objective references, placement, and the zero-or-one bound.
   """
 
   @domains ~w(chemistry physics biology mathematics astronomy computer_science)
-  @max_opportunities 3
+  @max_opportunities 1
 
   @required_text_fields ~w(
-    instructional_rationale learner_task misconception_target research_query
-    expected_instructional_value
+    instructional_rationale learner_task observable_outcome
   )
 
   @spec build(term(), map(), map()) :: {:ok, [map()]} | {:error, [map()]}
@@ -27,7 +26,7 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityV1 do
 
     cond do
       length(values) > @max_opportunities ->
-        {:error, [finding("too_many_simulation_opportunities", "$", "Return at most three.")]}
+        {:error, [finding("too_many_simulation_opportunities", "$", "Return at most one.")]}
 
       true ->
         values
@@ -59,7 +58,13 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityV1 do
       "stage_ids" =>
         blueprint |> Map.get("stages", []) |> List.wrap() |> Enum.map(&map_value(&1, "id")),
       "required_fields" =>
-        ~w(domain objective_ids source_evidence instructional_rationale learner_task misconception_target placement research_query expected_instructional_value)
+        ~w(domain objective_ids source_evidence instructional_rationale learner_task learner_controls observable_outcome placement),
+      "experience" => %{
+        "duration_minutes" => [3, 8],
+        "control_count" => [1, 3],
+        "minimum_dynamic_model" =>
+          "one meaningful learner-controlled variable and one observable outcome"
+      }
     }
   end
 
@@ -70,6 +75,7 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityV1 do
     evidence_ids = evidence_ids(raw["source_evidence"])
     placement = stringify_keys(raw["placement"] || %{})
     stage_id = placement["stage_id"]
+    learner_controls = normalize_controls(raw["learner_controls"] || raw["controls"])
     objective_catalog = ids(content["objective_catalog"])
     source_catalog = ids(lesson["source_blocks"])
     stage_catalog = ids(get_in(content, ["experience_blueprint", "stages"]))
@@ -93,6 +99,11 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityV1 do
         not is_binary(stage_id) or stage_id not in stage_catalog,
         "invalid_simulation_placement",
         "$.placement.stage_id"
+      )
+      |> maybe_finding(
+        length(learner_controls) not in 1..3,
+        "invalid_simulation_controls",
+        "$.learner_controls"
       )
       |> Kernel.++(
         Enum.flat_map(@required_text_fields, fn field ->
@@ -126,15 +137,24 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityV1 do
            "source_evidence" => %{"block_ids" => evidence_ids},
            "instructional_rationale" => String.trim(raw["instructional_rationale"]),
            "learner_task" => String.trim(raw["learner_task"]),
-           "misconception_target" => String.trim(raw["misconception_target"]),
+           "learner_controls" => learner_controls,
+           "observable_outcome" => String.trim(raw["observable_outcome"]),
+           "estimated_minutes" => normalize_duration(raw["estimated_minutes"]),
+           "misconception_target" => optional_text(raw["misconception_target"]),
            "placement" => placement,
-           "research_query" => String.trim(raw["research_query"]),
-           "expected_instructional_value" => String.trim(raw["expected_instructional_value"]),
+           "research_query" =>
+             optional_text(raw["research_query"]) ||
+               "Validate the source-grounded control and observable outcome.",
+           "expected_instructional_value" =>
+             optional_text(raw["expected_instructional_value"]) ||
+               String.trim(raw["observable_outcome"]),
            "metadata" => %{
              "planner_id" => planner_id,
              "domain" => domain,
-             "misconception_target" => String.trim(raw["misconception_target"]),
-             "expected_instructional_value" => String.trim(raw["expected_instructional_value"])
+             "misconception_target" => optional_text(raw["misconception_target"]),
+             "expected_instructional_value" =>
+               optional_text(raw["expected_instructional_value"]) ||
+                 String.trim(raw["observable_outcome"])
            }
          }}
 
@@ -184,6 +204,63 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityV1 do
     |> Enum.reject(&(&1 == ""))
     |> Enum.uniq()
   end
+
+  defp normalize_controls(values) do
+    values
+    |> List.wrap()
+    |> Enum.flat_map(fn
+      value when is_binary(value) ->
+        case optional_text(value) do
+          nil -> []
+          label -> [%{"id" => slug(label), "label" => label}]
+        end
+
+      value when is_map(value) ->
+        value = stringify_keys(value)
+        label = optional_text(value["label"] || value["name"])
+
+        if is_binary(label) do
+          [
+            %{
+              "id" => optional_text(value["id"]) || slug(label),
+              "label" => label,
+              "unit" => optional_text(value["unit"])
+            }
+            |> Enum.reject(fn {_key, item} -> is_nil(item) end)
+            |> Map.new()
+          ]
+        else
+          []
+        end
+
+      _value ->
+        []
+    end)
+    |> Enum.uniq_by(& &1["id"])
+  end
+
+  defp normalize_duration(value) when is_integer(value), do: value |> max(3) |> min(8)
+  defp normalize_duration(_value), do: 5
+
+  defp slug(value) do
+    value
+    |> String.downcase()
+    |> String.replace(~r/[^a-z0-9]+/u, "-")
+    |> String.trim("-")
+    |> case do
+      "" -> "control"
+      normalized -> normalized
+    end
+  end
+
+  defp optional_text(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      text -> text
+    end
+  end
+
+  defp optional_text(_value), do: nil
 
   defp stringify_keys(value) when is_map(value),
     do: Map.new(value, fn {key, item} -> {to_string(key), item} end)

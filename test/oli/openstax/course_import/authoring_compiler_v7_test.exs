@@ -1,25 +1,25 @@
-defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
+defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV7Test do
   use ExUnit.Case, async: true
 
   alias Oli.Activities.Model
-  alias Oli.OpenStax.CourseImport.{AdvancedPlanV6, AuthoringCompiler, BasicPlanV5}
-  alias Oli.OpenStax.CourseImport.V6Fixture, as: Fixture
+  alias Oli.OpenStax.CourseImport.{AdvancedPlanV7, AuthoringCompiler, BasicPlanV7}
+  alias Oli.OpenStax.CourseImport.V7Fixture, as: Fixture
 
   @proposal_id "00000000-0000-4000-8000-000000000006"
   @artifact_hash String.duplicate("c", 64)
 
-  test "compiles every schema 6 activity once with a default incorrect response" do
+  test "compiles every v7 activity once with a default incorrect response" do
     lesson = Fixture.lesson()
 
     {:ok, architecture} =
-      AdvancedPlanV6.build_architecture(
+      AdvancedPlanV7.build_architecture(
         Fixture.architecture_candidate(),
         lesson,
         1
       )
 
     {:ok, content} =
-      AdvancedPlanV6.attach_activities(
+      AdvancedPlanV7.attach_activities(
         architecture,
         Fixture.activity_candidate(),
         lesson
@@ -31,7 +31,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
                content["title"],
                content,
                %{"items" => []},
-               "advanced-v6",
+               "advanced-v7",
                media_urls: %{
                  "figure-1" => "https://example.edu/figure-1.png",
                  "figure-2" => "https://example.edu/figure-2.png",
@@ -62,28 +62,35 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
   test "compiles rich stages and immutable source blocks into coherent multi-part screens" do
     content = rich_content()
 
-    assert {:ok, compiled} = compile(content, "rich-advanced-v6")
+    assert {:ok, compiled} = compile(content, "rich-advanced-v7")
 
     stage =
-      Enum.find(compiled["activities"], &(&1["key"] == "rich-advanced-v6:v6:stage:investigation"))
+      Enum.find(compiled["activities"], &(&1["key"] == "rich-advanced-v7:v7:stage:investigation"))
 
     evidence =
       Enum.find(
         compiled["activities"],
-        &(&1["key"] == "rich-advanced-v6:v6:group:evidence-group")
+        &(&1["key"] == "rich-advanced-v7:v7:group:evidence-group")
+      )
+
+    investigation =
+      Enum.find(
+        compiled["activities"],
+        &(&1["key"] == "rich-advanced-v7:v7:group:investigation-group")
       )
 
     assert length(get_in(stage, ["model", "partsLayout"])) == 13
-    assert length(get_in(evidence, ["model", "partsLayout"])) == 4
+    assert length(get_in(evidence, ["model", "partsLayout"])) == 3
 
     stage_text = Jason.encode!(stage["model"])
     evidence_text = Jason.encode!(evidence["model"])
+    investigation_text = Jason.encode!(investigation["model"])
 
     assert stage_text =~ "Commit to a prediction"
     assert stage_text =~ "Record what the evidence shows"
     assert stage_text =~ "Test a changed condition"
     assert evidence_text =~ "Analyze quantitative data"
-    assert evidence_text =~ "First calculate the predicted value"
+    assert investigation_text =~ "First calculate the predicted value"
 
     refute Enum.any?(compiled["activities"], &String.contains?(&1["key"], ":block:"))
   end
@@ -144,7 +151,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
              )
   end
 
-  test "Basic schema 5 multiple choice also compiles a default incorrect response" do
+  test "Basic v7 multiple choice also compiles a default incorrect response" do
     candidate =
       Fixture.architecture_candidate()
       |> Map.delete("experience_blueprint")
@@ -157,7 +164,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
         }
       ])
 
-    assert {:ok, content} = BasicPlanV5.build(candidate, Fixture.lesson(), 1)
+    assert {:ok, content} = BasicPlanV7.build(candidate, Fixture.lesson(), 1)
 
     question = %{
       "id" => "basic-check",
@@ -194,7 +201,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
                content["title"],
                content,
                %{"items" => [question]},
-               "basic-v5-incorrect-response",
+               "basic-v7-incorrect-response",
                media_urls: %{
                  "figure-1" => "https://example.edu/figure-1.png",
                  "figure-2" => "https://example.edu/figure-2.png",
@@ -207,7 +214,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
     assert has_default_incorrect_response?(activity["model"])
   end
 
-  test "compiles every schema 6 interaction type with complete response rules" do
+  test "compiles every v7 interaction type with complete response rules" do
     types = ~w(multiple_choice dropdown slider number_input short_answer reflection)
 
     slots =
@@ -216,7 +223,7 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
       |> Enum.map(fn {type, index} ->
         %{
           "id" => "type-slot-#{index}",
-          "stage_id" => "investigation",
+          "stage_id" => if(index == length(types), do: "synthesis-stage", else: "investigation"),
           "purpose" => "Use #{type} to interpret the source evidence.",
           "objective_ids" => ["objective-1"],
           "evidence_block_ids" => ["evidence", "investigation"],
@@ -235,10 +242,30 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
       )
       |> put_in(
         ["experience_blueprint", "stages", Access.at(0), "items"],
-        [%{"kind" => "content_group", "ref_id" => "evidence-group"}] ++
-          Enum.map(1..length(types), fn index ->
+        [
+          %{"kind" => "content_group", "ref_id" => "evidence-group"},
+          %{"kind" => "content_group", "ref_id" => "investigation-group"}
+        ] ++
+          Enum.map(1..(length(types) - 1), fn index ->
             %{"kind" => "activity_slot", "ref_id" => "type-slot-#{index}"}
           end)
+      )
+      |> put_in(
+        ["experience_blueprint", "stages", Access.at(1), "native_follow_up_slot_id"],
+        "type-slot-6"
+      )
+      |> put_in(
+        ["experience_blueprint", "stages", Access.at(1), "items"],
+        [%{"kind" => "activity_slot", "ref_id" => "type-slot-6"}]
+      )
+      |> put_in(
+        [
+          "experience_blueprint",
+          "branch_sets",
+          Access.at(0),
+          "decision_activity_slot_id"
+        ],
+        "type-slot-1"
       )
 
     activities =
@@ -263,10 +290,10 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
       end)
 
     assert {:ok, architecture} =
-             AdvancedPlanV6.build_architecture(architecture_candidate, Fixture.lesson(), 1)
+             AdvancedPlanV7.build_architecture(architecture_candidate, Fixture.lesson(), 1)
 
     assert {:ok, content} =
-             AdvancedPlanV6.attach_activities(
+             AdvancedPlanV7.attach_activities(
                architecture,
                %{"activities" => activities},
                Fixture.lesson()
@@ -298,10 +325,10 @@ defmodule Oli.OpenStax.CourseImport.AuthoringCompilerV6Test do
 
   defp rich_content do
     {:ok, architecture} =
-      AdvancedPlanV6.build_architecture(Fixture.architecture_candidate(), Fixture.lesson(), 1)
+      AdvancedPlanV7.build_architecture(Fixture.architecture_candidate(), Fixture.lesson(), 1)
 
     {:ok, content} =
-      AdvancedPlanV6.attach_activities(
+      AdvancedPlanV7.attach_activities(
         architecture,
         Fixture.activity_candidate(),
         Fixture.lesson()

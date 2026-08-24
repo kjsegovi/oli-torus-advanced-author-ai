@@ -11,6 +11,7 @@ defmodule Oli.OpenStax.CourseImport.LessonPlan do
   import Ecto.Changeset
 
   alias Oli.OpenStax.CourseImport.Lesson
+  alias Oli.OpenStax.CourseImport.ImportContract
 
   @primary_key {:id, :binary_id, autogenerate: true}
   @foreign_key_type :binary_id
@@ -63,12 +64,11 @@ defmodule Oli.OpenStax.CourseImport.LessonPlan do
     mode = content["authoring_mode"] || content[:authoring_mode]
     version = content["schema_version"] || content[:schema_version]
 
-    if {mode, version} in [{"basic", 5}, {"advanced", 6}] do
+    if ImportContract.current_content?(%{"authoring_mode" => mode, "schema_version" => version}) do
       []
     else
       [
-        content_payload:
-          "must use the current OpenStax contract: Basic schema 5 or Advanced schema 6"
+        content_payload: "must use the current OpenStax contract: Basic or Advanced schema 7"
       ]
     end
   end

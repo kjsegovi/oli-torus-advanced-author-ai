@@ -1,6 +1,6 @@
 defmodule Oli.OpenStax.CourseImport.FullSource do
   @moduledoc """
-  Current-AST source disposition rules shared by Basic v5 and Advanced v6.
+  Current-AST source disposition rules shared by Basic and Advanced v7.
 
   Required instructional blocks are represented exactly once. Only importer-
   classified navigation, duplicate boilerplate, or unsafe media may be omitted.

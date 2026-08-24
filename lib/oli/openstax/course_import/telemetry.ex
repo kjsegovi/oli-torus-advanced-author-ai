@@ -16,7 +16,7 @@ defmodule Oli.OpenStax.CourseImport.Telemetry do
         blocks: number(counts, :blocks),
         assets: number(counts, :assets)
       },
-      %{run_id: run_id, source_schema_version: 3}
+      %{run_id: run_id, source_schema_version: 4}
     )
   end
 
@@ -39,7 +39,7 @@ defmodule Oli.OpenStax.CourseImport.Telemetry do
           run_id: run_id,
           lesson_id: lesson_id,
           plan_version: plan.version,
-          plan_schema_version: 6
+          plan_schema_version: 7
         }
       )
 

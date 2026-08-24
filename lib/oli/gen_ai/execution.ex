@@ -38,17 +38,30 @@ defmodule Oli.GenAI.Execution do
       notify_plan(Keyword.get(opts, :on_plan), plan)
 
       try do
-        execute_with_fallback(
-          :generate,
-          completer,
-          messages,
-          functions,
-          plan,
-          service_config,
-          request_ctx,
-          request_type,
-          true
-        )
+        case prepare_provider_request(request_ctx, messages, functions, plan) do
+          {:ok, {:proceed, request_metadata}} ->
+            execute_with_fallback(
+              :generate,
+              completer,
+              messages,
+              functions,
+              plan,
+              service_config,
+              Map.put(
+                request_ctx,
+                :request_payload_hash,
+                request_metadata.request_payload_hash
+              ),
+              request_type,
+              true
+            )
+
+          {:ok, {:replay, %{content: content, metadata: metadata}}} ->
+            {:ok, %{content: content, metadata: metadata}}
+
+          {:error, reason} ->
+            {:error, reason}
+        end
       after
         release_admission!(plan)
       end
@@ -97,7 +110,7 @@ defmodule Oli.GenAI.Execution do
          functions,
          plan,
          service_config,
-         _request_ctx,
+         request_ctx,
          request_type,
          include_metadata?
        ) do
@@ -107,6 +120,7 @@ defmodule Oli.GenAI.Execution do
       functions,
       plan,
       service_config,
+      request_ctx,
       request_type,
       include_metadata?
     )
@@ -141,19 +155,59 @@ defmodule Oli.GenAI.Execution do
          functions,
          plan,
          service_config,
+         request_ctx,
          request_type,
          include_metadata?
        ) do
     start_ms = System.monotonic_time(:millisecond)
-    result = completer.generate(messages, functions, plan.selected_model)
+
+    result =
+      if function_exported?(completer, :generate_with_metadata, 3) do
+        completer.generate_with_metadata(messages, functions, plan.selected_model)
+      else
+        completer.generate(messages, functions, plan.selected_model)
+      end
+
     latency_ms = System.monotonic_time(:millisecond) - start_ms
 
-    report_breaker(result, plan.selected_model, latency_ms)
-    emit_provider_telemetry(result, latency_ms, plan, request_type, service_config)
+    breaker_result = breaker_result(result)
+    report_breaker(breaker_result, plan.selected_model, latency_ms)
+    emit_provider_telemetry(breaker_result, latency_ms, plan, request_type, service_config)
 
     case {include_metadata?, result} do
+      {true, {:ok, %{content: content, response: response}}} ->
+        metadata =
+          generation_metadata(plan, service_config)
+          |> Map.merge(provider_metadata(response, plan, latency_ms))
+
+        case notify_usage(request_ctx, :ok, Map.put(metadata, :response_content, content)) do
+          :ok -> {:ok, %{content: content, metadata: metadata}}
+          {:error, reason} -> {:error, {:ai_usage_persistence_failed, reason}}
+        end
+
       {true, {:ok, content}} ->
-        {:ok, %{content: content, metadata: generation_metadata(plan, service_config)}}
+        metadata =
+          generation_metadata(plan, service_config)
+          |> Map.merge(provider_metadata(content, plan, latency_ms))
+
+        case notify_usage(request_ctx, :ok, Map.put(metadata, :response_content, content)) do
+          :ok -> {:ok, %{content: content, metadata: metadata}}
+          {:error, reason} -> {:error, {:ai_usage_persistence_failed, reason}}
+        end
+
+      {true, {:error, reason}} ->
+        metadata =
+          generation_metadata(plan, service_config)
+          |> Map.put(:latency_ms, latency_ms)
+          |> Map.put(:error, inspect(reason))
+
+        case notify_usage(request_ctx, {:error, reason}, metadata) do
+          :ok ->
+            {:error, reason}
+
+          {:error, persistence_reason} ->
+            {:error, {:ai_usage_persistence_failed, persistence_reason}}
+        end
 
       _ ->
         result
@@ -279,8 +333,119 @@ defmodule Oli.GenAI.Execution do
       model: plan.selected_model.model,
       provider: plan.selected_model.provider,
       registered_model_id: plan.selected_model.id,
-      service_config_id: service_config_id
+      service_config_id: service_config_id,
+      service_tier: plan.selected_model.service_tier || to_string(plan.tier),
+      reasoning_effort: plan.selected_model.reasoning_effort || "medium",
+      prompt_cache_key: plan.selected_model.prompt_cache_key,
+      max_output_tokens: plan.selected_model.max_output_tokens
     }
+  end
+
+  defp breaker_result({:ok, %{content: content}}), do: {:ok, content}
+  defp breaker_result(result), do: result
+
+  defp provider_metadata(response, plan, latency_ms) when is_map(response) do
+    usage = Map.get(response, "usage", Map.get(response, :usage, %{})) || %{}
+
+    input_details =
+      Map.get(usage, "input_tokens_details", Map.get(usage, :input_tokens_details, %{})) || %{}
+
+    prompt_details =
+      Map.get(usage, "prompt_tokens_details", Map.get(usage, :prompt_tokens_details, %{})) || %{}
+
+    output_details =
+      Map.get(usage, "output_tokens_details", Map.get(usage, :output_tokens_details, %{})) || %{}
+
+    input_tokens =
+      number(usage, ["input_tokens", :input_tokens, "prompt_tokens", :prompt_tokens])
+
+    cached_tokens =
+      number(input_details, ["cached_tokens", :cached_tokens]) ||
+        number(prompt_details, ["cached_tokens", :cached_tokens]) || 0
+
+    %{
+      request_id: Map.get(response, "id") || Map.get(response, :id),
+      service_tier:
+        Map.get(response, "service_tier") || Map.get(response, :service_tier) ||
+          plan.selected_model.service_tier || to_string(plan.tier),
+      input_tokens: input_tokens || 0,
+      cached_input_tokens: cached_tokens,
+      cache_write_tokens: number(input_details, ["cache_write_tokens", :cache_write_tokens]) || 0,
+      output_tokens:
+        number(usage, ["output_tokens", :output_tokens, "completion_tokens", :completion_tokens]) ||
+          0,
+      reasoning_tokens: number(output_details, ["reasoning_tokens", :reasoning_tokens]) || 0,
+      cache_status: if(cached_tokens > 0, do: "hit", else: "miss"),
+      latency_ms: latency_ms
+    }
+  end
+
+  defp provider_metadata(_response, _plan, latency_ms),
+    do: %{
+      input_tokens: 0,
+      cached_input_tokens: 0,
+      cache_write_tokens: 0,
+      output_tokens: 0,
+      reasoning_tokens: 0,
+      cache_status: "unknown",
+      latency_ms: latency_ms
+    }
+
+  defp number(map, keys) when is_map(map) do
+    Enum.find_value(keys, fn key ->
+      case Map.get(map, key) do
+        value when is_integer(value) and value >= 0 -> value
+        value when is_float(value) and value >= 0 -> trunc(value)
+        _ -> nil
+      end
+    end)
+  end
+
+  defp number(_map, _keys), do: nil
+
+  defp prepare_provider_request(request_ctx, messages, functions, plan) do
+    payload = {messages, functions}
+    payload_binary = :erlang.term_to_binary(payload, [:deterministic])
+
+    request = %{
+      model: plan.selected_model.model,
+      service_tier: plan.selected_model.service_tier || to_string(plan.tier),
+      input_tokens: max(div(byte_size(payload_binary) + 3, 4), 1),
+      max_output_tokens:
+        plan.selected_model.max_output_tokens || request_ctx[:max_output_tokens] || 4_000,
+      request_payload_hash:
+        payload_binary
+        |> then(&:crypto.hash(:sha256, &1))
+        |> Base.encode16(case: :lower)
+    }
+
+    case Map.get(request_ctx, :before_provider_request) do
+      callback when is_function(callback, 1) ->
+        case callback.(request) do
+          {:ok, :proceed} -> {:ok, {:proceed, request}}
+          other -> other
+        end
+
+      _ ->
+        {:ok, {:proceed, request}}
+    end
+  rescue
+    error -> {:error, {:ai_request_preparation_failed, error}}
+  end
+
+  defp notify_usage(request_ctx, outcome, metadata) do
+    case Map.get(request_ctx, :usage_recorder) do
+      recorder when is_function(recorder, 2) ->
+        recorder.(
+          outcome,
+          Map.put_new(metadata, :request_payload_hash, request_ctx[:request_payload_hash])
+        )
+
+      _ ->
+        :ok
+    end
+  rescue
+    error -> {:error, error}
   end
 
   defp emit_provider_telemetry(result, latency_ms, plan, request_type, service_config) do

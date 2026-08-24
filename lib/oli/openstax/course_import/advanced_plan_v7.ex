@@ -1,6 +1,6 @@
-defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
+defmodule Oli.OpenStax.CourseImport.AdvancedPlanV7 do
   @moduledoc """
-  Schema 6 contract for source-faithful Advanced Author Explorations.
+  Schema 7 contract for source-faithful Advanced Author Explorations.
 
   Source AST hydration remains deterministic. Models may organize source block
   ids and author source-grounded connective guidance around those immutable
@@ -8,9 +8,9 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
   author Torus rules, navigation targets, or URLs.
   """
 
-  alias Oli.OpenStax.CourseImport.BasicPlanV5
+  alias Oli.OpenStax.CourseImport.{BasicPlanV7, ImportContract}
 
-  @schema_version 6
+  @schema_version ImportContract.content_schema_version("advanced")
   @roles ~w(orientation prediction investigation observation evidence interpretation transfer synthesis)
   @required_roles ~w(orientation prediction interpretation transfer synthesis)
   @guidance_kinds ~w(prediction observation interpretation transfer synthesis)
@@ -30,7 +30,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
     candidate = candidate_content(candidate)
     base_candidate = Map.put(candidate, "question_slots", [])
 
-    with {:ok, base} <- BasicPlanV5.build(base_candidate, lesson, lesson_index),
+    with {:ok, base} <- BasicPlanV7.build(base_candidate, lesson, lesson_index),
          {:ok, blueprint} <-
            normalize_architecture(candidate["experience_blueprint"], base, lesson) do
       {:ok,
@@ -39,7 +39,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
        |> Map.put("authoring_mode", "advanced")
        |> Map.put("question_slots", [])
        |> Map.put("experience_blueprint", blueprint)
-       |> Map.put("advanced_v6_contract", %{
+       |> Map.put("advanced_v7_contract", %{
          "source_ast_authority" => "deterministic_extractor",
          "rule_authority" => "deterministic_compiler",
          "activity_authority" => "reviewed_activity_writer",
@@ -62,9 +62,15 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
     activities =
       (candidate["activities"] || candidate["adaptive_activities"])
       |> normalize_maps()
+      |> Enum.map(&normalize_activity_contract/1)
       |> Enum.map(&put_response_contract/1)
+      |> apply_slot_remediation_targets(slots)
 
-    findings = validate_activities(activities, slots, content, lesson)
+    branch_sets = List.wrap(blueprint["branch_sets"])
+
+    findings =
+      validate_activities(activities, slots, content, lesson) ++
+        validate_realized_branch_sets(branch_sets, activities)
 
     case findings do
       [] ->
@@ -110,6 +116,8 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
             }
           end)
 
+        realized_branch_sets = realize_branch_sets(branch_sets, activities)
+
         {:ok,
          Map.put(
            content,
@@ -120,6 +128,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
            |> Map.put("duration_manifest", duration)
            |> Map.put("estimated_minutes", duration["total_minutes"])
            |> Map.put("remediation_paths", remediation_paths)
+           |> Map.put("branch_sets", realized_branch_sets)
          )}
 
       findings ->
@@ -130,9 +139,106 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
   def attach_activities(_content, _candidate, _lesson),
     do: {:error, [finding("invalid_activity_candidate", "$", "Return one activity set.")]}
 
+  defp apply_slot_remediation_targets(activities, slots) do
+    remediation_by_slot =
+      Map.new(slots, &{&1["id"], &1["remediation_content_group_id"]})
+
+    Enum.map(activities, fn activity ->
+      case Map.fetch(remediation_by_slot, activity["slot_id"]) do
+        {:ok, remediation_content_group_id} ->
+          Map.put(activity, "remediation_content_group_id", remediation_content_group_id)
+
+        :error ->
+          activity
+      end
+    end)
+  end
+
+  @doc "Returns the compact model-owned architecture candidate for a persisted v7 plan."
+  @spec architecture_repair_candidate(map()) :: map()
+  def architecture_repair_candidate(content) when is_map(content) do
+    blueprint = content["experience_blueprint"] || %{}
+
+    activity_slots_by_id =
+      blueprint
+      |> Map.get("activities", [])
+      |> List.wrap()
+      |> Map.new(&{&1["id"], &1["slot_id"]})
+
+    stages =
+      blueprint
+      |> Map.get("stages", [])
+      |> List.wrap()
+      |> Enum.map(fn stage ->
+        items =
+          stage
+          |> Map.get("items", [])
+          |> List.wrap()
+          |> Enum.map(fn
+            %{"kind" => "activity", "ref_id" => activity_id} = item ->
+              case Map.get(activity_slots_by_id, activity_id) do
+                slot_id when is_binary(slot_id) ->
+                  %{"kind" => "activity_slot", "ref_id" => slot_id}
+
+                _ ->
+                  item
+              end
+
+            item ->
+              Map.take(item, ~w(kind ref_id))
+          end)
+
+        stage
+        |> Map.take(
+          ~w(id title purpose roles presentation_pattern introduction guidance native_follow_up_slot_id)
+        )
+        |> Map.put("items", items)
+      end)
+
+    slots =
+      blueprint
+      |> Map.get("activity_slots", [])
+      |> List.wrap()
+      |> Enum.map(
+        &Map.take(
+          &1,
+          ~w(id stage_id purpose objective_ids evidence_block_ids recommended_types remediation_content_group_id estimated_minutes)
+        )
+      )
+
+    content
+    |> BasicPlanV7.repair_candidate()
+    |> Map.put("question_slots", [])
+    |> Map.put("experience_blueprint", %{
+      "driving_question" => blueprint["driving_question"],
+      "stages" => stages,
+      "activity_slots" => slots,
+      "branch_sets" =>
+        blueprint
+        |> Map.get("branch_sets", [])
+        |> List.wrap()
+        |> Enum.map(&Map.drop(&1, ["decision_activity_id"]))
+    })
+  end
+
+  def architecture_repair_candidate(_content), do: %{}
+
+  @doc "Returns the exact model-owned activity set for a persisted v7 plan."
+  @spec activity_repair_candidate(map()) :: map()
+  def activity_repair_candidate(content) when is_map(content) do
+    %{
+      "activities" =>
+        content
+        |> get_in(["experience_blueprint", "activities"])
+        |> List.wrap()
+    }
+  end
+
+  def activity_repair_candidate(_content), do: %{}
+
   @spec prompt_contract(map()) :: map()
   def prompt_contract(lesson) do
-    BasicPlanV5.prompt_contract(lesson)
+    BasicPlanV7.prompt_contract(lesson)
     |> Map.put("schema_version", @schema_version)
     |> Map.put("allowed_stage_roles", @roles)
     |> Map.put("required_experience_roles", @required_roles)
@@ -146,6 +252,62 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
       "forbidden" => ["raw Torus rules", "navigation targets", "URLs"]
     })
     |> Map.put("allowed_activity_types", @activity_types)
+    |> Map.put("experience_blueprint_schema", %{
+      "driving_question" => "string",
+      "stages" => [
+        %{
+          "id" => "string",
+          "title" => "string",
+          "purpose" => "string",
+          "roles" => @roles,
+          "presentation_pattern" => "one allowed_presentation_patterns value",
+          "introduction" => %{
+            "heading" => "string",
+            "body" => "string",
+            "evidence_block_ids" => ["source block id"]
+          },
+          "guidance" => [
+            %{
+              "kind" => "one required_guidance_kinds value",
+              "heading" => "string",
+              "body" => "string",
+              "evidence_block_ids" => ["source block id"]
+            }
+          ],
+          "native_follow_up_slot_id" => "activity slot id from this stage",
+          "items" => [%{"kind" => "content_group|activity_slot", "ref_id" => "string"}]
+        }
+      ],
+      "activity_slots" => [
+        %{
+          "id" => "string",
+          "stage_id" => "stage id containing this activity_slot item",
+          "purpose" => "learner work performed in this slot",
+          "objective_ids" => ["server-issued objective id"],
+          "evidence_block_ids" => ["source block id"],
+          "recommended_types" => @activity_types,
+          "remediation_content_group_id" => "content group id",
+          "estimated_minutes" => "integer from 4 through 20"
+        }
+      ],
+      "branch_sets" => [
+        %{
+          "id" => "string",
+          "decision_activity_slot_id" => "multiple_choice or dropdown activity slot id",
+          "objective_ids" => ["server-issued objective id"],
+          "rejoin_stage_id" => "shared later stage id",
+          "pathways" => [
+            %{
+              "choice_id" => "choice id the activity writer must preserve",
+              "label" => "learner-facing pathway label",
+              "target_content_group_id" => "content group shown for this choice",
+              "feedback" => "source-grounded transition into the pathway",
+              "evidence_block_ids" => ["source block id"]
+            }
+          ]
+        }
+      ]
+    })
     |> Map.put("duration_range_minutes", [@minimum_minutes, @maximum_minutes])
   end
 
@@ -155,6 +317,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
 
     is_binary(blueprint["driving_question"]) and rich_stages?(blueprint["stages"]) and
       List.wrap(blueprint["activities"]) != [] and
+      List.wrap(blueprint["branch_sets"]) != [] and
       get_in(blueprint, ["duration_manifest", "total_minutes"]) in @minimum_minutes..@maximum_minutes
   end
 
@@ -167,9 +330,10 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
     objective_ids =
       base |> Map.get("objective_catalog", []) |> Enum.map(& &1["id"]) |> MapSet.new()
 
-    source_ids = BasicPlanV5.source_blocks(lesson) |> Enum.map(& &1["id"]) |> MapSet.new()
-    slots = normalize_slots(raw["activity_slots"])
+    source_ids = BasicPlanV7.source_blocks(lesson) |> Enum.map(& &1["id"]) |> MapSet.new()
     stages = normalize_stages(raw["stages"])
+    slots = normalize_slots(raw["activity_slots"], stages)
+    branch_sets = normalize_branch_sets(raw["branch_sets"])
 
     findings =
       []
@@ -187,6 +351,9 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
       )
       |> Kernel.++(validate_stages(stages, group_ids, slots, source_ids))
       |> Kernel.++(validate_slots(slots, group_ids, objective_ids, source_ids))
+      |> Kernel.++(
+        validate_branch_sets(branch_sets, slots, stages, group_ids, objective_ids, source_ids)
+      )
       |> Kernel.++(validate_group_stage_coverage(stages, group_ids))
 
     case findings do
@@ -199,6 +366,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
              "driving_question" => String.trim(raw["driving_question"]),
              "stages" => stages,
              "activity_slots" => slots,
+             "branch_sets" => branch_sets,
              "activities" => [],
              "enrichment_references" => [],
              "duration_manifest" => duration,
@@ -287,21 +455,204 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
     end)
   end
 
-  defp normalize_slots(values) do
+  defp normalize_slots(values, stages) do
+    inferred_stage_ids =
+      Map.new(
+        for stage <- stages,
+            item <- stage["items"],
+            item["kind"] == "activity_slot",
+            is_binary(item["ref_id"]),
+            do: {item["ref_id"], stage["id"]}
+      )
+
     values
     |> normalize_maps()
     |> Enum.with_index(1)
     |> Enum.map(fn {slot, index} ->
+      id = present(slot["id"]) || "activity-slot-#{index}"
+
       %{
-        "id" => present(slot["id"]) || "activity-slot-#{index}",
-        "stage_id" => present(slot["stage_id"]),
-        "purpose" => present(slot["purpose"]),
+        "id" => id,
+        "stage_id" => present(slot["stage_id"]) || inferred_stage_ids[id],
+        "purpose" => present(slot["purpose"] || slot["instructional_purpose"] || slot["prompt"]),
         "objective_ids" => normalize_strings(slot["objective_ids"]),
         "evidence_block_ids" => normalize_strings(slot["evidence_block_ids"]),
-        "recommended_types" => normalize_strings(slot["recommended_types"]),
+        "recommended_types" =>
+          normalize_strings(
+            slot["recommended_types"] || slot["recommended_activity_types"] ||
+              slot["recommended_interaction_type"]
+          ),
         "remediation_content_group_id" => present(slot["remediation_content_group_id"]),
         "estimated_minutes" => numeric_minutes(slot["estimated_minutes"])
       }
+    end)
+  end
+
+  defp normalize_branch_sets(values) do
+    values
+    |> normalize_maps()
+    |> Enum.with_index(1)
+    |> Enum.map(fn {branch_set, index} ->
+      %{
+        "id" => present(branch_set["id"]) || "branch-set-#{index}",
+        "decision_activity_slot_id" => present(branch_set["decision_activity_slot_id"]),
+        "objective_ids" => normalize_strings(branch_set["objective_ids"]),
+        "rejoin_stage_id" => present(branch_set["rejoin_stage_id"]),
+        "pathways" =>
+          branch_set
+          |> Map.get("pathways", [])
+          |> normalize_maps()
+          |> Enum.map(fn pathway ->
+            %{
+              "choice_id" => present(pathway["choice_id"]),
+              "label" => present(pathway["label"]),
+              "target_content_group_id" => present(pathway["target_content_group_id"]),
+              "feedback" => present(pathway["feedback"]),
+              "evidence_block_ids" => normalize_strings(pathway["evidence_block_ids"])
+            }
+          end)
+      }
+    end)
+  end
+
+  defp validate_branch_sets(branch_sets, slots, stages, group_ids, objective_ids, source_ids) do
+    slot_by_id = Map.new(slots, &{&1["id"], &1})
+    stage_ids = stages |> Enum.map(& &1["id"]) |> MapSet.new()
+    ids = Enum.map(branch_sets, & &1["id"])
+
+    []
+    |> maybe_finding(
+      branch_sets == [],
+      "missing_exploratory_branch",
+      "$.experience_blueprint.branch_sets",
+      "Add at least one answer-driven branch with two to four distinct pathways and a shared rejoin stage."
+    )
+    |> maybe_finding(
+      length(ids) != length(Enum.uniq(ids)),
+      "duplicate_branch_set_ids",
+      "$.experience_blueprint.branch_sets",
+      "Give every branch set a stable unique id."
+    )
+    |> Kernel.++(
+      branch_sets
+      |> Enum.with_index()
+      |> Enum.flat_map(fn {branch_set, index} ->
+        path = "$.experience_blueprint.branch_sets[#{index}]"
+        slot = slot_by_id[branch_set["decision_activity_slot_id"]]
+        pathways = branch_set["pathways"]
+        choice_ids = Enum.map(pathways, & &1["choice_id"])
+        target_ids = Enum.map(pathways, & &1["target_content_group_id"])
+
+        []
+        |> maybe_finding(
+          is_nil(slot) or
+            Enum.all?(
+              List.wrap(slot && slot["recommended_types"]),
+              &(&1 not in ["multiple_choice", "dropdown"])
+            ),
+          "invalid_branch_decision_slot",
+          path,
+          "Branch from an existing multiple-choice or dropdown activity slot."
+        )
+        |> maybe_finding(
+          branch_set["objective_ids"] == [] or
+            Enum.any?(branch_set["objective_ids"], &(not MapSet.member?(objective_ids, &1))),
+          "invalid_branch_objectives",
+          path,
+          "Map the branch only to server-issued objective ids."
+        )
+        |> maybe_finding(
+          not MapSet.member?(stage_ids, branch_set["rejoin_stage_id"]),
+          "invalid_branch_rejoin_stage",
+          path,
+          "Choose an existing shared stage where all pathways rejoin."
+        )
+        |> maybe_finding(
+          length(pathways) not in 2..4,
+          "invalid_branch_pathway_count",
+          path,
+          "Create two to four meaningful pathways."
+        )
+        |> maybe_finding(
+          Enum.any?(pathways, fn pathway ->
+            not present?(pathway["choice_id"]) or not present?(pathway["label"]) or
+              not present?(pathway["feedback"])
+          end),
+          "incomplete_branch_pathway",
+          path,
+          "Each pathway needs a choice id, learner-facing label, and transition feedback."
+        )
+        |> maybe_finding(
+          length(choice_ids) != length(Enum.uniq(choice_ids)),
+          "duplicate_branch_choice_ids",
+          path,
+          "Give each pathway a distinct choice id."
+        )
+        |> maybe_finding(
+          length(target_ids) != length(Enum.uniq(target_ids)) or
+            Enum.any?(target_ids, &(not MapSet.member?(group_ids, &1))),
+          "invalid_branch_targets",
+          path,
+          "Send each pathway to a distinct existing content group."
+        )
+        |> maybe_finding(
+          Enum.any?(pathways, fn pathway ->
+            pathway["evidence_block_ids"] == [] or
+              Enum.any?(
+                pathway["evidence_block_ids"],
+                &(not MapSet.member?(source_ids, &1))
+              )
+          end),
+          "invalid_branch_evidence",
+          path,
+          "Ground every pathway in supplied source block ids."
+        )
+      end)
+    )
+  end
+
+  defp validate_realized_branch_sets(branch_sets, activities) do
+    activities_by_slot = Map.new(activities, &{&1["slot_id"], &1})
+
+    branch_sets
+    |> Enum.with_index()
+    |> Enum.flat_map(fn {branch_set, index} ->
+      activity = activities_by_slot[branch_set["decision_activity_slot_id"]]
+
+      activity_choice_ids =
+        activity
+        |> then(&(&1 && &1["choices"]))
+        |> normalize_maps()
+        |> Enum.map(& &1["id"])
+        |> Enum.filter(&is_binary/1)
+
+      pathway_choice_ids = branch_set["pathways"] |> List.wrap() |> Enum.map(& &1["choice_id"])
+
+      []
+      |> maybe_finding(
+        is_nil(activity) or activity["interaction_type"] not in ["multiple_choice", "dropdown"],
+        "branch_activity_not_realized",
+        "$.experience_blueprint.branch_sets[#{index}]",
+        "Realize the branch decision slot as multiple choice or dropdown."
+      )
+      |> maybe_finding(
+        MapSet.new(activity_choice_ids) != MapSet.new(pathway_choice_ids),
+        "branch_choice_contract_mismatch",
+        "$.experience_blueprint.branch_sets[#{index}]",
+        "Use exactly the approved pathway choice ids in the realized decision activity."
+      )
+    end)
+  end
+
+  defp realize_branch_sets(branch_sets, activities) do
+    activity_id_by_slot = Map.new(activities, &{&1["slot_id"], &1["id"]})
+
+    Enum.map(branch_sets, fn branch_set ->
+      Map.put(
+        branch_set,
+        "decision_activity_id",
+        activity_id_by_slot[branch_set["decision_activity_slot_id"]]
+      )
     end)
   end
 
@@ -578,7 +929,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
     objective_ids =
       content |> Map.get("objective_catalog", []) |> Enum.map(& &1["id"]) |> MapSet.new()
 
-    source_ids = BasicPlanV5.source_blocks(lesson) |> Enum.map(& &1["id"]) |> MapSet.new()
+    source_ids = BasicPlanV7.source_blocks(lesson) |> Enum.map(& &1["id"]) |> MapSet.new()
     ids = Enum.map(activities, & &1["id"])
     activity_slots = Enum.map(activities, & &1["slot_id"])
 
@@ -722,7 +1073,8 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
       |> length()
 
     instructional_guidance = ceil_div(connective_words, 180)
-    synthesis = 6
+    synthesis_in_learner_work? = synthesis_activity_slot?(slots, stages)
+    synthesis = if synthesis_in_learner_work?, do: 0, else: 6
     total = reading + media_analysis + instructional_guidance + learner_work + synthesis
 
     %{
@@ -731,10 +1083,26 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
       "instructional_guidance_minutes" => instructional_guidance,
       "learner_work_minutes" => learner_work,
       "synthesis_minutes" => synthesis,
+      "synthesis_accounting" =>
+        if(synthesis_in_learner_work?,
+          do: "included_in_activity_slots",
+          else: "separate_instructional_allowance"
+        ),
       "total_minutes" => total,
       "range" => [@minimum_minutes, @maximum_minutes],
       "strategy" => "deterministic_source_guidance_and_activity_estimate"
     }
+  end
+
+  defp synthesis_activity_slot?(slots, stages) do
+    synthesis_stage_ids =
+      stages
+      |> List.wrap()
+      |> Enum.filter(&("synthesis" in List.wrap(&1["roles"])))
+      |> Enum.map(& &1["id"])
+      |> MapSet.new()
+
+    Enum.any?(slots, &MapSet.member?(synthesis_stage_ids, &1["stage_id"]))
   end
 
   defp rich_stages?(values) do
@@ -810,6 +1178,67 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
 
   defp numeric_response?(_activity), do: true
 
+  defp normalize_activity_contract(activity) do
+    response_contract =
+      case activity["response_contract"] do
+        value when is_map(value) -> stringify_map(value)
+        _ -> %{}
+      end
+
+    correct_choice_id =
+      response_contract["correct_choice_id"] || response_contract["correct_response"]
+
+    choices =
+      (activity["choices"] || response_contract["choices"])
+      |> normalize_maps()
+      |> Enum.map(&normalize_choice_contract(&1, correct_choice_id))
+
+    activity
+    |> Map.put("choices", choices)
+    |> put_first_present("correct_feedback", [
+      activity["correct_feedback"],
+      response_contract["correct_feedback"]
+    ])
+    |> put_first_present("incorrect_feedback", [
+      activity["incorrect_feedback"],
+      activity["default_incorrect_feedback"],
+      response_contract["incorrect_feedback"],
+      response_contract["default_incorrect_feedback"]
+    ])
+    |> put_first_non_nil("correct_response", [
+      activity["correct_response"],
+      response_contract["correct_response"]
+    ])
+  end
+
+  defp normalize_choice_contract(choice, correct_choice_id) do
+    correct =
+      cond do
+        is_boolean(choice["correct"]) -> choice["correct"]
+        is_boolean(choice["is_correct"]) -> choice["is_correct"]
+        is_binary(correct_choice_id) -> choice["id"] == correct_choice_id
+        true -> nil
+      end
+
+    choice
+    |> Map.put("correct", correct)
+    |> put_first_present("feedback", [choice["feedback"], choice["incorrect_feedback"]])
+  end
+
+  defp put_first_present(map, key, values) do
+    case Enum.find_value(values, &present/1) do
+      nil -> map
+      value -> Map.put(map, key, value)
+    end
+  end
+
+  defp put_first_non_nil(map, key, values) do
+    case Enum.find(values, &(not is_nil(&1))) do
+      nil -> map
+      value -> Map.put(map, key, value)
+    end
+  end
+
   defp put_response_contract(%{"interaction_type" => type} = activity)
        when type in ["multiple_choice", "dropdown"] do
     choices = normalize_maps(activity["choices"])
@@ -846,6 +1275,8 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV6 do
        when type in ["short_answer", "reflection"] do
     Map.put(activity, "response_contract", %{
       "kind" => "text",
+      "scoring" => "completion",
+      "semantic_evaluation" => "author_review",
       "minimum_length" =>
         get_in(activity, ["configuration", "minimum_length"]) || activity["minimum_length"] || 40,
       "must_contain" =>

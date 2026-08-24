@@ -316,7 +316,7 @@ defmodule Oli.OpenStax.CourseImport.RichSource do
           normalize_map(value(section, "source_coverage") || value(section, "coverage")),
         source_metadata:
           normalize_map(value(section, "source_metadata"))
-          |> Map.put_new("source_schema_version", 3)
+          |> Map.put_new("source_schema_version", 4)
       })
       |> Repo.insert!()
 

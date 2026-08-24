@@ -28,7 +28,7 @@
       custom:
         applyBtnFlag: false
         checkButtonLabel: "Interpret state"
-        height: 520
+        height: 920
         maxAttempt: 0
         maxScore: 0
         showCheckBtn: true
@@ -36,6 +36,10 @@
       authoring:
         parts:
           - id: "generated_simulation_iframe"
+            type: "janus-capi-iframe"
+            owner: "aa_import_layout"
+            inherited: false
+          - id: "generated_simulation_iframe_v2"
             type: "janus-capi-iframe"
             owner: "aa_import_layout"
             inherited: false
@@ -99,6 +103,48 @@
                   value: 80
                   remediation_section_id: "gas-model-explanation"
                   feedback: "Review the gas-model explanation before interpreting this state."
+            configData:
+              - key: "volume"
+                type: 1
+                value: 50
+                readonly: false
+                writeonly: false
+              - key: "pressure"
+                type: 1
+                value: 50
+                readonly: true
+                writeonly: false
+        - id: "generated_simulation_iframe_v2"
+          type: "janus-capi-iframe"
+          custom:
+            src: "http://generated-simulations.localhost:9000/torus-media-dev/generated-simulations/storage-v2/artifacts/artifact-gas-pressure-v2/v2/sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/index.html"
+            title: "Gas pressure model, storage version 2"
+            description: "The same typed simulation delivered from the dedicated simulation bucket."
+            allowScrolling: false
+            customCssClass: ""
+            height: 360
+            maxScore: 1
+            requiresManualGrading: false
+            responsiveLayoutWidth: 960
+            width: 100
+            x: 0
+            y: 460
+            z: 0
+            securityProfile: "generated_simulation"
+            artifactIdentity:
+              proposalId: "proposal-gas-pressure-v2"
+              artifactId: "artifact-gas-pressure-v2"
+              version: 2
+              contentHash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+              storageOrigin: "http://generated-simulations.localhost:9000"
+            capiInputs:
+              - key: "volume"
+                type: "number"
+                defaultValue: 50
+            capiOutputs:
+              - key: "pressure"
+                type: "number"
+                defaultValue: 50
             configData:
               - key: "volume"
                 type: 1

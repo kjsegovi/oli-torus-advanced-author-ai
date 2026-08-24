@@ -21,10 +21,10 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
   alias Oli.ScopedFeatureFlags
 
   defmodule DeterministicLessonPlanner do
-    alias Oli.OpenStax.CourseImport.BasicPlanV5
+    alias Oli.OpenStax.CourseImport.BasicPlanV7
 
     def plan(lesson, index, _opts) do
-      block_ids = lesson |> BasicPlanV5.source_blocks() |> Enum.map(& &1["id"])
+      block_ids = lesson |> BasicPlanV7.source_blocks() |> Enum.map(& &1["id"])
 
       candidate = %{
         "title" => lesson["title"],
@@ -45,7 +45,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
         }
       }
 
-      {:ok, content} = BasicPlanV5.build(candidate, lesson, index)
+      {:ok, content} = BasicPlanV7.build(candidate, lesson, index)
 
       {:ok,
        %{
@@ -591,7 +591,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     end)
   end
 
-  test "shows the schema 6 learner deck and its governed review views", %{
+  test "shows the schema 7 learner deck and its governed review views", %{
     conn: conn,
     project: project,
     author: author,
@@ -612,7 +612,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     |> Ecto.Changeset.change(
       content_payload:
         plan.content_payload
-        |> Map.put("schema_version", 6)
+        |> Map.put("schema_version", 7)
         |> Map.put("authoring_mode", "advanced")
         |> Map.put("question_slots", [])
         |> Map.put("experience_blueprint", %{
@@ -686,13 +686,13 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
 
     assert has_element?(view, "#{material_selector}[open]", "Generated lesson material")
 
-    assert has_element?(view, "#{material_selector} [data-openstax-v6-learner-preview]")
+    assert has_element?(view, "#{material_selector} [data-openstax-v7-learner-preview]")
     assert has_element?(view, material_selector, "Learner Preview")
     assert has_element?(view, material_selector, "Stage Flow")
     assert has_element?(view, material_selector, "Activities and Branches")
     assert has_element?(view, material_selector, "Source Coverage")
     assert has_element?(view, material_selector, "Quality History")
-    assert has_element?(view, "#{material_selector} [data-openstax-v6-stage='investigation']")
+    assert has_element?(view, "#{material_selector} [data-openstax-v7-stage='investigation']")
     assert has_element?(view, material_selector, group["title"])
     assert has_element?(view, material_selector, "Which conclusion is supported?")
     assert has_element?(view, material_selector, "Not sure support")
@@ -742,7 +742,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     assert has_element?(
              view,
              "[data-openstax-author-review-warning]",
-             "Resolve them or regenerate this lesson before approval."
+             "Use Fix with AI to send the exact findings back automatically."
            )
 
     assert has_element?(
@@ -763,6 +763,155 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     refute has_element?(
              view,
              "button[phx-click='approve_lesson'][phx-value-lesson_id='#{lesson.id}']"
+           )
+  end
+
+  test "lesson review deep links render one ordered active panel and preserve selection", %{
+    conn: conn,
+    project: project,
+    author: author,
+    root: root
+  } do
+    review_run = lesson_review_run(project, root, author, ["chapter-1", "chapter-2"])
+    lessons = review_run.units |> Enum.flat_map(& &1.lessons)
+    assert length(lessons) >= 2
+    [first, second | _] = lessons
+
+    {:ok, view, _html} =
+      live(
+        conn,
+        ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax?run_id=#{review_run.id}&lesson_id=#{second.id}"
+      )
+
+    assert has_element?(view, "#openstax-lesson-tabs [role='tablist']")
+    assert has_element?(view, "#openstax-lesson-tab-#{second.id}[aria-selected='true']")
+    assert has_element?(view, "#openstax-lesson-#{second.id}[data-active-lesson-panel]")
+    refute has_element?(view, "#openstax-lesson-#{first.id}[data-active-lesson-panel]")
+
+    document = view |> render() |> Floki.parse_document!()
+    assert length(Floki.find(document, "[data-active-lesson-panel]")) == 1
+    assert length(Floki.find(document, "[data-lesson-tab]")) == length(lessons)
+
+    first
+    |> Ecto.Changeset.change(status: "needs_attention", planning_state: "completed")
+    |> Oli.Repo.update!()
+
+    send(view.pid, :poll_run)
+    render(view)
+
+    assert has_element?(view, "#openstax-lesson-tab-#{second.id}[aria-selected='true']")
+    assert has_element?(view, "#openstax-lesson-#{second.id}[data-active-lesson-panel]")
+  end
+
+  test "an invalid lesson deep link falls back to the first error then attention page", %{
+    conn: conn,
+    project: project,
+    author: author,
+    root: root
+  } do
+    review_run = lesson_review_run(project, root, author, ["chapter-1", "chapter-2"])
+    [first, second | _] = review_run.units |> Enum.flat_map(& &1.lessons)
+
+    first
+    |> Ecto.Changeset.change(status: "needs_attention", planning_state: "completed")
+    |> Oli.Repo.update!()
+
+    second
+    |> Ecto.Changeset.change(
+      planning_state: "failed",
+      planning_error: %{"category" => "invalid_provider_response"}
+    )
+    |> Oli.Repo.update!()
+
+    {:ok, view, _html} =
+      live(
+        conn,
+        ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax?run_id=#{review_run.id}&lesson_id=missing"
+      )
+
+    assert has_element?(view, "#openstax-lesson-tab-#{second.id}[aria-selected='true']", "Error")
+    assert has_element?(view, "#openstax-lesson-#{second.id}[data-active-lesson-panel]")
+    refute has_element?(view, "#openstax-lesson-#{first.id}[data-active-lesson-panel]")
+  end
+
+  test "lesson tabs expose advisory-safe passed, attention, active, and error states", %{
+    conn: conn,
+    project: project,
+    author: author,
+    root: root
+  } do
+    review_run = lesson_review_run(project, root, author)
+    [lesson, other | _] = review_run.units |> Enum.flat_map(& &1.lessons)
+    plan = Enum.max_by(lesson.plans, & &1.version)
+
+    advisory = %{
+      "severity" => "advisory",
+      "ownership" => "source_advisory",
+      "source_owned" => true,
+      "blocking" => false,
+      "code" => "source_locator_note",
+      "path" => "$.content_groups[0].source_blocks[0].source_locator",
+      "message" => "OpenStax source metadata was reconciled by the importer."
+    }
+
+    plan
+    |> Ecto.Changeset.change(
+      generation_metadata:
+        put_in(plan.generation_metadata, ["quality_gate", "advisories"], [advisory])
+    )
+    |> Oli.Repo.update!()
+
+    {:ok, view, _html} =
+      live(
+        conn,
+        ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax?run_id=#{review_run.id}&lesson_id=#{lesson.id}"
+      )
+
+    tab = "#openstax-lesson-tab-#{lesson.id}"
+    assert has_element?(view, tab, "Checks passed")
+
+    lesson
+    |> Ecto.Changeset.change(status: "needs_attention", planning_state: "completed")
+    |> Oli.Repo.update!()
+
+    send(view.pid, :poll_run)
+    assert has_element?(view, tab, "Needs attention")
+
+    lesson
+    |> Ecto.Changeset.change(status: "needs_attention", planning_state: "queued")
+    |> Oli.Repo.update!()
+
+    send(view.pid, :poll_run)
+    assert has_element?(view, tab, "Generation active")
+
+    lesson
+    |> Ecto.Changeset.change(
+      status: "failed",
+      planning_state: "failed",
+      planning_error: %{"category" => "invalid_provider_response"}
+    )
+    |> Oli.Repo.update!()
+
+    send(view.pid, :poll_run)
+    assert has_element?(view, tab, "Error")
+
+    lesson
+    |> Ecto.Changeset.change(
+      status: "ready_for_review",
+      planning_state: "completed",
+      planning_error: nil
+    )
+    |> Oli.Repo.update!()
+
+    send(view.pid, :poll_run)
+
+    view
+    |> element("button[phx-click='edit_lesson'][phx-value-lesson_id='#{lesson.id}']")
+    |> render_click()
+
+    assert has_element?(
+             view,
+             "#openstax-lesson-tab-#{other.id}[data-confirm='Discard your unsaved lesson changes and switch pages?']"
            )
   end
 
@@ -799,7 +948,21 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     assert has_element?(
              view,
              "[data-openstax-author-review-warning]",
-             "Resolve them or regenerate this lesson before approval."
+             "Use Fix with AI to send the exact findings back automatically."
+           )
+
+    assert has_element?(view, "#openstax-lesson-resolution-center", "Guided resolution")
+
+    assert has_element?(
+             view,
+             "[data-openstax-resolution-lesson='#{lesson.id}']",
+             "The current generated plan and exact findings will be sent back"
+           )
+
+    assert has_element?(
+             view,
+             "button[phx-click='regenerate_lesson'][phx-value-lesson_id='#{lesson.id}']",
+             "Fix with AI"
            )
 
     assert has_element?(
@@ -818,6 +981,82 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
 
     assert unchanged_lesson.status == "needs_attention"
     refute unchanged_plan.approved_by_user
+  end
+
+  test "repairs all blocked lessons with their findings and author feedback attached", %{
+    conn: conn,
+    project: project,
+    author: author,
+    root: root
+  } do
+    review_run = lesson_review_run(project, root, author)
+    [lesson | _] = review_run.units |> Enum.flat_map(& &1.lessons)
+    plan = List.first(lesson.plans)
+
+    finding = %{
+      "severity" => "repair",
+      "code" => "weak_activity_feedback",
+      "path" => "$.experience_blueprint.activities[0].incorrect_feedback",
+      "message" => "Make the feedback address the learner's misconception."
+    }
+
+    generation_metadata =
+      put_in(plan.generation_metadata, ["quality_gate"], %{
+        "approved" => false,
+        "confidence" => 0.97,
+        "attention_reason" => "activity_quality_exhausted",
+        "hard_blockers" => [],
+        "repairs" => [finding],
+        "advisories" => [],
+        "content_critic" => %{"findings" => [finding]}
+      })
+
+    lesson
+    |> Ecto.Changeset.change(status: "needs_attention", planning_state: "completed")
+    |> Oli.Repo.update!()
+
+    plan
+    |> Ecto.Changeset.change(
+      checks_snapshot: failed_checks_snapshot(),
+      generation_metadata: generation_metadata,
+      rejection_reason: "Keep the feedback concise and learner friendly."
+    )
+    |> Oli.Repo.update!()
+
+    {:ok, view, _html} =
+      live(
+        conn,
+        ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax?run_id=#{review_run.id}"
+      )
+
+    assert has_element?(view, "#openstax-lesson-resolution-center", "Resolve one blocked lesson")
+    assert has_element?(view, "#openstax-lesson-resolution-center", "Generated activities")
+
+    view
+    |> element("button[phx-click='regenerate_blocked_lessons']")
+    |> render_click()
+
+    assert render(view) =~ "One blocked lesson is queued for automatic repair."
+
+    queued_lesson = Oli.Repo.get!(Oli.OpenStax.CourseImport.Lesson, lesson.id)
+    assert queued_lesson.planning_state == "queued"
+    assert queued_lesson.planning_operation == "regenerate"
+
+    job = Oli.Repo.get!(Oban.Job, queued_lesson.planning_oban_job_id)
+    assert {:ok, claim} = CourseImport.claim_lesson_plan_job(job.args, 1, job.id)
+
+    assert claim.source["repair_context"]["author_feedback"] ==
+             "Keep the feedback concise and learner friendly."
+
+    assert [%{"code" => "weak_activity_feedback"}] =
+             claim.source["repair_context"]["critic_findings"]
+
+    assert [%{"code" => "weak_activity_feedback"}] =
+             claim.source["repair_context"]["phase_findings"]["content"]
+
+    previous_content = claim.source["repair_context"]["previous_candidates"]["content"]
+    assert [%{"id" => "source-content"}] = previous_content["content_groups"]
+    refute get_in(previous_content, ["content_groups", Access.at(0), "source_blocks"])
   end
 
   test "shows parallel lesson progress and disables actions for a regenerating lesson", %{
@@ -908,7 +1147,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     assert has_element?(view, "button[phx-click='retry_run']", "Retry import")
   end
 
-  test "shows unresolved v5 repairs and blocks approval without failing the import", %{
+  test "shows unresolved v7 repairs and blocks approval without failing the import", %{
     conn: conn,
     project: project,
     author: author,
@@ -929,10 +1168,10 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     |> Ecto.Changeset.change(
       content_payload:
         plan.content_payload
-        |> Map.put("schema_version", 5)
+        |> Map.put("schema_version", 7)
         |> Map.put("authoring_mode", "basic"),
       generation_metadata: %{
-        "pipeline" => "openstax_basic_v5",
+        "pipeline" => "openstax_basic_v7",
         "quality_gate" => %{
           "approved" => false,
           "confidence" => 0.96,
@@ -962,6 +1201,24 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     assert has_element?(
              view,
              "button[phx-click='approve_lesson'][phx-value-lesson_id='#{lesson.id}'][disabled]"
+           )
+
+    assert has_element?(view, "button[phx-click='approve_all'][disabled]")
+
+    assert has_element?(
+             view,
+             "#openstax-bulk-approval-blocked[role='status']",
+             "One lesson plan is not yet approvable"
+           )
+
+    assert render(view) =~ "2 of 2 generated · 1 needs attention"
+
+    render_click(view, "approve_all")
+
+    assert has_element?(
+             view,
+             "[role='alert']",
+             "The independent critic has not approved every lesson."
            )
 
     refute has_element?(view, "button[phx-click='retry_run']", "Retry import")
@@ -1021,9 +1278,54 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
 
     assert has_element?(
              view,
-             "button[phx-click='approve_all'][data-confirm]",
+             "button[phx-click='approve_all'][data-confirm]:not([disabled])",
              "Approve all lessons"
            )
+
+    refute has_element?(view, "#openstax-bulk-approval-blocked")
+  end
+
+  test "clears a stale action error when polling advances to lesson review", %{
+    conn: conn,
+    project: project,
+    author: author,
+    root: root
+  } do
+    review_run = lesson_review_run(project, root, author)
+
+    planning_run =
+      review_run
+      |> Run.update_changeset(%{status: :planning_lessons})
+      |> Oli.Repo.update!()
+
+    {:ok, view, _html} =
+      live(
+        conn,
+        ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax?run_id=#{review_run.id}"
+      )
+
+    render_click(view, "retry_run")
+
+    assert has_element?(
+             view,
+             "[role='alert']",
+             "The import status has changed; please try again."
+           )
+
+    planning_run
+    |> Run.update_changeset(%{status: :awaiting_lesson_approval})
+    |> Oli.Repo.update!()
+
+    send(view.pid, :poll_run)
+    render(view)
+
+    refute has_element?(
+             view,
+             "[role='alert']",
+             "The import status has changed; please try again."
+           )
+
+    assert render(view) =~ "Review the lesson plans"
   end
 
   test "hides the approve-all shortcut when the environment gate is disabled", %{
@@ -1050,7 +1352,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     refute has_element?(view, "button[phx-click='approve_all']")
   end
 
-  test "lesson edits preserve the source AST and current Basic v5 contract", %{
+  test "lesson edits preserve the source AST and current Basic v7 contract", %{
     conn: conn,
     project: project,
     author: author,
@@ -1064,7 +1366,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     original_plan = List.first(lesson.plans)
     original_content = original_plan.content_payload
     assert original_plan.questions_payload["items"] == []
-    assert original_content["schema_version"] == 5
+    assert original_content["schema_version"] == 7
     assert original_content["authoring_mode"] == "basic"
 
     updated_objective =
@@ -1174,7 +1476,10 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     assert has_element?(curriculum_view, "[phx-value-slug]")
   end
 
-  defp lesson_review_run(project, root, author) do
+  defp lesson_review_run(project, root, author),
+    do: lesson_review_run(project, root, author, ["chapter-1"])
+
+  defp lesson_review_run(project, root, author, selected_chapter_ids) do
     {:ok, run} =
       CourseImport.start_import(
         project,
@@ -1184,7 +1489,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
       )
 
     :ok = perform_job(PreflightWorker, %{"run_id" => run.id})
-    {:ok, _run} = CourseImport.update_scope(run.id, author, ["chapter-1"])
+    {:ok, _run} = CourseImport.update_scope(run.id, author, selected_chapter_ids)
     :ok = perform_job(OutlineWorker, %{"run_id" => run.id})
     {:ok, _run} = CourseImport.approve_outline(run.id, author)
     :ok = drain_lesson_plan_jobs(run.id)

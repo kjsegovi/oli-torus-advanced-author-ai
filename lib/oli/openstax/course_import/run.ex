@@ -27,6 +27,8 @@ defmodule Oli.OpenStax.CourseImport.Run do
     Unit
   }
 
+  alias Oli.OpenStax.CourseImport.ImportContract
+
   alias Oli.Resources.Resource
 
   @primary_key {:id, :binary_id, autogenerate: true}
@@ -122,8 +124,8 @@ defmodule Oli.OpenStax.CourseImport.Run do
 
     field :lesson_planning_generation, :integer, default: 0
     field :lesson_planning_parallelism, :integer, default: 3
-    field :source_schema_version, :integer, default: 3
-    field :plan_schema_version, :integer, default: 6
+    field :source_schema_version, :integer, default: 4
+    field :plan_schema_version, :integer, default: 7
     field :error, :map
     field :result, :map
     field :preflight_snapshot, :map
@@ -167,8 +169,8 @@ defmodule Oli.OpenStax.CourseImport.Run do
       greater_than_or_equal_to: 1,
       less_than_or_equal_to: 8
     )
-    |> validate_inclusion(:source_schema_version, [3])
-    |> validate_inclusion(:plan_schema_version, [6])
+    |> validate_inclusion(:source_schema_version, [ImportContract.source_schema_version()])
+    |> validate_inclusion(:plan_schema_version, [ImportContract.plan_schema_version()])
     |> unique_constraint(:target_root_container_resource_id,
       name: :course_import_runs_one_active_per_project
     )
@@ -199,8 +201,8 @@ defmodule Oli.OpenStax.CourseImport.Run do
       greater_than_or_equal_to: 1,
       less_than_or_equal_to: 8
     )
-    |> validate_inclusion(:source_schema_version, [3])
-    |> validate_inclusion(:plan_schema_version, [6])
+    |> validate_inclusion(:source_schema_version, [ImportContract.source_schema_version()])
+    |> validate_inclusion(:plan_schema_version, [ImportContract.plan_schema_version()])
     |> validate_number(:failure_count, greater_than_or_equal_to: 0)
     |> unique_constraint(:target_root_container_resource_id,
       name: :course_import_runs_one_active_per_project

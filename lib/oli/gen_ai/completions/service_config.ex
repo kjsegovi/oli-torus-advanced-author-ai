@@ -3,6 +3,8 @@ defmodule Oli.GenAI.Completions.ServiceConfig do
 
   import Ecto.Changeset
 
+  @type t :: %__MODULE__{}
+
   schema "completions_service_configs" do
     field :name, :string
     belongs_to :primary_model, Oli.GenAI.Completions.RegisteredModel

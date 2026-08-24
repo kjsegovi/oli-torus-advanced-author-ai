@@ -49,6 +49,7 @@ import { ModalLaunch } from './modal';
 import { MonacoEditor } from './monaco_editor';
 import { NavigationGuard } from './navigation_guard';
 import { OnMountAndUpdate } from './on_mount_and_update';
+import { OpenStaxLessonTabs } from './openstax_lesson_tabs';
 import { OverflowChipList } from './overflow_chip_list';
 import { PageContentHooks } from './page_content_hooks';
 import { FirePageTrigger } from './page_trigger';
@@ -166,6 +167,7 @@ export const Hooks = {
   DisableSubmitted,
   Recaptcha,
   OnMountAndUpdate,
+  OpenStaxLessonTabs,
   OverflowChipList,
   FixedNavigationBar,
   SubmitTechSupportForm,

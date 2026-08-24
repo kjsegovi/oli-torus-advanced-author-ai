@@ -17,25 +17,39 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProvider do
 
   alias Oli.GenAI.Completions.RegisteredModel
 
-  def generate(messages, functions, %RegisteredModel{model: model} = registered_model) do
+  def generate(messages, functions, %RegisteredModel{} = registered_model) do
+    case generate_with_metadata(messages, functions, registered_model) do
+      {:ok, %{content: content}} -> {:ok, content}
+      {:error, _reason} = error -> error
+    end
+  end
+
+  def generate_with_metadata(
+        messages,
+        functions,
+        %RegisteredModel{} = registered_model
+      ) do
     config = config(:sync, registered_model)
 
     {path, params, normalize} =
-      case responses_tool_request?(registered_model, functions) do
+      case responses_request?(registered_model) do
         true ->
-          {"/v1/responses", responses_params(model, messages, functions),
+          {"/v1/responses", responses_params(registered_model, messages, functions),
            &normalize_responses_response/1}
 
         false ->
-          {"/v1/chat/completions", completion_params(model, messages, functions),
+          {"/v1/chat/completions", completion_params(registered_model, messages, functions),
            &Function.identity/1}
       end
 
     case api_post(config.api_url <> path, params, config) do
       {:ok, response} ->
-        response
-        |> normalize.()
-        |> extract_generate_result()
+        normalized = normalize.(response)
+
+        case extract_generate_result(normalized) do
+          {:ok, content} -> {:ok, %{content: content, response: normalized}}
+          {:error, _reason} = error -> error
+        end
 
       {:error, reason} ->
         {:error, reason}
@@ -45,11 +59,11 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProvider do
   def stream(
         messages,
         functions,
-        %RegisteredModel{model: model} = registered_model,
+        %RegisteredModel{} = registered_model,
         response_handler_fn
       ) do
     config = config(:async, registered_model)
-    params = completion_params(model, messages, functions, stream: true)
+    params = completion_params(registered_model, messages, functions, stream: true)
 
     case api_post(
            config.api_url <> "/v1/chat/completions",
@@ -111,13 +125,22 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProvider do
   end
 
   @doc false
-  def completion_params(model, messages, functions, opts \\ []) do
+  def completion_params(model, messages, functions, opts \\ [])
+
+  def completion_params(model, messages, functions, opts) when is_binary(model) do
+    completion_params(%RegisteredModel{model: model}, messages, functions, opts)
+  end
+
+  @doc false
+  def completion_params(%RegisteredModel{} = registered_model, messages, functions, opts) do
     encoded_messages = encode_messages(messages)
 
     base = [
-      model: model,
+      model: registered_model.model,
       messages: encoded_messages
     ]
+
+    base = maybe_put_param(base, :max_completion_tokens, registered_model.max_output_tokens)
 
     base =
       case functions do
@@ -136,14 +159,24 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProvider do
   end
 
   @doc false
-  def responses_params(model, messages, functions) do
-    [
-      model: model,
+  def responses_params(model, messages, functions) when is_binary(model) do
+    responses_params(%RegisteredModel{model: model}, messages, functions)
+  end
+
+  @doc false
+  def responses_params(%RegisteredModel{} = registered_model, messages, functions) do
+    base = [
+      model: registered_model.model,
       input: encode_responses_input(messages),
       tools: encode_responses_tools(functions),
       parallel_tool_calls: false,
-      reasoning: %{effort: "medium"}
+      reasoning: %{effort: registered_model.reasoning_effort || "medium"}
     ]
+
+    base
+    |> maybe_put_param(:service_tier, registered_model.service_tier)
+    |> maybe_put_param(:prompt_cache_key, registered_model.prompt_cache_key)
+    |> maybe_put_param(:max_output_tokens, registered_model.max_output_tokens)
   end
 
   @doc false
@@ -185,6 +218,7 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProvider do
       "id" => Map.get(response, "id"),
       "choices" => [%{"message" => message}],
       "usage" => Map.get(response, "usage", %{}),
+      "service_tier" => Map.get(response, "service_tier"),
       "responses_output" => output
     }
   end
@@ -201,14 +235,14 @@ defmodule Oli.GenAI.Completions.OpenAICompliantProvider do
     end)
   end
 
-  defp responses_tool_request?(
-         %RegisteredModel{provider: :open_ai, model: model},
-         functions
-       )
-       when model in ["gpt-5.6-terra", "gpt-5.6-luna"],
-       do: functions != []
+  defp responses_request?(%RegisteredModel{provider: :open_ai, model: model})
+       when is_binary(model),
+       do: String.starts_with?(model, "gpt-5.6-")
 
-  defp responses_tool_request?(_registered_model, _functions), do: false
+  defp responses_request?(_registered_model), do: false
+
+  defp maybe_put_param(params, _key, value) when value in [nil, ""], do: params
+  defp maybe_put_param(params, key, value), do: Keyword.put(params, key, value)
 
   defp encode_responses_function_result(message) do
     call_id = message.id || new_tool_call_id()

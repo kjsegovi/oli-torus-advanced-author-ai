@@ -1,6 +1,8 @@
 defmodule Oli.OpenStax.CourseImport.EnrichmentAdaptersTest do
   use ExUnit.Case, async: false
 
+  import Mox
+
   alias Oli.OpenStax.CourseImport.Enrichment
   alias Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media
   alias Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage
@@ -66,22 +68,53 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentAdaptersTest do
     original_origin = Application.get_env(:oli, :openstax_generated_simulation_origin)
     original_media_url = Application.get_env(:oli, :media_url)
     original_bucket = Application.get_env(:oli, :s3_media_bucket_name)
+
+    original_simulation_bucket =
+      Application.get_env(:oli, :openstax_generated_simulation_bucket_name)
+
     original_env = Application.get_env(:oli, :env)
+    original_aws_client = Application.get_env(:oli, :aws_client)
 
     original_csp_header =
       Application.get_env(:oli, :openstax_generated_simulation_csp_header_enforced)
+
+    original_response_headers =
+      Application.get_env(:oli, :openstax_generated_simulation_response_headers_enforced)
+
+    original_frame_ancestors =
+      Application.get_env(:oli, :openstax_generated_simulation_frame_ancestors)
 
     on_exit(fn ->
       Application.put_env(:oli, :openstax_enrichment_resource_catalog, original_catalog)
       Application.put_env(:oli, :openstax_generated_simulation_origin, original_origin)
       Application.put_env(:oli, :media_url, original_media_url)
       Application.put_env(:oli, :s3_media_bucket_name, original_bucket)
+
+      Application.put_env(
+        :oli,
+        :openstax_generated_simulation_bucket_name,
+        original_simulation_bucket
+      )
+
       Application.put_env(:oli, :env, original_env)
+      Application.put_env(:oli, :aws_client, original_aws_client)
 
       Application.put_env(
         :oli,
         :openstax_generated_simulation_csp_header_enforced,
         original_csp_header
+      )
+
+      Application.put_env(
+        :oli,
+        :openstax_generated_simulation_response_headers_enforced,
+        original_response_headers
+      )
+
+      Application.put_env(
+        :oli,
+        :openstax_generated_simulation_frame_ancestors,
+        original_frame_ancestors
       )
     end)
 
@@ -324,12 +357,14 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentAdaptersTest do
              LocalContainer.build_and_validate(unsafe_path, [])
   end
 
-  test "S3 media resolution accepts only the exact content-addressed key and recorded origin" do
+  test "S3 media resolution preserves legacy URLs and isolates version two identities" do
     artifact = %SimulationArtifact{
       id: "artifact-one",
       version: 2,
       content_hash: @hash,
       storage_provider: "s3_media",
+      storage_bucket: "legacy-media",
+      storage_identity_version: 1,
       storage_key: "generated-simulations/artifacts/artifact-one/v2/sha256/#{@hash}/index.html",
       storage_origin: "https://media.example.edu"
     }
@@ -343,8 +378,11 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentAdaptersTest do
              |> Map.put(:storage_key, "generated-simulations/latest/index.html")
              |> S3Media.resolve(origin: "https://media.example.edu")
 
-    assert {:error, :artifact_storage_identity_invalid} =
+    assert {:ok, legacy_url} =
              S3Media.resolve(artifact, origin: "https://other-media.example.edu")
+
+    assert legacy_url ==
+             "https://media.example.edu/generated-simulations/artifacts/artifact-one/v2/sha256/#{@hash}/index.html"
 
     second_artifact = %{
       artifact
@@ -356,6 +394,23 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentAdaptersTest do
              S3Media.resolve(second_artifact, origin: "https://media.example.edu")
 
     refute second_url =~ "/artifacts/artifact-one/"
+
+    version_two = %{
+      artifact
+      | storage_bucket: "torus-simulations",
+        storage_identity_version: 2,
+        storage_key:
+          "generated-simulations/storage-v2/artifacts/artifact-one/v2/sha256/#{@hash}/index.html",
+        storage_origin: "https://simulations.example.edu"
+    }
+
+    assert {:ok, version_two_url} =
+             S3Media.resolve(version_two, origin: "https://simulations.example.edu")
+
+    assert version_two_url =~ "/generated-simulations/storage-v2/artifacts/"
+
+    assert {:error, :artifact_storage_identity_invalid} =
+             S3Media.resolve(version_two, origin: "https://other-media.example.edu")
   end
 
   test "S3 media availability requires a dedicated generated-simulation origin" do
@@ -395,7 +450,124 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentAdaptersTest do
     refute S3Media.available?()
 
     Application.put_env(:oli, :openstax_generated_simulation_csp_header_enforced, true)
+    refute S3Media.available?()
+
+    Application.put_env(
+      :oli,
+      :openstax_generated_simulation_response_headers_enforced,
+      true
+    )
+
+    refute S3Media.available?()
+
+    Application.put_env(
+      :oli,
+      :openstax_generated_simulation_frame_ancestors,
+      ["https://torus.example.edu"]
+    )
+
     assert S3Media.available?()
+  end
+
+  test "CDN smoke validation requires the exact restrictive response headers" do
+    headers = S3Media.required_response_headers(["https://torus.example.edu"])
+
+    assert :ok =
+             S3Media.validate_response_headers(headers,
+               parent_origins: ["https://torus.example.edu"]
+             )
+
+    assert {:error, {:simulation_cdn_headers_invalid, missing}} =
+             headers
+             |> Map.delete("permissions-policy")
+             |> S3Media.validate_response_headers(parent_origins: ["https://torus.example.edu"])
+
+    assert "permissions-policy" in missing
+  end
+
+  test "S3 media stages immutable objects without a public-read ACL" do
+    files = %{"index.html" => "<!doctype html><title>Private simulation</title>"}
+
+    content_hash =
+      files
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map_join(fn {path, contents} -> path <> <<0>> <> contents <> <<0>> end)
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    artifact = %SimulationArtifact{id: "private-artifact", version: 1, content_hash: content_hash}
+    bundle = %{files: files, content_hash: content_hash}
+
+    Application.put_env(:oli, :aws_client, Oli.Test.MockAws)
+    Application.put_env(:oli, :s3_media_bucket_name, "private-media")
+    Application.put_env(:oli, :openstax_generated_simulation_bucket_name, "private-media")
+    Application.put_env(:oli, :openstax_generated_simulation_origin, "https://sims.example.edu")
+    Application.put_env(:oli, :env, :test)
+
+    expect(Oli.Test.MockAws, :request, fn %ExAws.Operation.S3{} = operation ->
+      assert operation.http_method == :put
+      refute Map.has_key?(operation.headers, "x-amz-acl")
+      assert operation.headers["cache-control"] == "public, max-age=31536000, immutable"
+      assert operation.path =~ "/storage-v2/artifacts/"
+      assert operation.path =~ "/v1/sha256/#{content_hash}/index.html"
+      {:ok, %{status_code: 200}}
+    end)
+
+    assert {:ok,
+            %{
+              storage_state: "staged",
+              storage_bucket: "private-media",
+              storage_identity_version: 2
+            }} =
+             S3Media.stage(artifact, bundle, bucket: "private-media")
+  end
+
+  test "a configured bucket change cannot redirect a persisted storage identity" do
+    files = %{"index.html" => "<!doctype html><title>Recorded identity</title>"}
+
+    content_hash =
+      files
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map_join(fn {path, contents} -> path <> <<0>> <> contents <> <<0>> end)
+      |> then(&:crypto.hash(:sha256, &1))
+      |> Base.encode16(case: :lower)
+
+    artifact = %SimulationArtifact{
+      id: "recorded-artifact",
+      version: 3,
+      content_hash: content_hash,
+      byte_size: byte_size(files["index.html"]),
+      storage_provider: "s3_media",
+      storage_bucket: "recorded-bucket",
+      storage_identity_version: 2,
+      storage_key:
+        "generated-simulations/storage-v2/artifacts/recorded-artifact/v3/sha256/#{content_hash}/index.html",
+      storage_origin: "https://simulations.example.edu",
+      storage_state: "unstaged",
+      bundle_manifest: %{"entrypoint" => "index.html", "files" => ["index.html"]}
+    }
+
+    Application.put_env(:oli, :aws_client, Oli.Test.MockAws)
+    Application.put_env(:oli, :openstax_generated_simulation_bucket_name, "new-default-bucket")
+    Application.put_env(:oli, :openstax_generated_simulation_origin, artifact.storage_origin)
+    Application.put_env(:oli, :env, :test)
+
+    expect(Oli.Test.MockAws, :request, 2, fn %ExAws.Operation.S3{} = operation ->
+      assert operation.http_method in [:put, :delete]
+      assert operation.bucket == "recorded-bucket"
+      refute operation.bucket == "new-default-bucket"
+      {:ok, %{status_code: 200}}
+    end)
+
+    assert {:ok, staged} =
+             S3Media.stage(artifact, %{files: files, content_hash: content_hash}, [])
+
+    assert staged.storage_bucket == "recorded-bucket"
+
+    assert {:ok, url} = S3Media.resolve(%{artifact | storage_state: "staged"}, [])
+    assert url == artifact.storage_origin <> "/" <> artifact.storage_key
+
+    assert :ok = S3Media.discard(%{artifact | storage_state: "staged"}, [])
   end
 
   test "the dedicated local MinIO dev origin is accepted consistently" do
@@ -418,6 +590,8 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentAdaptersTest do
       content_hash: @hash,
       byte_size: 512,
       storage_provider: "s3_media",
+      storage_bucket: "torus-media-dev",
+      storage_identity_version: 1,
       storage_state: "staged",
       storage_key: storage_key,
       storage_origin: @dev_generated_origin,
@@ -465,6 +639,40 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentAdaptersTest do
              )
 
     assert_received {:cleanup_called, "cleanup-artifact"}
+  end
+
+  test "public delivery readiness validates the known object and exact headers" do
+    alias Oli.OpenStax.CourseImport.Enrichment.SimulationDeliveryReadiness
+
+    headers = S3Media.required_response_headers(["https://torus.example.edu"])
+
+    assert SimulationDeliveryReadiness.readiness_hash() ==
+             "d9183cccabe3a6daf616864543f35a0441d6892b5252d3e8c3d61ee8256cf944"
+
+    assert :ok =
+             SimulationDeliveryReadiness.probe(
+               origin: "https://simulations.example.edu",
+               parent_origins: ["https://torus.example.edu"],
+               fetch: fn url ->
+                 assert url =~ SimulationDeliveryReadiness.readiness_key()
+
+                 {:ok,
+                  %{
+                    status_code: 200,
+                    headers: headers,
+                    body: SimulationDeliveryReadiness.readiness_body()
+                  }}
+               end
+             )
+
+    assert {:error, :simulation_readiness_body_invalid} =
+             SimulationDeliveryReadiness.probe(
+               origin: "https://simulations.example.edu",
+               parent_origins: ["https://torus.example.edu"],
+               fetch: fn _url ->
+                 {:ok, %{status_code: 200, headers: headers, body: "wrong"}}
+               end
+             )
   end
 
   defp valid_html(body, csp \\ required_csp()) do

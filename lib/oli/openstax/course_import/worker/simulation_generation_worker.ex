@@ -37,7 +37,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
 
   alias Oli.Repo
 
-  @max_builder_candidates 4
+  @max_builder_candidates 2
 
   @impl Oban.Worker
   def perform(%Oban.Job{
@@ -65,6 +65,19 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
   def perform(_job), do: {:discard, :invalid_artifact_job}
 
   defp run_generation(artifact, attempt, max_attempts) do
+    cond do
+      resumable_storage_intent?(artifact) ->
+        resume_storage(artifact, attempt, max_attempts)
+
+      prior_intent?(artifact) ->
+        terminal_or_retry(artifact.id, attempt, max_attempts, :storage_checkpoint_missing)
+
+      true ->
+        generate_and_stage(artifact, attempt, max_attempts)
+    end
+  end
+
+  defp generate_and_stage(artifact, attempt, max_attempts) do
     started_at = System.monotonic_time(:millisecond)
 
     with :ok <- ensure_reviewable(artifact.run_id),
@@ -116,6 +129,33 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
     end
   end
 
+  defp resume_storage(artifact, attempt, max_attempts) do
+    with :ok <- ensure_reviewable(artifact.run_id),
+         {:ok, staged_storage} <- ArtifactStorage.stage(artifact, artifact.storage_payload) do
+      staged_artifact = apply_storage_identity(artifact, staged_storage)
+
+      case ensure_reviewable(artifact.run_id) do
+        :ok ->
+          persist_staged_result(
+            staged_artifact,
+            persisted_intent_payload(artifact),
+            staged_storage
+          )
+
+        {:error, :run_not_reviewable} ->
+          discard_after_cancel(staged_artifact)
+      end
+    else
+      {:error, :run_not_reviewable} ->
+        _ = Enrichment.cancel_run_workflows(artifact.run_id)
+        broadcast_run(artifact.run_id)
+        :ok
+
+      {:error, reason} ->
+        terminal_or_retry(artifact.id, attempt, max_attempts, reason)
+    end
+  end
+
   defp build_validated_artifact(artifact, proposal, spec, research, project_id) do
     build_validated_artifact(artifact, proposal, spec, research, project_id, 1, nil, [])
   end
@@ -131,7 +171,14 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
          history
        ) do
     generator_opts =
-      [simulation_spec: spec, research_set: research]
+      [
+        simulation_spec: spec,
+        research_set: research,
+        run_id: artifact.run_id,
+        lesson_id: artifact.lesson_id,
+        operation_id: artifact.id,
+        cost_scope: :simulation
+      ]
       |> maybe_put_option(:author_feedback, artifact_author_feedback(artifact))
       |> maybe_put_option(:repair, repair)
 
@@ -224,7 +271,15 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
        ) do
     validation = compact_validation(validated)
 
-    case ArtifactCritic.review(spec, research, generated, validated) do
+    critic_opts = [
+      run_id: artifact.run_id,
+      lesson_id: artifact.lesson_id,
+      operation_id: artifact.id,
+      candidate_number: attempt,
+      cost_scope: :simulation
+    ]
+
+    case ArtifactCritic.review(spec, research, generated, validated, critic_opts) do
       {:ok, criticism} ->
         with {:ok, persisted_attempt} <-
                persist_builder_attempt(
@@ -353,6 +408,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
       intent_payload
       |> Map.merge(staged_storage)
       |> Map.put(:validation_status, "passed")
+      |> Map.put(:storage_payload, nil)
       |> Map.put(:staged_at, DateTime.utc_now())
 
     case Enrichment.record_artifact_generation_result(artifact.id, {:ok, result}) do
@@ -422,6 +478,12 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
       is_map(artifact.bundle_manifest) and map_size(artifact.bundle_manifest) > 0
   end
 
+  defp resumable_storage_intent?(artifact) do
+    prior_intent?(artifact) and is_map(artifact.storage_payload) and
+      map_size(artifact.storage_payload) > 0 and is_binary(artifact.storage_bucket) and
+      artifact.storage_identity_version in [1, 2]
+  end
+
   defp assemble_libraries(bundle, project_id) do
     three_d_enabled =
       case Repo.get(Project, project_id) do
@@ -467,6 +529,34 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
       metadata[:generator_version] || metadata["generator_version"]
     )
     |> Map.put(:generation_metadata, metadata)
+    |> Map.put(:storage_payload, storage_payload(built.validated))
+  end
+
+  defp storage_payload(validated) do
+    %{
+      "files" => validated[:files] || validated["files"],
+      "content_hash" => validated[:content_hash] || validated["content_hash"]
+    }
+  end
+
+  defp persisted_intent_payload(artifact) do
+    artifact
+    |> Map.from_struct()
+    |> Map.take([
+      :generator_name,
+      :generator_version,
+      :generation_metadata,
+      :bundle_manifest,
+      :capi_manifest,
+      :accessibility_metadata,
+      :validation_status,
+      :validation_version,
+      :validation_payload,
+      :content_hash,
+      :byte_size,
+      :storage_payload,
+      :generated_at
+    ])
   end
 
   defp apply_storage_identity(artifact, identity) do
@@ -474,6 +564,8 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
       {key, value}, current
       when key in [
              :storage_provider,
+             :storage_bucket,
+             :storage_identity_version,
              :storage_key,
              :storage_origin,
              :storage_state,

@@ -1,6 +1,6 @@
-defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
+defmodule Oli.OpenStax.CourseImport.BasicPlanV7 do
   @moduledoc """
-  Server-owned schema v5 contract for source-faithful Basic pages.
+  Server-owned schema v7 contract for source-faithful Basic pages.
 
   The model chooses organization, instructional purpose, figure placement, and
   checkpoint opportunities. The server hydrates every referenced source block
@@ -8,7 +8,9 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
   duplicates, invented references, or inaccessible required media.
   """
 
-  @schema_version 5
+  alias Oli.OpenStax.CourseImport.ImportContract
+
+  @schema_version ImportContract.content_schema_version("basic")
   @allowed_purposes ~w(orientation reading concept evidence example application synthesis reference)
   @allowed_question_types ~w(multiple_choice short_answer)
   @structural_block_kinds ~w(objectives callout footnotes)
@@ -18,6 +20,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
     ~r/^apply\s+what\s+you\s+learned(?:\s+\d+)?$/i,
     ~r/^core\s+concept(?:\s+\d+)?$/i
   ]
+  @split_lesson_suffix ~r/\s+[—–-]\s*part\s+\d+\s+of\s+\d+(?::.*)?$/iu
 
   @type finding :: %{required(String.t()) => term()}
 
@@ -36,6 +39,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
       |> normalize_groups()
       |> merge_lesson_title_only_groups(blocks)
       |> sanitize_transitions(blocks)
+      |> downgrade_unsupported_card_purposes(blocks)
 
     findings =
       validate_groups(groups, blocks) ++
@@ -75,7 +79,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
            "source_block_ids" => all_ids,
            "coverage_manifest" => coverage_manifest(blocks, hydrated_groups),
            "attribution" => normalized_attribution(lesson),
-           "v5_contract" => %{
+           "v7_contract" => %{
              "source_ast_authority" => "deterministic_extractor",
              "organization_authority" => "content_architect",
              "coverage_strategy" => "exact_source_block_disposition",
@@ -93,11 +97,44 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
       {:error,
        [
          finding(
-           "invalid_v5_candidate",
+           "invalid_v7_basic_candidate",
            "$",
            "The content architect must return one JSON object."
          )
        ]}
+
+  @doc "Returns the compact model-owned candidate used to repair a persisted v7 Basic plan."
+  @spec repair_candidate(map()) :: map()
+  def repair_candidate(content) when is_map(content) do
+    %{
+      "title" => content["title"],
+      "orientation" => %{
+        "overview" => get_in(content, ["orientation", "overview"]) || content["narrative"]
+      },
+      "content_groups" =>
+        content
+        |> Map.get("content_groups", [])
+        |> List.wrap()
+        |> Enum.map(&Map.take(&1, ~w(id title instructional_purpose transition source_block_ids))),
+      "question_slots" =>
+        content
+        |> Map.get("question_slots", [])
+        |> List.wrap()
+        |> Enum.map(
+          &Map.take(
+            &1,
+            ~w(id purpose placement_after_group_id objective_ids evidence_block_ids recommended_types)
+          )
+        ),
+      "generated_alt_text" => repair_alt_text(content),
+      "synthesis" =>
+        content
+        |> Map.get("synthesis", %{})
+        |> Map.take(~w(heading summary takeaways))
+    }
+  end
+
+  def repair_candidate(_content), do: %{}
 
   @spec prompt_contract(map()) :: map()
   def prompt_contract(lesson) when is_map(lesson) do
@@ -106,6 +143,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
     %{
       "schema_version" => @schema_version,
       "lesson_title" => lesson["title"],
+      "repair_context" => prompt_repair_context(lesson["repair_context"]),
       "source_objectives" => source_objectives(lesson),
       "objective_catalog" => objective_catalog(source_objectives(lesson), blocks),
       "allowed_instructional_purposes" => @allowed_purposes,
@@ -130,7 +168,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
     }
   end
 
-  @doc "Returns the exact non-overlapping source AST blocks governed by schema v5."
+  @doc "Returns the exact non-overlapping source AST blocks governed by schema v7."
   @spec source_blocks(map()) :: [map()]
   def source_blocks(lesson) when is_map(lesson),
     do: lesson |> normalized_blocks() |> mark_lesson_title_block(lesson["title"])
@@ -143,6 +181,32 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
 
   defp candidate_content(%{"content_payload" => %{} = content}), do: content
   defp candidate_content(candidate), do: candidate
+
+  defp repair_alt_text(content) do
+    content
+    |> Map.get("media", [])
+    |> List.wrap()
+    |> Enum.flat_map(fn media ->
+      id = media["source_media_id"] || media["id"]
+      alt = media["alt"] || media["alt_text"]
+
+      if present(id) && present(alt) do
+        [%{"source_media_id" => id, "alt" => alt}]
+      else
+        []
+      end
+    end)
+    |> Enum.uniq_by(& &1["source_media_id"])
+  end
+
+  defp prompt_repair_context(context) when is_map(context) do
+    Map.take(
+      context,
+      ~w(author_feedback previous_plan_version previous_finding_fingerprint required_action)
+    )
+  end
+
+  defp prompt_repair_context(_context), do: nil
 
   defp normalized_blocks(lesson) do
     lesson
@@ -419,6 +483,18 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
   end
 
   defp unsupported_card_purpose?(_group, _blocks_by_id), do: false
+
+  defp downgrade_unsupported_card_purposes(groups, blocks) do
+    blocks_by_id = Map.new(blocks, &{&1["id"], &1})
+
+    Enum.map(groups, fn group ->
+      if unsupported_card_purpose?(group, blocks_by_id) do
+        Map.put(group, "instructional_purpose", "reading")
+      else
+        group
+      end
+    end)
+  end
 
   defp card_worthy_source?(%{"kind" => kind}, "example")
        when kind in ["example", "exercise", "worked_example"],
@@ -733,8 +809,24 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
     String.length(transition) >= 24 and String.contains?(source_text, transition)
   end
 
-  defp equivalent_heading?(left, right),
-    do: heading_key(left) != "" and heading_key(left) == heading_key(right)
+  defp equivalent_heading?(left, right) do
+    left_key = heading_key(left)
+
+    right_keys =
+      right
+      |> lesson_title_variants()
+      |> Enum.map(&heading_key/1)
+      |> Enum.reject(&(&1 == ""))
+
+    left_key != "" and left_key in right_keys
+  end
+
+  defp lesson_title_variants(value) when is_binary(value) do
+    base_title = value |> String.trim() |> String.replace(@split_lesson_suffix, "")
+    [value, base_title] |> Enum.uniq()
+  end
+
+  defp lesson_title_variants(_value), do: []
 
   defp heading_key(value) when is_binary(value),
     do: value |> String.downcase() |> String.replace(~r/[^[:alnum:]]/u, "")
@@ -772,7 +864,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV5 do
       token_matches?(normalized, ~w(orient)) ->
         "orientation"
 
-      token_matches?(normalized, ~w(concept)) ->
+      token_matches?(normalized, ~w(concept interpret)) ->
         "concept"
 
       true ->

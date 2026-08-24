@@ -13,19 +13,55 @@ services:
     volumes:
       - pg_data:/var/lib/postgresql/data
 
+  minio-credentials:
+    image: alpine:3.22
+    volumes:
+      - minio_credentials:/credentials
+      - ./scripts/dev/minio:/config:ro
+    entrypoint: ["/bin/sh", "/config/setup_credentials.sh"]
+    restart: "no"
+
   minio:
     image: minio/minio
     container_name: oli_minio
+    depends_on:
+      minio-credentials:
+        condition: service_completed_successfully
     env_file: ./oli.env
     entrypoint: /bin/sh
-    ports:
-      - 9000:9000
-      - 9001:9001
     volumes:
       - minio_data:/data
+      - minio_credentials:/credentials:ro
     command:
       - -c
-      - exec env MINIO_ROOT_USER="$$AWS_ACCESS_KEY_ID" MINIO_ROOT_PASSWORD="$$AWS_SECRET_ACCESS_KEY" minio server --console-address :9001 /data
+      - |
+        minio_user="$${AWS_S3_ACCESS_KEY_ID:-$${AWS_ACCESS_KEY_ID:-$${MINIO_ROOT_USER:-}}}"
+        minio_password="$${AWS_S3_SECRET_ACCESS_KEY:-$${AWS_SECRET_ACCESS_KEY:-$${MINIO_ROOT_PASSWORD:-}}}"
+        if [ -z "$$minio_user" ]; then minio_user="$$(cat /credentials/access_key)"; fi
+        if [ -z "$$minio_password" ]; then minio_password="$$(cat /credentials/secret_key)"; fi
+        exec env MINIO_ROOT_USER="$$minio_user" MINIO_ROOT_PASSWORD="$$minio_password" minio server --console-address :9001 /data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-init:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    env_file: ./oli.env
+    environment:
+      MINIO_ENDPOINT: "http://minio:9000"
+      GENERATED_SIMULATION_BUCKET_NAME: "${GENERATED_SIMULATION_BUCKET_NAME:-torus-simulations}"
+      MINIO_ROOT_USER_FILE: "/credentials/access_key"
+      MINIO_ROOT_PASSWORD_FILE: "/credentials/secret_key"
+    volumes:
+      - ./scripts/dev/minio:/config:ro
+      - minio_credentials:/credentials:ro
+    entrypoint: ["/bin/sh", "/config/setup_generated_simulations.sh"]
+    restart: "no"
 
   clickhouse:
     image: clickhouse/clickhouse-server:latest
@@ -44,15 +80,38 @@ services:
       dockerfile: Dockerfile
     container_name: oli_haproxy
     depends_on:
-      - minio
+      minio-init:
+        condition: service_completed_successfully
     env_file: ./oli.env
+    environment:
+      HA_PROXY_MODE: "minio"
+      MINIO_API_HOST: "minio"
+      MINIO_API_PORT: "9000"
+      GENERATED_SIMULATION_BUCKET_NAME: "${GENERATED_SIMULATION_BUCKET_NAME:-torus-simulations}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    volumes:
+      - ${SSL_CERT_PATH:-./priv/ssl/localhost.crt}:/certs/tls.crt:ro
+      - ${SSL_KEY_PATH:-./priv/ssl/localhost.key}:/certs/tls.key:ro
     ports:
       - 80:80
       - 443:443
 
+  minio-admin:
+    profiles: ["minio-admin"]
+    build:
+      context: ./scripts/dev/ha-proxy
+      dockerfile: Dockerfile
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      ["haproxy", "-W", "-db", "-f", "/usr/local/etc/haproxy/minio-admin.cfg"]
+    ports:
+      - "127.0.0.1:9001:9001"
+
 volumes:
   pg_data:
   minio_data:
+  minio_credentials:
   clickhouse_data:

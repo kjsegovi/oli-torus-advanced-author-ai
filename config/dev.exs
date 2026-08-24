@@ -37,7 +37,7 @@ end
 config :oli,
   env: :dev,
   openstax_course_import_test_conveniences_enabled: true,
-  openstax_advanced_pages_v6_enabled: true,
+  openstax_advanced_pages_enabled: true,
   openstax_generated_enrichment_enabled: true,
   openstax_web_research_enabled: true,
   openstax_three_d_generation_enabled: true,
@@ -45,6 +45,8 @@ config :oli,
   openstax_generated_simulation_kill_switch: false,
   s3_xapi_bucket_name: System.get_env("S3_XAPI_BUCKET_NAME", "torus-xapi-dev"),
   s3_media_bucket_name: System.get_env("S3_MEDIA_BUCKET_NAME", "torus-media-dev"),
+  openstax_generated_simulation_bucket_name:
+    System.get_env("GENERATED_SIMULATION_BUCKET_NAME", "torus-simulations"),
   media_url: System.get_env("MEDIA_URL", "http://localhost:9000/torus-media-dev"),
   openstax_generated_simulation_origin: generated_simulation_origin,
   generated_simulation_origins: [generated_simulation_origin],
@@ -57,6 +59,10 @@ config :oli,
     Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media,
   openstax_generated_simulation_csp_header_enforced:
     get_env_as_boolean.("GENERATED_SIMULATION_CSP_HEADER_ENFORCED", "false"),
+  openstax_generated_simulation_response_headers_enforced:
+    get_env_as_boolean.("GENERATED_SIMULATION_RESPONSE_HEADERS_ENFORCED", "false"),
+  openstax_generated_simulation_readiness_required:
+    get_env_as_boolean.("GENERATED_SIMULATION_READINESS_REQUIRED", "false"),
   problematic_query_detection:
     get_env_as_boolean.("DEV_PROBLEMATIC_QUERY_DETECTION_ENABLED", "false"),
   load_testing_mode: get_env_as_boolean.("LOAD_TESTING_MODE", "false"),

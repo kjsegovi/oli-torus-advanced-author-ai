@@ -1,6 +1,6 @@
 defmodule Oli.Scenarios.Delivery.GeneratedSimulationWorkflowHooks do
   @moduledoc """
-  Drives one seeded Advanced v6 simulation through the real governance,
+  Drives one seeded Advanced v7 simulation through the real governance,
   validation, compiler, authoring, publication, and delivery boundaries.
 
   Oli.Scenarios does not yet expose OpenStax import directives, so this hook is
@@ -15,7 +15,7 @@ defmodule Oli.Scenarios.Delivery.GeneratedSimulationWorkflowHooks do
   alias Oli.Authoring.Editing.ActivityEditor
 
   alias Oli.OpenStax.CourseImport.{
-    AdvancedPlanV6,
+    AdvancedPlanV7,
     AuthoringCompiler,
     Compiler,
     Enrichment,
@@ -103,8 +103,8 @@ defmodule Oli.Scenarios.Delivery.GeneratedSimulationWorkflowHooks do
         status: :awaiting_lesson_approval,
         source_url: @source_url,
         book_slug: "chemistry-2e",
-        source_schema_version: 3,
-        plan_schema_version: 6,
+        source_schema_version: 4,
+        plan_schema_version: 7,
         lesson_planning_strategy: :parallel_v1,
         started_at: now
       })
@@ -232,13 +232,13 @@ defmodule Oli.Scenarios.Delivery.GeneratedSimulationWorkflowHooks do
       Enum.map(1..4, fn index ->
         %{
           "id" => "gas-slot-#{index}",
-          "stage_id" => "investigation",
+          "stage_id" => if(index == 4, do: "synthesis-stage", else: "investigation"),
           "purpose" => "Use imported gas evidence in step #{index}.",
           "objective_ids" => ["objective-1"],
           "evidence_block_ids" => ["gas-evidence", "gas-investigation"],
           "recommended_types" => ["multiple_choice"],
           "remediation_content_group_id" => "gas-evidence-group",
-          "estimated_minutes" => 10
+          "estimated_minutes" => 11
         }
       end)
 
@@ -253,7 +253,13 @@ defmodule Oli.Scenarios.Delivery.GeneratedSimulationWorkflowHooks do
           "id" => "gas-evidence-group",
           "title" => "Pressure and volume evidence",
           "instructional_purpose" => "evidence",
-          "source_block_ids" => ["gas-evidence", "gas-investigation"]
+          "source_block_ids" => ["gas-evidence"]
+        },
+        %{
+          "id" => "gas-investigation-group",
+          "title" => "Prediction and investigation evidence",
+          "instructional_purpose" => "application",
+          "source_block_ids" => ["gas-investigation"]
         }
       ],
       "question_slots" => [],
@@ -282,13 +288,56 @@ defmodule Oli.Scenarios.Delivery.GeneratedSimulationWorkflowHooks do
             "guidance" => gas_guidance(),
             "native_follow_up_slot_id" => "gas-slot-1",
             "items" =>
-              [%{"kind" => "content_group", "ref_id" => "gas-evidence-group"}] ++
-                Enum.map(1..4, fn index ->
+              [
+                %{"kind" => "content_group", "ref_id" => "gas-evidence-group"},
+                %{"kind" => "content_group", "ref_id" => "gas-investigation-group"}
+              ] ++
+                Enum.map(1..3, fn index ->
                   %{"kind" => "activity_slot", "ref_id" => "gas-slot-#{index}"}
                 end)
+          },
+          %{
+            "id" => "synthesis-stage",
+            "title" => "Rejoin and explain",
+            "purpose" => "Rejoin both evidence pathways for a shared explanation.",
+            "presentation_pattern" => "guided_reading",
+            "roles" => ["synthesis"],
+            "introduction" => %{
+              "heading" => "Compare what each pathway established",
+              "body" =>
+                "Use the evidence from the selected pathway to explain the shared pressure-volume relationship.",
+              "evidence_block_ids" => ["gas-evidence", "gas-investigation"]
+            },
+            "guidance" => [],
+            "native_follow_up_slot_id" => "gas-slot-4",
+            "items" => [%{"kind" => "activity_slot", "ref_id" => "gas-slot-4"}]
           }
         ],
-        "activity_slots" => slots
+        "activity_slots" => slots,
+        "branch_sets" => [
+          %{
+            "id" => "gas-evidence-path",
+            "decision_activity_slot_id" => "gas-slot-1",
+            "objective_ids" => ["objective-1"],
+            "rejoin_stage_id" => "synthesis-stage",
+            "pathways" => [
+              %{
+                "choice_id" => "supported",
+                "label" => "Follow the matching-evidence path",
+                "target_content_group_id" => "gas-evidence-group",
+                "feedback" => "Inspect where the prediction and measured relationship agree.",
+                "evidence_block_ids" => ["gas-evidence"]
+              },
+              %{
+                "choice_id" => "unsupported",
+                "label" => "Investigate the conflicting-evidence path",
+                "target_content_group_id" => "gas-investigation-group",
+                "feedback" => "Test why the evidence challenges the original prediction.",
+                "evidence_block_ids" => ["gas-investigation"]
+              }
+            ]
+          }
+        ]
       }
     }
 
@@ -324,10 +373,10 @@ defmodule Oli.Scenarios.Delivery.GeneratedSimulationWorkflowHooks do
       end)
 
     {:ok, architecture} =
-      AdvancedPlanV6.build_architecture(architecture_candidate, lesson_payload, 1)
+      AdvancedPlanV7.build_architecture(architecture_candidate, lesson_payload, 1)
 
     {:ok, content} =
-      AdvancedPlanV6.attach_activities(
+      AdvancedPlanV7.attach_activities(
         architecture,
         %{"activities" => activities},
         lesson_payload
@@ -366,7 +415,7 @@ defmodule Oli.Scenarios.Delivery.GeneratedSimulationWorkflowHooks do
       version: 1,
       content_payload: content,
       questions_payload: %{"items" => []},
-      generation_metadata: %{"pipeline" => "advanced_v6_seeded_scenario"},
+      generation_metadata: %{"pipeline" => "advanced_v7_seeded_scenario"},
       checks_snapshot: %{"quality_gate" => "passed", "confidence" => 1.0},
       created_by: "system",
       approved_by_user: true,

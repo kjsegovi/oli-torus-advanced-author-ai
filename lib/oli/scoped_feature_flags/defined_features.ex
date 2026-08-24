@@ -67,13 +67,6 @@ defmodule Oli.ScopedFeatureFlags.DefinedFeatures do
   )
 
   deffeature(
-    :openstax_advanced_pages_v6,
-    [:authoring],
-    "Enable source-fit, independently reviewed OpenStax Advanced Exploration generation",
-    rollout_mode: :canary
-  )
-
-  deffeature(
     :openstax_generated_enrichment,
     [:authoring],
     "Enable author-governed generated enrichment proposals and simulation artifacts",

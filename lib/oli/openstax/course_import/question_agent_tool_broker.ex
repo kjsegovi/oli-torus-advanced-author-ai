@@ -11,21 +11,15 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentToolBroker do
   alias Oli.GenAI.Agent.Persistence
   alias Oli.OpenStax.CourseImport.QuestionAgentValidator
 
-  @review_tool "review_openstax_questions"
-  @submit_tool "submit_openstax_questions"
+  @validate_and_submit_tool "validate_and_submit_openstax_questions"
 
   @spec describe() :: [map()]
   def describe do
     [
       %{
-        name: @review_tool,
+        name: @validate_and_submit_tool,
         desc:
-          "Review one complete proposed Basic lesson question set. Returns bounded deterministic repair findings and does not persist it."
-      },
-      %{
-        name: @submit_tool,
-        desc:
-          "Submit one complete revised Basic lesson question set. Validation reruns and only an accepted set is persisted."
+          "Validate one complete Basic lesson question set and atomically persist it when valid. Invalid sets return bounded deterministic repair findings."
       }
     ]
   end
@@ -45,27 +39,14 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentToolBroker do
   end
 
   @impl true
-  def call(@review_tool, args, context) do
-    validation = QuestionAgentValidator.validate(args, context)
-
-    {:ok,
-     %{
-       content: review_content(validation),
-       token_cost: 0
-     }}
-  end
-
-  def call(@submit_tool, args, context) do
+  def call(@validate_and_submit_tool, args, context) do
     validation = QuestionAgentValidator.validate(args, context)
 
     case validation.valid do
       false ->
         {:ok,
          %{
-           content:
-             validation
-             |> review_content()
-             |> Map.put(:accepted, false),
+           content: validation |> review_content() |> Map.put(:accepted, false),
            token_cost: 0
          }}
 

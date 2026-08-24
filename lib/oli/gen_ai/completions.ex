@@ -15,6 +15,19 @@ defmodule Oli.GenAI.Completions do
     |> apply(:generate, [messages, functions, registered_model])
   end
 
+  def generate_with_metadata(messages, functions, %RegisteredModel{} = registered_model) do
+    provider = get_provider(registered_model)
+
+    if function_exported?(provider, :generate_with_metadata, 3) do
+      apply(provider, :generate_with_metadata, [messages, functions, registered_model])
+    else
+      case apply(provider, :generate, [messages, functions, registered_model]) do
+        {:ok, content} -> {:ok, %{content: content, response: nil}}
+        {:error, _reason} = error -> error
+      end
+    end
+  end
+
   def stream(messages, functions, %RegisteredModel{} = registered_model, response_handler_fn) do
     get_provider(registered_model)
     |> apply(:stream, [messages, functions, registered_model, response_handler_fn])

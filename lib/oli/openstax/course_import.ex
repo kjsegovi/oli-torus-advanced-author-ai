@@ -16,12 +16,15 @@ defmodule Oli.OpenStax.CourseImport do
   alias Oli.Authoring.Editing.Utils, as: EditingUtils
 
   alias Oli.OpenStax.CourseImport.{
+    AdvancedPlanV7,
+    BasicPlanV7,
     Checks,
     Compiler,
     Enrichment,
     EnrichmentProposal,
     EnrichmentResearchSet,
     FullSource,
+    ImportContract,
     Lesson,
     LessonCheck,
     LessonPlan,
@@ -29,6 +32,7 @@ defmodule Oli.OpenStax.CourseImport do
     Outbox,
     Parser,
     PubSub,
+    QualityCritic,
     RichSource,
     Run,
     SimulationArtifact,
@@ -37,6 +41,9 @@ defmodule Oli.OpenStax.CourseImport do
     Telemetry,
     Unit
   }
+
+  @source_schema_version 4
+  @plan_schema_version 7
 
   alias Oli.OpenStax.CourseImport.Worker.{
     ApplyWorker,
@@ -282,8 +289,9 @@ defmodule Oli.OpenStax.CourseImport do
                where:
                  run.project_id == ^project.id and run.author_id == ^author.id and
                    run.target_root_container_resource_id == ^target_resource_id and
-                   run.status in ^@active_statuses and run.source_schema_version == 3 and
-                   run.plan_schema_version == 6,
+                   run.status in ^@active_statuses and
+                   run.source_schema_version == @source_schema_version and
+                   run.plan_schema_version == @plan_schema_version,
                order_by: [desc: run.inserted_at],
                limit: 1
              )
@@ -294,7 +302,7 @@ defmodule Oli.OpenStax.CourseImport do
     end
   end
 
-  @doc "Returns whether this project has an unfinished pre-v6 import without mutating it."
+  @doc "Returns whether this project has an unfinished pre-v7 import without mutating it."
   @spec unfinished_legacy_run?(Project.t(), Author.t()) :: boolean()
   def unfinished_legacy_run?(%Project{} = project, %Author{} = author) do
     with :ok <- authorize_project(project, author) do
@@ -303,7 +311,8 @@ defmodule Oli.OpenStax.CourseImport do
           where:
             run.project_id == ^project.id and run.author_id == ^author.id and
               run.status in ^@active_statuses and
-              (run.source_schema_version != 3 or run.plan_schema_version != 6)
+              (run.source_schema_version != @source_schema_version or
+                 run.plan_schema_version != @plan_schema_version)
         )
       )
     else
@@ -344,7 +353,8 @@ defmodule Oli.OpenStax.CourseImport do
              from(run in Run,
                where:
                  run.project_id == ^project_id and run.author_id == ^author.id and
-                   run.source_schema_version == 3 and run.plan_schema_version == 6,
+                   run.source_schema_version == @source_schema_version and
+                   run.plan_schema_version == @plan_schema_version,
                order_by: [desc: run.inserted_at],
                limit: ^limit
              )
@@ -593,7 +603,7 @@ defmodule Oli.OpenStax.CourseImport do
 
   defp exclusion_needs_acknowledgement?(_source_context, _exclusion, _plan_version), do: false
 
-  defp ensure_current_plan_approvable(lesson, %LessonPlan{} = plan, 6) do
+  defp ensure_current_plan_approvable(lesson, %LessonPlan{} = plan, 7) do
     quality_gate = get_in(plan.generation_metadata || %{}, ["quality_gate"]) || %{}
     coverage = plan.content_payload["coverage_manifest"] || %{}
     available = MapSet.new(List.wrap(coverage["available_source_block_ids"]))
@@ -601,7 +611,7 @@ defmodule Oli.OpenStax.CourseImport do
     contract = {plan.content_payload["authoring_mode"], plan.content_payload["schema_version"]}
 
     cond do
-      contract not in [{"basic", 5}, {"advanced", 6}] ->
+      not ImportContract.current_content?(plan.content_payload) ->
         {:error, :plan_schema_version_mismatch}
 
       quality_gate["approved"] != true or numeric_confidence(quality_gate["confidence"]) < 0.9 ->
@@ -618,7 +628,7 @@ defmodule Oli.OpenStax.CourseImport do
           List.wrap(coverage["duplicate_source_block_ids"]) != [] ->
         {:error, :source_coverage_incomplete}
 
-      contract == {"advanced", 6} and List.wrap(plan.questions_payload["items"]) != [] ->
+      contract == {"advanced", 7} and List.wrap(plan.questions_payload["items"]) != [] ->
         {:error, :advanced_questions_must_be_single_sourced}
 
       true ->
@@ -1156,6 +1166,57 @@ defmodule Oli.OpenStax.CourseImport do
     end
   end
 
+  @spec regenerate_blocked_lessons(Ecto.UUID.t(), Author.t()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def regenerate_blocked_lessons(run_id, %Author{} = author) do
+    with {:ok, run} <- authorized_run(run_id, author),
+         :ok <- ensure_status(run.status, :awaiting_lesson_approval) do
+      lessons =
+        Repo.all(
+          from(lesson in Lesson,
+            join: unit in Unit,
+            on: unit.id == lesson.unit_id,
+            where: lesson.run_id == ^run.id and lesson.selected == true,
+            order_by: [asc: unit.order, asc: lesson.order, asc: lesson.id],
+            select: lesson
+          )
+        )
+
+      blocked_lessons =
+        Enum.filter(lessons, fn lesson ->
+          not lesson_planning_busy?(lesson) and lesson_requires_regeneration?(lesson, run)
+        end)
+
+      case blocked_lessons do
+        [] ->
+          {:error, :no_blocked_lessons_to_repair}
+
+        lessons ->
+          Enum.reduce_while(lessons, {:ok, 0}, fn lesson, {:ok, count} ->
+            case enqueue_lesson_regeneration(run, lesson.id) do
+              {:ok, _lesson} -> {:cont, {:ok, count + 1}}
+              {:error, reason} -> {:halt, {:error, {:bulk_lesson_repair_failed, count, reason}}}
+            end
+          end)
+      end
+    end
+  end
+
+  defp lesson_requires_regeneration?(lesson, run) do
+    case latest_plan_or_nil(lesson.id) do
+      %LessonPlan{} = plan ->
+        lesson.status in ["needs_attention", "needs_repair", "failed"] or
+          plan.rejection_reason not in [nil, ""] or
+          ensure_current_plan_approvable(lesson, plan, run.plan_schema_version) != :ok
+
+      nil ->
+        false
+    end
+  end
+
+  defp lesson_planning_busy?(lesson),
+    do: lesson.planning_state in @unfinished_lesson_planning_states
+
   @spec cancel_run(Ecto.UUID.t(), Author.t()) :: {:ok, Run.t()} | {:error, term()}
   def cancel_run(run_id, %Author{} = author) do
     with {:ok, run} <- authorized_run(run_id, author),
@@ -1497,7 +1558,7 @@ defmodule Oli.OpenStax.CourseImport do
   @doc false
   def persist_ingested_snapshot(run_id, snapshot) when is_map(snapshot) do
     case Repo.get(Run, run_id) do
-      %Run{source_schema_version: 3} ->
+      %Run{source_schema_version: @source_schema_version} ->
         persist_rich_ingested_snapshot(run_id, snapshot)
 
       %Run{source_schema_version: version} ->
@@ -1568,14 +1629,12 @@ defmodule Oli.OpenStax.CourseImport do
   def link_lesson_sources(run_id), do: RichSource.link_lessons(run_id)
 
   @doc false
-  def rich_content_versions(%Project{}), do: {3, 6}
+  def rich_content_versions(%Project{}),
+    do: {ImportContract.source_schema_version(), ImportContract.plan_schema_version()}
 
   @doc false
-  def advanced_v6_enabled?(%Project{} = project) do
-    Application.get_env(:oli, :openstax_advanced_pages_v6_enabled, false) or
-      ScopedFeatureFlags.enabled?(:openstax_advanced_pages_v6, project)
-  rescue
-    _ -> false
+  def advanced_enabled?(%Project{}) do
+    Application.get_env(:oli, :openstax_advanced_pages_enabled, true)
   end
 
   @doc false
@@ -1703,6 +1762,7 @@ defmodule Oli.OpenStax.CourseImport do
                source: source,
                lesson_id: lesson.id,
                run_id: run.id,
+               planning_request_id: lesson.planning_request_id,
                project_id: run.project_id,
                author_id: run.author_id,
                generation_checkpoint: lesson.generation_checkpoint || %{},
@@ -1710,7 +1770,7 @@ defmodule Oli.OpenStax.CourseImport do
                  approved_objective_ledger(run.id, lesson.planning_position || job_args.position),
                planning_position: lesson.planning_position || job_args.position,
                plan_schema_version: run.plan_schema_version,
-               advanced_v6_enabled: not is_nil(project) and advanced_v6_enabled?(project)
+               advanced_enabled: not is_nil(project) and advanced_enabled?(project)
              }}
           end
 
@@ -2410,7 +2470,7 @@ defmodule Oli.OpenStax.CourseImport do
         |> build_progress(%{}, now)
         |> Map.put("work_state", "queued"),
       source_schema_version: source_schema_version,
-      plan_schema_version: 6,
+      plan_schema_version: ImportContract.plan_schema_version(),
       lesson_planning_strategy: :parallel_v1,
       lesson_planning_parallelism: configured_lesson_planning_parallelism(),
       started_at: now
@@ -2792,7 +2852,7 @@ defmodule Oli.OpenStax.CourseImport do
 
     # Current-schema author edits never invoke the removed deterministic legacy
     # repairer. They create a new version and rerun deterministic gates; model
-    # repairs happen only inside the reviewed v5/v6 pipelines.
+    # Repairs happen only inside the reviewed v7 pipelines.
     _allow_repair? = allow_repair?
     {final_plan, final_results, repair_increment} = {first_plan, first_results, 0}
 
@@ -2855,7 +2915,7 @@ defmodule Oli.OpenStax.CourseImport do
          content_payload: %{"schema_version" => schema, "authoring_mode" => mode},
          generation_metadata: metadata
        })
-       when {mode, schema} in [{"basic", 5}, {"advanced", 6}] do
+       when {mode, schema} in [{"basic", 7}, {"advanced", 7}] do
     quality_gate = get_in(metadata || %{}, ["quality_gate"]) || %{}
 
     quality_gate["approved"] != true or numeric_confidence(quality_gate["confidence"]) < 0.9 or
@@ -2978,26 +3038,26 @@ defmodule Oli.OpenStax.CourseImport do
   defp normalize_content_for_authoring_mode(content, "basic") do
     Map.drop(content, [
       "experience_blueprint",
-      "advanced_v6_contract"
+      "advanced_v7_contract"
     ])
   end
 
   defp normalize_content_for_authoring_mode(content, "advanced"), do: content
 
-  defp ensure_payload_schema_version(payload, 6, "basic", "advanced") do
+  defp ensure_payload_schema_version(payload, 7, "basic", "advanced") do
     incoming = payload["content_payload"] || payload[:content_payload] || payload
 
     case incoming_schema_version(incoming) do
-      version when version in [5, 6] -> :ok
+      7 -> :ok
       nil -> {:error, :plan_schema_version_required}
       _other -> {:error, :plan_schema_version_immutable}
     end
   end
 
-  defp ensure_payload_schema_version(payload, 6, plan_mode, current_plan_mode)
+  defp ensure_payload_schema_version(payload, 7, plan_mode, current_plan_mode)
        when plan_mode in ["basic", "advanced"] and current_plan_mode in ["basic", "advanced"] do
     incoming = payload["content_payload"] || payload[:content_payload] || payload
-    expected = expected_content_schema_version(6, plan_mode)
+    expected = expected_content_schema_version(7, plan_mode)
 
     case incoming_schema_version(incoming) do
       ^expected -> :ok
@@ -3023,13 +3083,13 @@ defmodule Oli.OpenStax.CourseImport do
 
   defp incoming_schema_version(_content), do: nil
 
-  defp enforce_system_schema_version(content, 6, plan_mode)
+  defp enforce_system_schema_version(content, 7, plan_mode)
        when plan_mode in ["basic", "advanced"],
        do:
          Map.put(
            content,
            "schema_version",
-           expected_content_schema_version(6, plan_mode)
+           expected_content_schema_version(7, plan_mode)
          )
 
   defp enforce_system_schema_version(_content, run_plan_schema_version, plan_mode),
@@ -3039,8 +3099,8 @@ defmodule Oli.OpenStax.CourseImport do
         "unsupported OpenStax schema contract #{inspect({run_plan_schema_version, plan_mode})}"
       )
 
-  defp expected_content_schema_version(6, "basic"), do: 5
-  defp expected_content_schema_version(6, "advanced"), do: 6
+  defp expected_content_schema_version(7, "basic"), do: 7
+  defp expected_content_schema_version(7, "advanced"), do: 7
 
   defp expected_content_schema_version(run_plan_schema_version, plan_mode),
     do:
@@ -3049,7 +3109,8 @@ defmodule Oli.OpenStax.CourseImport do
         "unsupported OpenStax schema contract #{inspect({run_plan_schema_version, plan_mode})}"
       )
 
-  defp strip_untrusted_exclusion_acknowledgements(content, 6) do
+  defp strip_untrusted_exclusion_acknowledgements(content, run_plan_schema_version)
+       when run_plan_schema_version in [6, 7] do
     update_in(
       content,
       [Access.key("coverage_manifest", %{}), Access.key("excluded_blocks", [])],
@@ -3127,10 +3188,153 @@ defmodule Oli.OpenStax.CourseImport do
       "source_objectives" => lesson.source_objectives || []
     }
 
-    merge_lesson_source_corpus(base, lesson)
+    base
+    |> maybe_put_lesson_repair_context(lesson)
+    |> merge_lesson_source_corpus(lesson)
   end
 
-  defp ensure_usable_lesson_source(%Run{source_schema_version: 3}, source) do
+  defp maybe_put_lesson_repair_context(base, %Lesson{planning_operation: "regenerate"} = lesson) do
+    case latest_plan_or_nil(lesson.id) do
+      %LessonPlan{} = plan ->
+        quality_gate =
+          plan.generation_metadata["quality_gate"] ||
+            plan.generation_metadata[:quality_gate] || %{}
+
+        findings =
+          List.wrap(quality_gate["hard_blockers"] || quality_gate[:hard_blockers]) ++
+            List.wrap(quality_gate["repairs"] || quality_gate[:repairs])
+
+        repair_context = %{
+          "author_feedback" => normalized_repair_feedback(plan.rejection_reason),
+          "critic_findings" =>
+            findings
+            |> Enum.take(20)
+            |> Enum.map(fn finding ->
+              repair_finding(finding)
+            end),
+          "phase_findings" => repair_phase_findings(plan.content_payload, quality_gate),
+          "previous_candidates" => repair_candidates(plan),
+          "previous_finding_fingerprint" => QualityCritic.fingerprint_findings(findings),
+          "previous_plan_version" => plan.version,
+          "required_action" =>
+            "Edit the supplied previous candidates to resolve every applicable finding. Preserve unrelated generated fields and never change the authoritative source."
+        }
+
+        if repair_context["author_feedback"] || repair_context["critic_findings"] != [] do
+          Map.put(base, "repair_context", repair_context)
+        else
+          base
+        end
+
+      nil ->
+        base
+    end
+  end
+
+  defp maybe_put_lesson_repair_context(base, _lesson), do: base
+
+  defp normalized_repair_feedback(value) when is_binary(value) do
+    case String.trim(value) do
+      "" -> nil
+      feedback -> String.slice(feedback, 0, 2_000)
+    end
+  end
+
+  defp normalized_repair_feedback(_value), do: nil
+
+  defp repair_phase_findings(content, quality_gate) do
+    mode = content["authoring_mode"] || content[:authoring_mode]
+
+    fallback =
+      List.wrap(quality_gate["hard_blockers"] || quality_gate[:hard_blockers]) ++
+        List.wrap(quality_gate["repairs"] || quality_gate[:repairs])
+
+    case mode do
+      "advanced" ->
+        phase_findings(
+          review_repair_findings(quality_gate, "experience_critic"),
+          review_repair_findings(quality_gate, "activity_critic"),
+          fallback,
+          &activity_finding?/1,
+          "experience",
+          "activities"
+        )
+
+      _ ->
+        phase_findings(
+          review_repair_findings(quality_gate, "content_critic"),
+          review_repair_findings(quality_gate, "question_critic"),
+          fallback,
+          &question_finding?/1,
+          "content",
+          "questions"
+        )
+    end
+  end
+
+  defp phase_findings(primary, secondary, fallback, secondary?, primary_key, secondary_key) do
+    {primary, secondary} =
+      if primary == [] and secondary == [] do
+        {secondary_findings, primary_findings} = Enum.split_with(fallback, secondary?)
+        {primary_findings, secondary_findings}
+      else
+        {primary, secondary}
+      end
+
+    %{
+      primary_key => primary |> Enum.take(20) |> Enum.map(&repair_finding/1),
+      secondary_key => secondary |> Enum.take(20) |> Enum.map(&repair_finding/1)
+    }
+  end
+
+  defp activity_finding?(finding) do
+    path = to_string(finding["path"] || finding[:path] || "")
+    code = to_string(finding["code"] || finding[:code] || "")
+
+    String.contains?(path, ["activities", "activity_slots"]) or
+      String.contains?(code, ["activity", "response", "feedback", "distractor"])
+  end
+
+  defp question_finding?(finding) do
+    path = to_string(finding["path"] || finding[:path] || "")
+    code = to_string(finding["code"] || finding[:code] || "")
+
+    String.contains?(path, ["questions", "questions_payload", ".items["]) or
+      String.contains?(code, ["question", "answer", "distractor", "feedback"])
+  end
+
+  defp review_repair_findings(quality_gate, critic_key) do
+    quality_gate
+    |> Map.get(critic_key, %{})
+    |> Map.get("findings", [])
+    |> List.wrap()
+    |> Enum.filter(&((&1["severity"] || &1[:severity]) in ["hard_blocker", "repair"]))
+    |> Enum.take(20)
+    |> Enum.map(&repair_finding/1)
+  end
+
+  defp repair_finding(finding) do
+    finding
+    |> stringify_keys()
+    |> Map.take(~w(severity code path message))
+  end
+
+  defp repair_candidates(%LessonPlan{content_payload: %{"authoring_mode" => "advanced"}} = plan) do
+    %{
+      "experience" => AdvancedPlanV7.architecture_repair_candidate(plan.content_payload),
+      "activities" => AdvancedPlanV7.activity_repair_candidate(plan.content_payload),
+      "questions" => plan.questions_payload || %{}
+    }
+  end
+
+  defp repair_candidates(%LessonPlan{} = plan) do
+    %{
+      "content" => BasicPlanV7.repair_candidate(plan.content_payload || %{}),
+      "questions" => plan.questions_payload || %{}
+    }
+  end
+
+  defp ensure_usable_lesson_source(%Run{source_schema_version: @source_schema_version}, source) do
     source
     |> Map.get("source_blocks", [])
     |> List.wrap()
@@ -3825,7 +4029,7 @@ defmodule Oli.OpenStax.CourseImport do
 
   defp maybe_link_lesson_sources(run_id) do
     case Repo.get(Run, run_id) do
-      %Run{source_schema_version: 3} ->
+      %Run{source_schema_version: @source_schema_version} ->
         RichSource.link_lessons(run_id)
 
       %Run{source_schema_version: version} ->
@@ -4881,18 +5085,19 @@ defmodule Oli.OpenStax.CourseImport do
   end
 
   defp lesson_planning_failure_message(:content_validation_exhausted),
-    do: "Generated Basic content did not satisfy the lesson contract after three candidates."
+    do:
+      "Generated Basic content did not satisfy the lesson contract after bounded generation and repair."
 
   defp lesson_planning_failure_message(:content_quality_exhausted),
     do:
-      "The independent content critic did not approve this Basic lesson after three repair rounds."
+      "The independent content critic did not approve this Basic lesson after one targeted repair."
 
   defp lesson_planning_failure_message(:content_quality_stalled),
     do: "Content repair stopped because the independent critic repeated the same findings."
 
   defp lesson_planning_failure_message(:question_quality_exhausted),
     do:
-      "The independent question critic did not approve the question set after three repair rounds."
+      "The independent question critic did not approve the question set after one targeted repair."
 
   defp lesson_planning_failure_message(:question_quality_stalled),
     do: "Question repair stopped because the independent critic repeated the same findings."
@@ -4971,13 +5176,7 @@ defmodule Oli.OpenStax.CourseImport do
     end
   end
 
-  defp ensure_current_run_schema(%Run{plan_schema_version: 6, source_schema_version: 3}), do: :ok
-
-  defp ensure_current_run_schema(%Run{
-         plan_schema_version: plan_version,
-         source_schema_version: source_version
-       }),
-       do: {:error, {:unsupported_openstax_schema_contract, source_version, plan_version}}
+  defp ensure_current_run_schema(%Run{} = run), do: ImportContract.ensure_current_run(run)
 
   defp get_owned_run(run_id, author) do
     case Repo.get(Run, run_id) do

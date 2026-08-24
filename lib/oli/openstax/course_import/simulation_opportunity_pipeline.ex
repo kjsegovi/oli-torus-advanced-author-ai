@@ -4,10 +4,15 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityPipeline do
   alias Oli.GenAI.Completions.Message
   alias Oli.GenAI.Execution
 
-  alias Oli.OpenStax.CourseImport.SimulationOpportunityV1
+  alias Oli.OpenStax.CourseImport.{
+    AIUsageLedger,
+    ModelRoutingPolicy,
+    QualityCritic,
+    SimulationOpportunityV1,
+    StructuredPatch
+  }
 
-  @feature :openstax_course_import
-  @max_candidates 3
+  @max_candidates 2
 
   @spec plan(map(), map(), map(), keyword()) :: {:ok, [map()], map()} | {:error, term()}
   def plan(lesson, content, services, opts)
@@ -22,11 +27,34 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityPipeline do
   def plan(_, _, _, _), do: {:error, :invalid_simulation_opportunity_context}
 
   defp loop(lesson, content, services, opts, attempt, repair, history) do
-    with {:ok, candidate, usage} <- generate(lesson, content, services.designer, repair, opts) do
+    with {:ok, candidate, usage} <-
+           generate(lesson, content, services.designer, repair, attempt, opts) do
       case SimulationOpportunityV1.build(candidate, lesson, content) do
+        {:ok, []} ->
+          {:ok, [],
+           %{
+             "pipeline" => "simulation_opportunity_v1",
+             "attempts" =>
+               history ++
+                 [
+                   %{
+                     "attempt" => attempt,
+                     "designer_usage" => stringify(usage),
+                     "strategy" => "optional_zero_selection"
+                   }
+                 ],
+             "opportunity_count" => 0,
+             "repair_count" => attempt - 1,
+             "designer" => identity(services.designer),
+             "critic" => %{},
+             "critic_skipped" => true
+           }}
+
         {:ok, opportunities} ->
           with {:ok, criticism, critic_usage} <-
-                 criticize(lesson, content, opportunities, services.critic, opts) do
+                 criticize(lesson, content, opportunities, services.critic, attempt, opts) do
+            fingerprint = QualityCritic.fingerprint_findings(criticism["findings"] || [])
+
             history =
               history ++
                 [
@@ -34,7 +62,8 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityPipeline do
                     "attempt" => attempt,
                     "designer_usage" => stringify(usage),
                     "critic_usage" => stringify(critic_usage),
-                    "criticism" => criticism
+                    "criticism" => criticism,
+                    "finding_fingerprint" => fingerprint
                   }
                 ]
 
@@ -65,7 +94,14 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityPipeline do
         {:error, findings} ->
           history =
             history ++
-              [%{"attempt" => attempt, "usage" => stringify(usage), "findings" => findings}]
+              [
+                %{
+                  "attempt" => attempt,
+                  "usage" => stringify(usage),
+                  "findings" => findings,
+                  "finding_fingerprint" => QualityCritic.fingerprint_findings(findings)
+                }
+              ]
 
           repair_or_stop(lesson, content, services, opts, attempt, candidate, findings, history)
       end
@@ -77,25 +113,39 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityPipeline do
        do: {:error, {:simulation_opportunity_exhausted, %{findings: findings, attempts: history}}}
 
   defp repair_or_stop(lesson, content, services, opts, attempt, candidate, findings, history) do
-    loop(
-      lesson,
-      content,
-      services,
-      opts,
-      attempt + 1,
-      %{candidate: candidate, findings: findings},
-      history
-    )
+    fingerprint = QualityCritic.fingerprint_findings(findings)
+    prior = history |> Enum.drop(-1) |> List.last()
+    prior_prior = history |> Enum.drop(-2) |> List.last()
+    repeated = prior && prior["finding_fingerprint"] == fingerprint
+    repeated_twice = repeated && prior_prior && prior_prior["finding_fingerprint"] == fingerprint
+
+    if repeated_twice do
+      {:error,
+       {:simulation_opportunity_needs_attention,
+        %{findings: findings, attempts: history, finding_fingerprint: fingerprint}}}
+    else
+      loop(
+        lesson,
+        content,
+        services,
+        opts,
+        attempt + 1,
+        %{candidate: candidate, findings: findings, force_terra: repeated},
+        history
+      )
+    end
   end
 
-  defp generate(lesson, content, service, repair, opts) do
+  defp generate(lesson, content, service, repair, attempt, opts) do
     contract = SimulationOpportunityV1.prompt_contract(lesson, content)
 
     messages = [
       Message.new(:system, """
-      Identify zero to three simulation opportunities only when dynamic manipulation materially
+      Identify zero or one focused 3–8 minute micro-simulation only when dynamic manipulation materially
       improves the approved Advanced experience. Ground every objective and evidence reference in
-      the supplied contract. Return JSON: {"opportunities": [...]}. Do not design or code a simulation.
+      the supplied contract. One meaningful learner-controlled variable and one observable outcome
+      are sufficient; prefer one to three controls. Return JSON: {"opportunities": [...]}. Do not
+      design or code a simulation.
       """),
       Message.new(:user, Jason.encode!(contract))
     ]
@@ -110,7 +160,7 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityPipeline do
                 :user,
                 Jason.encode!(%{
                   "required_action" =>
-                    "Repair every finding and return the complete JSON object.",
+                    "Return only a bounded JSON patch. Repair every finding; allowed root: opportunities.",
                   "findings" => findings
                 })
               )
@@ -120,10 +170,42 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityPipeline do
           messages
       end
 
-    execute(:simulation_opportunity_designer, messages, service, opts, :opportunity_execution_fun)
+    service =
+      if is_map(repair) do
+        configured =
+          ModelRoutingPolicy.service_config(service, :repair_patch_writer,
+            first_pass: false,
+            cache_material: contract
+          )
+
+        if repair[:force_terra],
+          do: ModelRoutingPolicy.escalate_to_terra(configured, :repair_patch_writer),
+          else: configured
+      else
+        ModelRoutingPolicy.for_attempt(
+          service,
+          attempt,
+          :simulation_opportunity_designer,
+          contract
+        )
+      end
+
+    with {:ok, decoded, usage} <-
+           execute(
+             if(is_map(repair), do: :repair_patch_writer, else: :simulation_opportunity_designer),
+             messages,
+             service,
+             attempt,
+             opts,
+             :opportunity_execution_fun,
+             repair
+           ),
+         {:ok, candidate} <- repaired_candidate(decoded, repair) do
+      {:ok, candidate, usage}
+    end
   end
 
-  defp criticize(lesson, content, opportunities, service, opts) do
+  defp criticize(lesson, content, opportunities, service, attempt, opts) do
     messages = [
       Message.new(:system, """
       Independently reject decorative, duplicative, uncited, misplaced, or pedagogically weak
@@ -143,17 +225,33 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityPipeline do
            execute(
              :simulation_opportunity_critic,
              messages,
-             service,
+             ModelRoutingPolicy.for_attempt(
+               service,
+               attempt,
+               :simulation_opportunity_critic,
+               SimulationOpportunityV1.prompt_contract(lesson, content)
+             ),
+             attempt,
              opts,
-             :opportunity_critic_fun
+             :opportunity_critic_fun,
+             nil
            ) do
       {:ok, criticism, usage}
     end
   end
 
-  defp execute(phase, messages, service, opts, option_name) do
+  defp execute(phase, messages, service, attempt, opts, option_name, repair) do
     execution = Keyword.get(opts, option_name, &Execution.generate_with_metadata/4)
-    context = %{request_type: :generate, feature: @feature, phase: phase}
+
+    context =
+      opts
+      |> Keyword.put(:authoring_mode, "advanced")
+      |> AIUsageLedger.request_context(phase, %{
+        candidate_number: attempt,
+        retry_category: if(attempt > 1, do: "contract_repair"),
+        finding_fingerprint:
+          repair && QualityCritic.fingerprint_findings(List.wrap(repair.findings))
+      })
 
     result =
       case Function.info(execution, :arity) do
@@ -171,6 +269,11 @@ defmodule Oli.OpenStax.CourseImport.SimulationOpportunityPipeline do
       other -> {:error, {:provider_failed, phase, other}}
     end
   end
+
+  defp repaired_candidate(decoded, repair) when is_map(repair),
+    do: StructuredPatch.apply(repair.candidate, decoded, :simulation_opportunity_designer)
+
+  defp repaired_candidate(decoded, _repair), do: {:ok, decoded}
 
   defp approved?(criticism),
     do:

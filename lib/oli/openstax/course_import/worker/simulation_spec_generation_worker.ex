@@ -2,7 +2,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationSpecGenerationWorker do
   @moduledoc """
   Produces and independently reviews one immutable SimulationSpecV1 version.
 
-  The worker is fenced to an author-reviewable v6 run and to the exact approved
+  The worker is fenced to an author-reviewable v7 run and to the exact approved
   research set recorded on the spec. Provider errors are retried and the final
   sanitized failure is persisted without changing any legacy import.
   """
@@ -65,7 +65,11 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationSpecGenerationWorker do
            SimulationSpecDesigner.generate(
              proposal,
              research,
-             three_d_enabled: three_d_enabled?(spec.project_id)
+             three_d_enabled: three_d_enabled?(spec.project_id),
+             run_id: spec.run_id,
+             lesson_id: spec.lesson_id,
+             operation_id: spec.id,
+             cost_scope: :simulation
            )
            |> put_duration(elapsed_milliseconds(started_at)),
          :ok <- ensure_reviewable(spec.run_id) do
@@ -124,8 +128,8 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationSpecGenerationWorker do
       {:ok,
        %{
          status: :awaiting_lesson_approval,
-         source_schema_version: 3,
-         plan_schema_version: 6
+         source_schema_version: 4,
+         plan_schema_version: 7
        }} ->
         :ok
 

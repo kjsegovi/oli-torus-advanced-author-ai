@@ -46,6 +46,7 @@ defmodule Oli.GenAI.Agent.Server do
       :steps,
       :inflight,
       :metadata,
+      :request_context_factory,
       :tokens_used,
       :input_tokens_used,
       :output_tokens_used,
@@ -73,6 +74,7 @@ defmodule Oli.GenAI.Agent.Server do
             steps: [Step.t()],
             inflight: map(),
             metadata: map(),
+            request_context_factory: (pos_integer() -> map()) | nil,
             tokens_used: integer(),
             input_tokens_used: integer(),
             output_tokens_used: integer(),
@@ -140,6 +142,7 @@ defmodule Oli.GenAI.Agent.Server do
       steps: [],
       inflight: %{},
       metadata: Map.get(args, :metadata, %{}),
+      request_context_factory: Map.get(args, :request_context_factory),
       tokens_used: 0,
       input_tokens_used: 0,
       output_tokens_used: 0,
@@ -356,6 +359,15 @@ defmodule Oli.GenAI.Agent.Server do
     }
 
     opts = Map.put(opts, :tools, state.tool_broker.tools_for_completion())
+
+    opts =
+      case state.request_context_factory do
+        factory when is_function(factory, 1) ->
+          Map.put(opts, :request_ctx, factory.(length(state.steps) + 1))
+
+        _ ->
+          opts
+      end
 
     case state.llm_bridge.next_decision_with_metadata(messages, opts) do
       {:ok, decision, usage} ->

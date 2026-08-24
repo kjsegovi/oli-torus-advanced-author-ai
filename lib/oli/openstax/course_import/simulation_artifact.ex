@@ -55,6 +55,9 @@ defmodule Oli.OpenStax.CourseImport.SimulationArtifact do
     field :byte_size, :integer
     field :storage_state, :string, default: "unstaged"
     field :storage_provider, :string
+    field :storage_bucket, :string
+    field :storage_identity_version, :integer
+    field :storage_payload, :map
     field :storage_key, :string
     field :storage_origin, :string
     field :failure, :map
@@ -127,6 +130,9 @@ defmodule Oli.OpenStax.CourseImport.SimulationArtifact do
       :byte_size,
       :storage_state,
       :storage_provider,
+      :storage_bucket,
+      :storage_identity_version,
+      :storage_payload,
       :storage_key,
       :storage_origin,
       :failure,
@@ -168,6 +174,7 @@ defmodule Oli.OpenStax.CourseImport.SimulationArtifact do
       present?(artifact.storage_key) and
       content_addressed?(artifact.storage_key, artifact.content_hash) and
       present?(artifact.storage_origin) and
+      storage_identity_valid?(artifact) and
       accessibility_metadata_valid?(artifact.accessibility_metadata)
   end
 
@@ -183,6 +190,7 @@ defmodule Oli.OpenStax.CourseImport.SimulationArtifact do
     |> validate_number(:version, greater_than: 0)
     |> validate_number(:validation_version, greater_than_or_equal_to: 0)
     |> validate_number(:byte_size, greater_than_or_equal_to: 0)
+    |> validate_inclusion(:storage_identity_version, [1, 2])
     |> validate_format(:content_hash, ~r/^[0-9a-f]{64}$/)
     |> check_constraint(:status, name: :course_import_simulation_artifacts_status)
     |> check_constraint(:validation_status,
@@ -194,13 +202,18 @@ defmodule Oli.OpenStax.CourseImport.SimulationArtifact do
     |> check_constraint(:version, name: :course_import_simulation_artifacts_bounds)
     |> check_constraint(:status, name: :course_import_simulation_artifacts_preview)
     |> check_constraint(:status, name: :course_import_simulation_artifacts_approval)
+    |> check_constraint(:storage_identity_version,
+      name: :course_import_simulation_artifacts_storage_identity_version
+    )
+    |> check_constraint(:storage_bucket,
+      name: :course_import_simulation_artifacts_storage_identity_pair
+    )
   end
 
   defp validate_preview_fields(changeset) do
     case get_field(changeset, :status) do
       status when status in ["ready_for_review", "approved", "superseded"] ->
-        changeset
-        |> validate_required([
+        required_fields = [
           :validation_status,
           :validation_version,
           :content_hash,
@@ -209,12 +222,23 @@ defmodule Oli.OpenStax.CourseImport.SimulationArtifact do
           :storage_provider,
           :storage_key,
           :storage_origin
-        ])
+        ]
+
+        required_fields =
+          if get_field(changeset, :storage_provider) == "s3_media" do
+            required_fields ++ [:storage_bucket, :storage_identity_version]
+          else
+            required_fields
+          end
+
+        changeset
+        |> validate_required(required_fields)
+        |> validate_storage_identity_immutable()
         |> validate_metadata_map(:bundle_manifest)
         |> validate_metadata_map(:accessibility_metadata)
 
       _ ->
-        changeset
+        validate_storage_identity_immutable(changeset)
     end
   end
 
@@ -233,7 +257,37 @@ defmodule Oli.OpenStax.CourseImport.SimulationArtifact do
       present?(artifact.storage_provider) and present?(artifact.storage_key) and
       content_addressed?(artifact.storage_key, artifact.content_hash) and
       present?(artifact.storage_origin) and
+      storage_identity_valid?(artifact) and
       accessibility_metadata_valid?(artifact.accessibility_metadata)
+  end
+
+  defp storage_identity_valid?(%__MODULE__{storage_provider: "s3_media"} = artifact) do
+    present?(artifact.storage_bucket) and artifact.storage_identity_version in [1, 2]
+  end
+
+  defp storage_identity_valid?(_artifact), do: true
+
+  defp validate_storage_identity_immutable(changeset) do
+    Enum.reduce(
+      [
+        :storage_provider,
+        :storage_bucket,
+        :storage_identity_version,
+        :storage_key,
+        :storage_origin
+      ],
+      changeset,
+      fn field, current ->
+        original = Map.get(current.data, field)
+        replacement = get_change(current, field, original)
+
+        if not is_nil(original) and replacement != original do
+          add_error(current, field, "is immutable once assigned")
+        else
+          current
+        end
+      end
+    )
   end
 
   defp accessibility_metadata_valid?(metadata) when is_map(metadata) do

@@ -1,15 +1,15 @@
 defmodule Oli.OpenStax.CourseImport.Checks do
   @moduledoc """
   Deterministic quality gates for the only supported OpenStax lesson contracts:
-  Basic schema 5 and Advanced schema 6.
+  Basic and Advanced schema 7.
 
   This module intentionally contains no legacy schema dispatch or fallback.
   """
 
-  alias Oli.OpenStax.CourseImport.{AdvancedPlanV6, BasicPlanV5}
+  alias Oli.OpenStax.CourseImport.{AdvancedPlanV7, BasicPlanV7}
 
   @check_types [:source_fidelity, :pedagogy_assessment, :torus_accessibility]
-  @current_contracts [{"basic", 5}, {"advanced", 6}]
+  @current_contracts [{"basic", 7}, {"advanced", 7}]
   @advanced_activity_types ~w(multiple_choice dropdown slider number_input short_answer reflection)
 
   @type result :: %{
@@ -37,11 +37,11 @@ defmodule Oli.OpenStax.CourseImport.Checks do
     Enum.map(@check_types, fn check_type ->
       result(
         check_type,
-        ["Only Basic schema 5 and Advanced schema 6 lesson contracts are supported"],
+        ["Only the Basic and Advanced schema 7 lesson contracts are supported"],
         %{
           "supported_contracts" => [
-            %{"authoring_mode" => "basic", "schema_version" => 5},
-            %{"authoring_mode" => "advanced", "schema_version" => 6}
+            %{"authoring_mode" => "basic", "schema_version" => 7},
+            %{"authoring_mode" => "advanced", "schema_version" => 7}
           ]
         }
       )
@@ -55,7 +55,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
   defp run_check(:source_fidelity, lesson, %{"content_payload" => content}) do
     available_ids =
       lesson
-      |> BasicPlanV5.source_blocks()
+      |> BasicPlanV7.source_blocks()
       |> Enum.map(& &1["id"])
       |> MapSet.new()
 
@@ -136,7 +136,8 @@ defmodule Oli.OpenStax.CourseImport.Checks do
   defp run_check(
          :pedagogy_assessment,
          _lesson,
-         %{"content_payload" => %{"schema_version" => 5} = content} = plan
+         %{"content_payload" => %{"schema_version" => 7, "authoring_mode" => "basic"} = content} =
+           plan
        ) do
     objectives = List.wrap(content["learning_objectives"])
     groups = content_maps(content, "content_groups")
@@ -149,7 +150,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
       []
       |> maybe_add(
         content["authoring_mode"] != "basic",
-        "Schema 5 is available only for Basic pages"
+        "Schema 7 Basic content must use Basic Author mode"
       )
       |> maybe_add(
         objectives == [] or Enum.any?(objectives, &(not present?(&1))),
@@ -179,7 +180,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
         Enum.any?(questions, &invalid_basic_question?/1),
         "Every Basic question must have a valid response contract"
       )
-      |> quality_failures(quality, "Basic v5")
+      |> quality_failures(quality, "Basic v7")
 
     result(:pedagogy_assessment, failures, %{
       "organization" => "content_groups",
@@ -194,7 +195,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
          :pedagogy_assessment,
          _lesson,
          %{
-           "content_payload" => %{"schema_version" => 6, "authoring_mode" => "advanced"} = content
+           "content_payload" => %{"schema_version" => 7, "authoring_mode" => "advanced"} = content
          } = plan
        ) do
     blueprint = content["experience_blueprint"] || %{}
@@ -207,8 +208,8 @@ defmodule Oli.OpenStax.CourseImport.Checks do
     failures =
       []
       |> maybe_add(
-        not AdvancedPlanV6.valid?(content),
-        "The Advanced schema 6 experience blueprint is incomplete"
+        not AdvancedPlanV7.valid?(content),
+        "The Advanced schema 7 experience blueprint is incomplete"
       )
       |> maybe_add(duration not in 45..75, "Advanced duration must be an honest 45–75 minutes")
       |> maybe_add(stages == [], "Advanced lessons require a coherent stage flow")
@@ -227,9 +228,9 @@ defmodule Oli.OpenStax.CourseImport.Checks do
       )
       |> maybe_add(
         List.wrap(get_in(plan, ["questions_payload", "items"])) != [],
-        "Schema 6 activities must exist only inside experience_blueprint"
+        "Advanced schema 7 activities must exist only inside experience_blueprint"
       )
-      |> quality_failures(quality_gate(plan), "Advanced v6")
+      |> quality_failures(quality_gate(plan), "Advanced v7")
 
     result(:pedagogy_assessment, failures, %{
       "organization" => "experience_blueprint",
@@ -283,7 +284,7 @@ defmodule Oli.OpenStax.CourseImport.Checks do
       )
 
     result(:torus_accessibility, failures, %{
-      "supported_contract" => if(mode == "advanced", do: "advanced_v6", else: "basic_v5"),
+      "supported_contract" => if(mode == "advanced", do: "advanced_v7", else: "basic_v7"),
       "required_feedback_paths" => ["correct", "default_incorrect", "not_sure"],
       "regression" => "could_not_find_incorrect_response"
     })

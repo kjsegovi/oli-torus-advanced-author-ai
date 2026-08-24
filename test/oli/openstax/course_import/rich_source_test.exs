@@ -309,7 +309,7 @@ defmodule Oli.OpenStax.CourseImport.RichSourceTest do
              run
              |> Run.update_changeset(%{
                status: :planning_outline,
-               source_schema_version: 3,
+               source_schema_version: 4,
                preflight_snapshot: compact,
                scope_manifest: %{"selected_chapter_ids" => ["chapter-1"]}
              })

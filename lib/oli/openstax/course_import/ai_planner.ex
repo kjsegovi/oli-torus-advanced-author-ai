@@ -1,22 +1,25 @@
 defmodule Oli.OpenStax.CourseImport.AIPlanner do
   @moduledoc """
-  Hard-cutover OpenStax planner. Every run uses plan schema 6 and every lesson
-  is emitted as either source-faithful Basic schema 5 or reviewed Advanced
-  schema 6. No legacy schema reader, downgrade, or Advanced filler is available.
+  Hard-cutover OpenStax planner. Every run uses source schema 4 and plan schema 7,
+  and every lesson is emitted through the shared Basic/Advanced content schema 7.
+  No legacy schema reader, downgrade, or Advanced filler is available.
   """
 
   alias Oli.GenAI.Completions.{RegisteredModel, ServiceConfig}
   alias Oli.GenAI.FeatureConfig
 
   alias Oli.OpenStax.CourseImport.{
-    AdvancedPipelineV6,
-    AdvancedSuitabilityV6,
-    BasicPipelineV5,
+    AdvancedPipelineV7,
+    AdvancedSuitabilityV7,
+    BasicPipelineV7,
+    ImportContract,
+    ModelRoutingPolicy,
+    PlanTemplateCache,
     SimulationOpportunityPipeline
   }
 
   @feature :openstax_course_import
-  @run_schema_version 6
+  @run_schema_version ImportContract.plan_schema_version()
   @default_openai_url "https://api.openai.com"
   @default_openai_model "gpt-5.6-luna"
   @default_openai_timeout 8_000
@@ -31,7 +34,7 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
     with :ok <- require_current_run_schema(opts),
          :ok <- require_source_ast(lesson),
          {:ok, service_config} <- service_config(opts) do
-      suitability = AdvancedSuitabilityV6.assess(lesson)
+      suitability = AdvancedSuitabilityV7.assess(lesson)
 
       if advanced_enabled?(opts) and suitability["candidate"] == true do
         plan_advanced(lesson, index, service_config, suitability, opts)
@@ -55,7 +58,10 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   defp plan_basic(lesson, index, service_config, suitability, opts) do
     services = basic_services(service_config, opts)
 
-    with {:ok, result} <- BasicPipelineV5.plan(lesson, index, services, opts) do
+    with {:ok, result, _cache_status} <-
+           PlanTemplateCache.fetch_or_generate(lesson, "basic", services, opts, fn ->
+             BasicPipelineV7.plan(lesson, index, services, opts)
+           end) do
       {:ok, planning_result("basic", result, suitability, [], %{})}
     else
       {:error, reason} -> {:error, {:ai_planning_failed, reason}}
@@ -66,7 +72,10 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
     services = advanced_services(service_config, opts)
     opts = Keyword.put(opts, :advanced_suitability, suitability)
 
-    with {:ok, result} <- AdvancedPipelineV6.plan(lesson, index, services, opts) do
+    with {:ok, result, _cache_status} <-
+           PlanTemplateCache.fetch_or_generate(lesson, "advanced", services, opts, fn ->
+             AdvancedPipelineV7.plan(lesson, index, services, opts)
+           end) do
       {opportunities, opportunity_metadata} =
         maybe_plan_simulation_opportunities(lesson, result, services, opts)
 
@@ -152,94 +161,29 @@ defmodule Oli.OpenStax.CourseImport.AIPlanner do
   defp advanced_enabled?(opts) do
     Keyword.get(
       opts,
-      :advanced_v6_enabled,
-      Application.get_env(:oli, :openstax_advanced_pages_v6_enabled, false)
+      :advanced_enabled,
+      Application.get_env(:oli, :openstax_advanced_pages_enabled, true)
     )
   end
 
   defp basic_services(%ServiceConfig{} = base, opts) do
-    env = Keyword.get(opts, :env_getter, &System.get_env/1)
-
     %{
-      architect:
-        role_service_config(
-          base,
-          "basic-content-architect",
-          env.("OPENSTAX_CONTENT_ARCHITECT_MODEL") || "gpt-5.6-terra"
-        ),
-      critic:
-        role_service_config(
-          base,
-          "basic-content-critic",
-          env.("OPENSTAX_CONTENT_CRITIC_MODEL") || "gpt-5.6-sol"
-        ),
-      question_writer:
-        role_service_config(
-          base,
-          "basic-question-writer",
-          env.("OPENSTAX_QUESTION_WRITER_MODEL") || "gpt-5.6-terra"
-        ),
-      question_critic:
-        role_service_config(
-          base,
-          "basic-question-critic",
-          env.("OPENSTAX_QUESTION_CRITIC_MODEL") || "gpt-5.6-sol"
-        )
+      architect: ModelRoutingPolicy.service_config(base, :basic_content_architect, opts),
+      critic: ModelRoutingPolicy.service_config(base, :basic_content_critic, opts),
+      question_writer: ModelRoutingPolicy.service_config(base, :basic_question_writer, opts),
+      question_critic: ModelRoutingPolicy.service_config(base, :basic_question_critic, opts)
     }
   end
 
   defp advanced_services(%ServiceConfig{} = base, opts) do
-    env = Keyword.get(opts, :env_getter, &System.get_env/1)
-
     %{
-      architect:
-        role_service_config(
-          base,
-          "advanced-experience-architect",
-          env.("OPENSTAX_ADVANCED_ARCHITECT_MODEL") || "gpt-5.6-terra"
-        ),
-      critic:
-        role_service_config(
-          base,
-          "advanced-experience-critic",
-          env.("OPENSTAX_ADVANCED_CRITIC_MODEL") || "gpt-5.6-sol"
-        ),
-      activity_writer:
-        role_service_config(
-          base,
-          "advanced-activity-writer",
-          env.("OPENSTAX_ADVANCED_ACTIVITY_WRITER_MODEL") || "gpt-5.6-terra"
-        ),
-      activity_critic:
-        role_service_config(
-          base,
-          "advanced-activity-critic",
-          env.("OPENSTAX_ADVANCED_ACTIVITY_CRITIC_MODEL") || "gpt-5.6-sol"
-        ),
-      designer:
-        role_service_config(
-          base,
-          "simulation-opportunity-designer",
-          env.("OPENSTAX_SIMULATION_OPPORTUNITY_MODEL") || "gpt-5.6-terra"
-        ),
+      architect: ModelRoutingPolicy.service_config(base, :advanced_experience_architect, opts),
+      critic: ModelRoutingPolicy.service_config(base, :advanced_experience_critic, opts),
+      activity_writer: ModelRoutingPolicy.service_config(base, :advanced_activity_writer, opts),
+      activity_critic: ModelRoutingPolicy.service_config(base, :advanced_activity_critic, opts),
+      designer: ModelRoutingPolicy.service_config(base, :simulation_opportunity_designer, opts),
       opportunity_critic:
-        role_service_config(
-          base,
-          "simulation-opportunity-critic",
-          env.("OPENSTAX_SIMULATION_OPPORTUNITY_CRITIC_MODEL") || "gpt-5.6-sol"
-        )
-    }
-  end
-
-  defp role_service_config(%ServiceConfig{} = service_config, role, model_name) do
-    role_model = %{service_config.primary_model | name: "openstax-#{role}", model: model_name}
-
-    %{
-      service_config
-      | name: "openstax-#{role}",
-        primary_model: role_model,
-        secondary_model: nil,
-        backup_model: nil
+        ModelRoutingPolicy.service_config(base, :simulation_opportunity_critic, opts)
     }
   end
 

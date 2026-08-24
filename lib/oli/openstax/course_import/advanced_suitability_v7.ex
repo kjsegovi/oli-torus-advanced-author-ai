@@ -1,6 +1,6 @@
-defmodule Oli.OpenStax.CourseImport.AdvancedSuitabilityV6 do
+defmodule Oli.OpenStax.CourseImport.AdvancedSuitabilityV7 do
   @moduledoc """
-  Deterministic, source-only suitability assessment for schema 6 Advanced
+  Deterministic, source-only suitability assessment for schema 7 Advanced
   Explorations.
 
   The assessment is intentionally conservative. A source-grounded knowledge

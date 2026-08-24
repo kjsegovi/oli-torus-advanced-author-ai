@@ -3,30 +3,14 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentPolicy do
 
   @behaviour Oli.GenAI.Agent.Policy
 
-  alias Oli.OpenStax.CourseImport.QuestionAgentValidator
-
-  @review_tool "review_openstax_questions"
-  @submit_tool "submit_openstax_questions"
-  @max_candidates 3
+  @validate_and_submit_tool "validate_and_submit_openstax_questions"
+  @max_candidates 2
 
   @impl true
-  def allowed_action?(%{next_action: "tool", tool_name: @review_tool}, state) do
-    if tool_count(state, @review_tool) < @max_candidates,
+  def allowed_action?(%{next_action: "tool", tool_name: @validate_and_submit_tool}, state) do
+    if tool_count(state, @validate_and_submit_tool) < @max_candidates,
       do: true,
-      else: {false, "The three-candidate review budget is exhausted."}
-  end
-
-  def allowed_action?(%{next_action: "tool", tool_name: @submit_tool} = decision, state) do
-    cond do
-      tool_count(state, @submit_tool) >= @max_candidates ->
-        {false, "The three-candidate submission budget is exhausted."}
-
-      not successfully_reviewed?(state, decision.arguments) ->
-        {false, "Review this exact candidate successfully before submitting it."}
-
-      true ->
-        true
-    end
+      else: {false, "The two-candidate validation budget is exhausted."}
   end
 
   def allowed_action?(%{next_action: "tool", tool_name: tool_name}, _state) do
@@ -65,20 +49,9 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentPolicy do
     ])
   end
 
-  defp successfully_reviewed?(state, candidate) do
-    candidate_hash = QuestionAgentValidator.candidate_hash(candidate)
-
-    Enum.any?(state.steps, fn step ->
-      step.action[:type] == "tool" and step.action[:name] == @review_tool and
-        truthy?(step.observation[:valid] || step.observation["valid"]) and
-        (step.observation[:candidate_hash] || step.observation["candidate_hash"]) ==
-          candidate_hash
-    end)
-  end
-
   defp accepted?(state) do
     Enum.any?(state.steps, fn step ->
-      step.action[:type] == "tool" and step.action[:name] == @submit_tool and
+      step.action[:type] == "tool" and step.action[:name] == @validate_and_submit_tool and
         truthy?(step.observation[:accepted] || step.observation["accepted"])
     end)
   end

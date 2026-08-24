@@ -20,7 +20,7 @@ defmodule Oli.OpenStax.CourseImport.SchemaCutoverTest do
            )
 
     current_contract_files =
-      ~w(parser.ex checks.ex authoring_compiler.ex ai_planner.ex advanced_plan_v6.ex)
+      ~w(parser.ex checks.ex authoring_compiler.ex ai_planner.ex advanced_plan_v7.ex)
       |> Enum.map(&Path.join(@root, "lib/oli/openstax/course_import/#{&1}"))
       |> Enum.map_join("\n", &File.read!/1)
 
@@ -33,7 +33,7 @@ defmodule Oli.OpenStax.CourseImport.SchemaCutoverTest do
     refute current_contract_files =~ "curiosity_prompts"
   end
 
-  test "plan persistence accepts only Basic 5 and Advanced 6 content contracts" do
+  test "plan persistence accepts only the Basic and Advanced schema 7 contracts" do
     alias Oli.OpenStax.CourseImport.LessonPlan
 
     base = %{lesson_id: Ecto.UUID.generate(), version: 1}
@@ -42,7 +42,7 @@ defmodule Oli.OpenStax.CourseImport.SchemaCutoverTest do
           %{"authoring_mode" => "basic", "schema_version" => 4},
           %{"authoring_mode" => "basic", "schema_version" => 6},
           %{"authoring_mode" => "advanced", "schema_version" => 4},
-          %{"authoring_mode" => "advanced", "schema_version" => 5}
+          %{"authoring_mode" => "advanced", "schema_version" => 6}
         ] do
       refute LessonPlan.changeset(%LessonPlan{}, Map.put(base, :content_payload, contract)).valid?
     end
@@ -51,7 +51,7 @@ defmodule Oli.OpenStax.CourseImport.SchemaCutoverTest do
              %LessonPlan{},
              Map.put(base, :content_payload, %{
                "authoring_mode" => "basic",
-               "schema_version" => 5
+               "schema_version" => 7
              })
            ).valid?
 
@@ -59,23 +59,24 @@ defmodule Oli.OpenStax.CourseImport.SchemaCutoverTest do
              %LessonPlan{},
              Map.put(base, :content_payload, %{
                "authoring_mode" => "advanced",
-               "schema_version" => 6
+               "schema_version" => 7
              })
            ).valid?
   end
 
-  test "only explicit Basic 5 and Advanced 6 compiler entry contracts remain callable" do
+  test "only the explicit schema 7 compiler entry contract remains callable" do
     compiler =
       File.read!(Path.join(@root, "lib/oli/openstax/course_import/authoring_compiler.ex"))
 
-    assert compiler =~ ~s("schema_version" => 5)
-    assert compiler =~ ~s("schema_version" => 6)
+    assert compiler =~ "ImportContract.content_schema_version(:basic)"
+    assert compiler =~ "ImportContract.content_schema_version(:advanced)"
+    assert compiler =~ "compile_advanced_v7"
 
     refute compiler =~
              "expected_content_schema_version(_run_plan_schema_version, _plan_mode), do: 4"
   end
 
-  test "outline construction rejects every pre-v6 run schema" do
+  test "outline construction rejects every pre-v7 run schema" do
     snapshot = %{
       "book_slug" => "chemistry-2e",
       "chapters" => [

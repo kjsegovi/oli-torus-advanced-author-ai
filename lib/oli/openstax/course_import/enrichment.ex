@@ -51,7 +51,8 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   @artifact_result_attr_names ~w(
     generator_name generator_version generation_metadata bundle_manifest capi_manifest
     accessibility_metadata validation_status validation_version validation_payload
-    content_hash byte_size storage_state storage_provider storage_key storage_origin
+    content_hash byte_size storage_state storage_provider storage_bucket storage_identity_version
+    storage_payload storage_key storage_origin
     failure staged_at
   )a
 
@@ -1007,22 +1008,21 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   def artifact_url(artifact, opts \\ [])
 
   def artifact_url(%SimulationArtifact{} = artifact, opts) do
-    expected_origin =
-      Keyword.get(opts, :trusted_origin) ||
-        Application.get_env(:oli, :openstax_generated_simulation_origin)
+    expected_origins = trusted_artifact_origins(artifact, opts)
 
     opts =
-      Keyword.put_new(
-        opts,
+      opts
+      |> Keyword.put_new(
         :allow_local_http,
         Application.get_env(:oli, :env) in [:dev, :test]
       )
+      |> Keyword.put(:trusted_origins, expected_origins)
 
     with true <- artifact_resolvable?(artifact, opts),
-         :ok <- require_trusted_origin(expected_origin),
-         :ok <- validate_resolved_url(artifact.storage_origin, expected_origin, opts),
+         :ok <- require_trusted_origins(expected_origins),
+         :ok <- validate_resolved_url(artifact.storage_origin, expected_origins, opts),
          {:ok, url} <- ArtifactStorage.resolve(artifact, opts),
-         :ok <- validate_resolved_url(url, expected_origin, opts) do
+         :ok <- validate_resolved_url(url, expected_origins, opts) do
       {:ok, url}
     else
       false -> {:error, :artifact_not_approved}
@@ -1032,8 +1032,29 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
 
   def artifact_url(_, _), do: {:error, :invalid_input}
 
-  defp require_trusted_origin(origin) when is_binary(origin), do: :ok
-  defp require_trusted_origin(_origin), do: {:error, :untrusted_storage}
+  defp require_trusted_origins(origins) when is_list(origins) and origins != [], do: :ok
+  defp require_trusted_origins(_origins), do: {:error, :untrusted_storage}
+
+  defp trusted_artifact_origins(artifact, opts) do
+    configured =
+      Keyword.get(opts, :trusted_origin) ||
+        Application.get_env(:oli, :openstax_generated_simulation_origin)
+
+    [configured]
+    |> maybe_add_legacy_artifact_origin(artifact)
+    |> Enum.filter(&is_binary/1)
+    |> Enum.uniq()
+  end
+
+  defp maybe_add_legacy_artifact_origin(origins, %SimulationArtifact{
+         storage_provider: "s3_media",
+         storage_identity_version: 1,
+         storage_origin: origin
+       })
+       when is_binary(origin),
+       do: [origin | origins]
+
+  defp maybe_add_legacy_artifact_origin(origins, _artifact), do: origins
 
   defp artifact_resolvable?(artifact, opts) do
     SimulationArtifact.resolvable?(artifact) or
@@ -1143,7 +1164,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
           on: run.id == proposal.run_id,
           where:
             proposal.research_status == "running" and proposal.updated_at < ^cutoff and
-              run.source_schema_version == 3 and run.plan_schema_version == 6
+              run.source_schema_version == 4 and run.plan_schema_version == 7
         )
         |> Repo.update_all(
           set: [
@@ -1159,7 +1180,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
           on: run.id == artifact.run_id,
           where:
             artifact.status == "generating" and artifact.updated_at < ^cutoff and
-              run.source_schema_version == 3 and run.plan_schema_version == 6
+              run.source_schema_version == 4 and run.plan_schema_version == 7
         )
         |> Repo.update_all(
           set: [
@@ -1253,8 +1274,8 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
           artifact.status in ^@discardable_artifact_statuses and
             artifact.storage_state in ["unstaged", "staged", "promoted"] and
             not is_nil(artifact.storage_provider) and not is_nil(artifact.storage_key) and
-            not is_nil(artifact.content_hash) and run.source_schema_version == 3 and
-            run.plan_schema_version == 6 and
+            not is_nil(artifact.content_hash) and run.source_schema_version == 4 and
+            run.plan_schema_version == 7 and
             artifact.inserted_at < ^inserted_before,
         distinct: true,
         select: artifact.run_id
@@ -1391,7 +1412,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
       |> Repo.one()
 
     case {run, lesson} do
-      {%Run{source_schema_version: 3, plan_schema_version: 6} = run, %Lesson{} = lesson} ->
+      {%Run{source_schema_version: 4, plan_schema_version: 7} = run, %Lesson{} = lesson} ->
         {run, lesson}
 
       {%Run{}, %Lesson{}} ->
@@ -1885,13 +1906,13 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
     case Repo.one(from(run in Run, where: run.id == ^run_id, lock: "FOR UPDATE")) do
       %Run{
         status: :awaiting_lesson_approval,
-        source_schema_version: 3,
-        plan_schema_version: 6
+        source_schema_version: 4,
+        plan_schema_version: 7
       } = run ->
         run
 
       %Run{source_schema_version: source, plan_schema_version: plan}
-      when source != 3 or plan != 6 ->
+      when source != 4 or plan != 7 ->
         Repo.rollback(:unsupported_legacy_run)
 
       %Run{status: status} ->
@@ -1906,13 +1927,13 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
     case Repo.get(Run, run_id) do
       %Run{
         status: :awaiting_lesson_approval,
-        source_schema_version: 3,
-        plan_schema_version: 6
+        source_schema_version: 4,
+        plan_schema_version: 7
       } ->
         :ok
 
       %Run{source_schema_version: source, plan_schema_version: plan}
-      when source != 3 or plan != 6 ->
+      when source != 4 or plan != 7 ->
         {:error, :unsupported_legacy_run}
 
       %Run{status: status} ->
@@ -1926,7 +1947,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   defp fetch_run(run_id) do
     case Repo.get(Run, run_id) do
       nil -> {:error, :not_found}
-      %Run{source_schema_version: 3, plan_schema_version: 6} = run -> {:ok, run}
+      %Run{source_schema_version: 4, plan_schema_version: 7} = run -> {:ok, run}
       %Run{} -> {:error, :unsupported_legacy_run}
     end
   end
@@ -2249,10 +2270,9 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
       artifact.lesson_id == proposal.lesson_id
   end
 
-  defp validate_resolved_url(url, expected_origin, opts)
-       when is_binary(url) and is_binary(expected_origin) do
+  defp validate_resolved_url(url, expected_origins, opts)
+       when is_binary(url) and is_list(expected_origins) do
     resolved = URI.parse(url)
-    expected = URI.parse(expected_origin)
     allow_local_http = Keyword.get(opts, :allow_local_http, false)
 
     secure_scheme =
@@ -2260,10 +2280,14 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
         (allow_local_http and resolved.scheme == "http" and local_host?(resolved.host))
 
     same_origin =
-      resolved.scheme == expected.scheme and resolved.host == expected.host and
-        effective_port(resolved) == effective_port(expected)
+      Enum.any?(expected_origins, fn expected_origin ->
+        expected = URI.parse(expected_origin)
 
-    if secure_scheme and present_uri?(resolved) and present_uri?(expected) and same_origin,
+        present_uri?(expected) and resolved.scheme == expected.scheme and
+          resolved.host == expected.host and effective_port(resolved) == effective_port(expected)
+      end)
+
+    if secure_scheme and present_uri?(resolved) and same_origin,
       do: :ok,
       else: {:error, :untrusted_storage}
   end

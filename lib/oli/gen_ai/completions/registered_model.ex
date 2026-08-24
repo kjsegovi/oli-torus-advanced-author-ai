@@ -3,6 +3,8 @@ defmodule Oli.GenAI.Completions.RegisteredModel do
 
   import Ecto.Changeset
 
+  @type t :: %__MODULE__{}
+
   schema "registered_models" do
     field :name, :string
     field :provider, Ecto.Enum, values: [:null, :open_ai, :claude]
@@ -19,6 +21,13 @@ defmodule Oli.GenAI.Completions.RegisteredModel do
     field :routing_breaker_latency_p95_ms, :integer, default: 6000
     field :routing_open_cooldown_ms, :integer, default: 30_000
     field :routing_half_open_probe_count, :integer, default: 3
+
+    # Request-scoped OpenAI controls. Importer role routing copies registered
+    # models and sets these virtual fields without mutating shared model rows.
+    field :service_tier, :string, virtual: true
+    field :reasoning_effort, :string, virtual: true
+    field :prompt_cache_key, :string, virtual: true
+    field :max_output_tokens, :integer, virtual: true
 
     # virtual field for count of service configs appearing in
     field :service_config_count, :integer, virtual: true

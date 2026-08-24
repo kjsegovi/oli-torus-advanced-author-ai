@@ -14,6 +14,7 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
   }
 
   alias Oli.OpenStax.CourseImport.Enrichment.{Generator, Research, Sandbox}
+  alias Oli.OpenStax.CourseImport.Enrichment.SimulationStorageIdentityBackfill
   alias Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker
   alias Oli.Repo
 
@@ -166,6 +167,54 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
     end
   end
 
+  defmodule RetryOnceWorkerStorage do
+    @behaviour Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage
+
+    @impl true
+    def available?, do: true
+
+    @impl true
+    def cleanup_available?, do: true
+
+    @impl true
+    def prepare(artifact, bundle, _opts), do: {:ok, identity(artifact, bundle, "unstaged")}
+
+    @impl true
+    def stage(artifact, bundle, _opts) do
+      attempt = Process.get(:artifact_worker_storage_attempt, 0) + 1
+      Process.put(:artifact_worker_storage_attempt, attempt)
+
+      case attempt do
+        1 -> {:error, :artifact_upload_failed}
+        _ -> {:ok, identity(artifact, bundle, "staged")}
+      end
+    end
+
+    @impl true
+    def resolve(_artifact, _opts), do: {:error, :not_used}
+
+    @impl true
+    def discard(_artifact, _opts), do: :ok
+
+    defp identity(artifact, bundle, state) do
+      hash = bundle[:content_hash] || bundle["content_hash"]
+      files = bundle[:files] || bundle["files"]
+
+      %{
+        storage_provider: "s3_media",
+        storage_bucket: "torus-simulations-test",
+        storage_identity_version: 2,
+        storage_key:
+          "generated-simulations/storage-v2/artifacts/#{artifact.id}/v#{artifact.version}/sha256/#{hash}/index.html",
+        storage_origin: "https://simulations.example.edu",
+        storage_state: state,
+        byte_size:
+          artifact.byte_size ||
+            Enum.reduce(files, 0, fn {_path, contents}, total -> total + byte_size(contents) end)
+      }
+    end
+  end
+
   setup do
     author = author_fixture()
     %{project: project} = project_fixture(author, "OpenStax enrichment lifecycle")
@@ -178,7 +227,7 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
         source_url: "https://openstax.org/details/books/chemistry-2e",
         book_slug: "chemistry-2e",
         status: :awaiting_lesson_approval,
-        plan_schema_version: 6
+        plan_schema_version: 7
       })
       |> Repo.insert()
 
@@ -238,7 +287,7 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
 
     refute changeset.valid?
     assert {message, _} = changeset.errors[:content_payload]
-    assert message =~ "Basic schema 5 or Advanced schema 6"
+    assert message =~ "Basic or Advanced schema 7"
   end
 
   test "proposal decisions cannot commit after the run leaves review", %{
@@ -294,6 +343,86 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
                preview.content_hash,
                author
              )
+  end
+
+  @tag capture_log: true
+  test "legacy S3 identities backfill once without rewriting their URL", %{
+    author: author,
+    run: run,
+    lesson: lesson
+  } do
+    {:ok, proposal} =
+      Enrichment.create_proposal(
+        run.id,
+        lesson.id,
+        proposal_attrs("generated_simulation", 1)
+      )
+
+    {:ok, proposal, spec} = prepare_generated_proposal(proposal, author)
+
+    {:ok, artifact} =
+      Enrichment.begin_artifact_generation(proposal.id, artifact_start_attrs(spec))
+
+    content_hash = String.duplicate("a", 64)
+    legacy_origin = "https://legacy-simulations.example.edu/torus-media"
+
+    legacy_key =
+      "generated-simulations/artifacts/#{artifact.id}/v#{artifact.version}/sha256/#{content_hash}/index.html"
+
+    staging_attrs =
+      preview_attrs("a")
+      |> Map.merge(%{
+        storage_state: "unstaged",
+        storage_provider: "s3_media",
+        storage_key: legacy_key,
+        storage_origin: legacy_origin,
+        storage_payload: %{
+          "files" => %{"index.html" => "legacy"},
+          "content_hash" => content_hash
+        }
+      })
+
+    assert {:ok, intent} =
+             Enrichment.record_artifact_staging_intent(artifact.id, staging_attrs)
+
+    assert intent.storage_bucket == nil
+    assert intent.storage_identity_version == nil
+
+    results =
+      1..2
+      |> Task.async_stream(
+        fn _index ->
+          SimulationStorageIdentityBackfill.run(
+            legacy_bucket: "torus-media",
+            object_exists?: fn "torus-media", ^legacy_key -> true end
+          )
+        end,
+        ordered: false
+      )
+      |> Enum.map(fn {:ok, {:ok, counts}} -> counts end)
+
+    assert Enum.sum(Enum.map(results, & &1.backfilled)) == 1
+
+    backfilled = Repo.get!(SimulationArtifact, artifact.id)
+    assert backfilled.storage_bucket == "torus-media"
+    assert backfilled.storage_identity_version == 1
+    assert backfilled.storage_key == legacy_key
+    assert backfilled.storage_origin == legacy_origin
+
+    from(current in SimulationArtifact, where: current.id == ^artifact.id)
+    |> Repo.update_all(set: [storage_bucket: nil, storage_identity_version: nil])
+
+    assert {:ok, %{missing: 1, backfilled: 0}} =
+             SimulationStorageIdentityBackfill.run(
+               legacy_bucket: "torus-media",
+               object_exists?: fn "torus-media", ^legacy_key -> false end
+             )
+
+    unavailable = Repo.get!(SimulationArtifact, artifact.id)
+    assert unavailable.storage_bucket == nil
+    assert unavailable.storage_identity_version == nil
+    assert unavailable.storage_key == legacy_key
+    assert unavailable.storage_origin == legacy_origin
   end
 
   test "synchronizes at most three ranked proposals and locks after governance begins", %{
@@ -595,6 +724,75 @@ defmodule Oli.OpenStax.CourseImport.EnrichmentTest do
 
     assert saved.generation_metadata["author_feedback"] ==
              "Show the evidence table before the chart."
+  end
+
+  test "generation worker retries only storage from its durable bundle checkpoint", %{
+    author: author,
+    run: run,
+    lesson: lesson
+  } do
+    previous_generator = Application.get_env(:oli, :openstax_enrichment_generator)
+    previous_sandbox = Application.get_env(:oli, :openstax_enrichment_sandbox)
+    previous_storage = Application.get_env(:oli, :openstax_enrichment_artifact_storage)
+
+    Application.put_env(:oli, :openstax_enrichment_generator, FakeWorkerGenerator)
+    Application.put_env(:oli, :openstax_enrichment_sandbox, FakeWorkerSandbox)
+    Application.put_env(:oli, :openstax_enrichment_artifact_storage, RetryOnceWorkerStorage)
+
+    on_exit(fn ->
+      Application.put_env(:oli, :openstax_enrichment_generator, previous_generator)
+      Application.put_env(:oli, :openstax_enrichment_sandbox, previous_sandbox)
+      Application.put_env(:oli, :openstax_enrichment_artifact_storage, previous_storage)
+    end)
+
+    Process.put(:artifact_worker_generator_attempt, 0)
+    Process.put(:artifact_worker_sandbox_attempt, 0)
+    Process.put(:artifact_worker_storage_attempt, 0)
+
+    {:ok, proposal} =
+      Enrichment.create_proposal(
+        run.id,
+        lesson.id,
+        proposal_attrs("generated_simulation", 1)
+      )
+
+    {:ok, proposal, spec} = prepare_generated_proposal(proposal, author)
+
+    {:ok, artifact} =
+      Enrichment.begin_artifact_generation(proposal.id, artifact_start_attrs(spec))
+
+    first_job = %Oban.Job{
+      args: %{"artifact_id" => artifact.id, "run_id" => run.id},
+      attempt: 1,
+      max_attempts: 3
+    }
+
+    assert {:error, :artifact_upload_failed} = SimulationGenerationWorker.perform(first_job)
+    assert Process.get(:artifact_worker_generator_attempt) == 2
+    assert Process.get(:artifact_worker_sandbox_attempt) == 2
+    assert Process.get(:artifact_worker_storage_attempt) == 1
+
+    checkpoint = Repo.get!(SimulationArtifact, artifact.id)
+    assert checkpoint.status == "generating"
+    assert checkpoint.storage_state == "unstaged"
+    assert checkpoint.storage_bucket == "torus-simulations-test"
+    assert checkpoint.storage_identity_version == 2
+    assert is_map(checkpoint.storage_payload)
+    assert is_map(checkpoint.storage_payload["files"])
+
+    second_job = %{first_job | attempt: 2}
+    assert :ok = SimulationGenerationWorker.perform(second_job)
+
+    assert Process.get(:artifact_worker_generator_attempt) == 2
+    assert Process.get(:artifact_worker_sandbox_attempt) == 2
+    assert Process.get(:artifact_worker_storage_attempt) == 2
+
+    saved = Repo.get!(SimulationArtifact, artifact.id)
+    assert saved.status == "ready_for_review"
+    assert saved.storage_state == "staged"
+    assert saved.storage_payload == nil
+    assert saved.storage_bucket == "torus-simulations-test"
+    assert saved.storage_identity_version == 2
   end
 
   test "approved incomplete generation can be cancelled without blocking core compilation", %{

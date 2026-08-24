@@ -4,55 +4,42 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentPolicyTest do
   alias Oli.GenAI.Agent.Decision
   alias Oli.GenAI.Agent.Server.Step
 
-  alias Oli.OpenStax.CourseImport.{
-    QuestionAgentPolicy,
-    QuestionAgentToolBroker,
-    QuestionAgentValidator
-  }
+  alias Oli.OpenStax.CourseImport.{QuestionAgentPolicy, QuestionAgentToolBroker}
 
-  test "exposes only whole-set review and submission tools" do
+  test "exposes only the atomic whole-set validation and submission tool" do
     assert QuestionAgentToolBroker.describe() |> Enum.map(& &1.name) == [
-             "review_openstax_questions",
-             "submit_openstax_questions"
+             "validate_and_submit_openstax_questions"
            ]
 
     refute Enum.any?(QuestionAgentToolBroker.describe(), &(&1.name == "create_activity"))
   end
 
-  test "requires a successful review of the exact candidate before submission" do
-    candidate = %{
-      "count_rationale" => "One focused objective needs one high-value transfer question.",
-      "questions_payload" => %{"items" => []}
-    }
-
-    submit = %Decision{
+  test "allows at most two bounded candidate validations" do
+    validate = %Decision{
       next_action: "tool",
-      tool_name: "submit_openstax_questions",
-      arguments: candidate
+      tool_name: "validate_and_submit_openstax_questions",
+      arguments: %{}
     }
 
-    assert {false, reason} = QuestionAgentPolicy.allowed_action?(submit, %{steps: []})
-    assert reason =~ "Review this exact candidate"
+    assert true = QuestionAgentPolicy.allowed_action?(validate, %{steps: []})
 
-    reviewed = %Step{
-      num: 1,
-      action: %{type: "tool", name: "review_openstax_questions", args: candidate},
-      observation: %{
-        valid: true,
-        candidate_hash: QuestionAgentValidator.candidate_hash(candidate)
-      }
-    }
+    attempts =
+      Enum.map(1..2, fn num ->
+        %Step{
+          num: num,
+          action: %{type: "tool", name: "validate_and_submit_openstax_questions", args: %{}},
+          observation: %{valid: false, accepted: false}
+        }
+      end)
 
-    assert true = QuestionAgentPolicy.allowed_action?(submit, %{steps: [reviewed]})
-
-    changed = put_in(submit.arguments["count_rationale"], "A different rationale and candidate.")
-    assert {false, _reason} = QuestionAgentPolicy.allowed_action?(changed, %{steps: [reviewed]})
+    assert {false, reason} = QuestionAgentPolicy.allowed_action?(validate, %{steps: attempts})
+    assert reason =~ "two-candidate"
   end
 
   test "terminates successfully only after an accepted submission" do
     accepted = %Step{
       num: 2,
-      action: %{type: "tool", name: "submit_openstax_questions", args: %{}},
+      action: %{type: "tool", name: "validate_and_submit_openstax_questions", args: %{}},
       observation: %{accepted: true}
     }
 

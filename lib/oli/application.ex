@@ -28,6 +28,7 @@ defmodule Oli.Application do
 
         # Starts telemetry
         OliWeb.Telemetry,
+        Oli.OpenStax.CourseImport.Enrichment.SimulationDeliveryReadiness,
         Oli.Analytics.XAPI.UploadPipeline,
 
         # Start the endpoint when the application starts
@@ -154,6 +155,7 @@ defmodule Oli.Application do
         Task.Supervisor.start_child(Oli.TaskSupervisor, fn ->
           Process.sleep(1_000)
           safe_inventory_recovery()
+          safe_simulation_storage_identity_backfill()
           safe_course_import_recovery()
         end)
 
@@ -236,6 +238,22 @@ defmodule Oli.Application do
     exception ->
       Logger.error(
         "OpenStax course import recovery failed: #{Exception.format(:error, exception, __STACKTRACE__)}"
+      )
+
+      :ok
+  end
+
+  defp safe_simulation_storage_identity_backfill do
+    unless Application.get_env(:oli, :env) == :test do
+      case Oli.OpenStax.CourseImport.Enrichment.SimulationStorageIdentityBackfill.run() do
+        {:ok, _counts} -> :ok
+        {:error, reason} -> Logger.error("Simulation storage backfill failed: #{inspect(reason)}")
+      end
+    end
+  rescue
+    exception ->
+      Logger.error(
+        "Simulation storage backfill failed: #{Exception.format(:error, exception, __STACKTRACE__)}"
       )
 
       :ok

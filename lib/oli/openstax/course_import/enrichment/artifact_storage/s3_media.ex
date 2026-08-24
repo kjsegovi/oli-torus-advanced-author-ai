@@ -1,6 +1,6 @@
 defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media do
   @moduledoc """
-  Stores immutable simulation bundles in the configured Torus media bucket.
+  Stores immutable simulation bundles in a dedicated S3-compatible bucket.
 
   Every object lives below a SHA-256 content-addressed prefix. The configured
   generated-simulation origin remains separate from planner content and is the
@@ -16,30 +16,81 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media do
 
   @hash_pattern ~r/\A[0-9a-f]{64}\z/
   @storage_provider "s3_media"
+  @legacy_identity_version 1
+  @current_identity_version 2
+  @base_csp "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; form-action 'none'; base-uri 'none'; frame-src 'none'; worker-src 'none'"
 
   @impl true
   def available? do
-    present?(Application.get_env(:oli, :s3_media_bucket_name)) and
+    present?(configured_bucket()) and
       valid_origin?(configured_origin()) and dedicated_origin?(configured_origin()) and
-      delivery_csp_enforced?()
+      delivery_headers_enforced?() and delivery_ready?()
   rescue
     _ -> false
   end
 
   @impl true
   def cleanup_available? do
-    present?(Application.get_env(:oli, :s3_media_bucket_name))
+    present?(configured_bucket()) or present?(legacy_bucket())
   rescue
     _ -> false
   end
 
+  @doc "Authoritative CDN response-header contract for approved simulation objects."
+  def required_response_headers(parent_origins \\ configured_parent_origins()) do
+    frame_ancestors =
+      parent_origins
+      |> Enum.map(&normalize_origin/1)
+      |> Enum.reject(&is_nil/1)
+      |> Enum.uniq()
+      |> Enum.join(" ")
+
+    %{
+      "content-security-policy" => @base_csp <> "; frame-ancestors 'self' " <> frame_ancestors,
+      "x-content-type-options" => "nosniff",
+      "referrer-policy" => "no-referrer",
+      "permissions-policy" =>
+        "camera=(), microphone=(), geolocation=(), payment=(), usb=(), display-capture=()",
+      "cache-control" => "public, max-age=31536000, immutable"
+    }
+  end
+
+  @doc "Validates headers observed by a staging or production CDN smoke request."
+  def validate_response_headers(headers, opts \\ [])
+
+  def validate_response_headers(headers, opts) when is_list(headers) or is_map(headers) do
+    observed =
+      headers
+      |> Enum.map(fn {key, value} -> {String.downcase(to_string(key)), to_string(value)} end)
+      |> Map.new()
+
+    required =
+      required_response_headers(Keyword.get(opts, :parent_origins, configured_parent_origins()))
+
+    case Enum.reject(required, fn {key, value} -> observed[key] == value end) do
+      [] -> :ok
+      missing -> {:error, {:simulation_cdn_headers_invalid, Enum.map(missing, &elem(&1, 0))}}
+    end
+  end
+
+  def validate_response_headers(_, _), do: {:error, :simulation_cdn_headers_invalid}
+
   @impl true
   def stage(%SimulationArtifact{} = artifact, bundle, opts)
       when is_map(bundle) and is_list(opts) do
-    with {:ok, identity} <- prepare(artifact, bundle, opts),
+    with true <- available?(),
+         {:ok, identity} <- storage_identity_for_stage(artifact, bundle, opts),
          {:ok, files} <- files(bundle),
          {:ok, content_hash} <- bundle_hash(bundle),
-         :ok <- upload_files(files, artifact.id, artifact.version, content_hash, opts) do
+         :ok <-
+           upload_files(
+             files,
+             artifact.id,
+             artifact.version,
+             content_hash,
+             identity.storage_bucket,
+             identity.storage_identity_version
+           ) do
       {:ok, Map.put(identity, :storage_state, "staged")}
     else
       false -> {:error, :artifact_storage_unavailable}
@@ -51,12 +102,60 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media do
 
   def stage(_, _, _), do: {:error, :invalid_input}
 
+  defp storage_identity_for_stage(
+         %SimulationArtifact{
+           storage_provider: @storage_provider,
+           storage_state: "unstaged"
+         } = artifact,
+         bundle,
+         opts
+       ) do
+    with {:ok, content_hash} <- bundle_hash(bundle),
+         {:ok, bundle_files} <- files(bundle),
+         true <-
+           content_hash == artifact.content_hash and
+             hash_matches_files?(content_hash, bundle_files),
+         true <- present?(artifact.storage_bucket),
+         true <-
+           artifact.storage_identity_version in [
+             @legacy_identity_version,
+             @current_identity_version
+           ],
+         true <-
+           valid_storage_key?(
+             artifact.storage_identity_version,
+             artifact.storage_key,
+             artifact.id,
+             artifact.version,
+             artifact.content_hash
+           ),
+         true <- trusted_recorded_origin?(artifact, opts) do
+      {:ok,
+       %{
+         storage_provider: artifact.storage_provider,
+         storage_bucket: artifact.storage_bucket,
+         storage_identity_version: artifact.storage_identity_version,
+         storage_key: artifact.storage_key,
+         storage_origin: artifact.storage_origin,
+         storage_state: artifact.storage_state,
+         byte_size: artifact.byte_size
+       }}
+    else
+      false -> {:error, :artifact_storage_identity_invalid}
+      {:error, _} = error -> error
+    end
+  end
+
+  defp storage_identity_for_stage(artifact, bundle, opts), do: prepare(artifact, bundle, opts)
+
   @impl true
   def prepare(%SimulationArtifact{} = artifact, bundle, opts)
       when is_map(bundle) and is_list(opts) do
     with true <- available?(),
          storage_origin <- origin(opts),
+         storage_bucket <- bucket(opts),
          true <- valid_origin?(storage_origin) and dedicated_origin?(storage_origin),
+         true <- present?(storage_bucket),
          {:ok, files} <- files(bundle),
          {:ok, content_hash} <- bundle_hash(bundle),
          true <- hash_matches_files?(content_hash, files),
@@ -65,7 +164,16 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media do
       {:ok,
        %{
          storage_provider: @storage_provider,
-         storage_key: storage_key(artifact.id, artifact.version, content_hash, "index.html"),
+         storage_bucket: storage_bucket,
+         storage_identity_version: @current_identity_version,
+         storage_key:
+           storage_key(
+             @current_identity_version,
+             artifact.id,
+             artifact.version,
+             content_hash,
+             "index.html"
+           ),
          storage_origin: storage_origin,
          storage_state: "unstaged",
          byte_size:
@@ -84,16 +192,22 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media do
   @impl true
   def resolve(%SimulationArtifact{} = artifact, opts) when is_list(opts) do
     with true <- artifact.storage_provider == @storage_provider,
+         true <- present?(artifact.storage_bucket),
+         true <-
+           artifact.storage_identity_version in [
+             @legacy_identity_version,
+             @current_identity_version
+           ],
          true <-
            valid_storage_key?(
+             artifact.storage_identity_version,
              artifact.storage_key,
              artifact.id,
              artifact.version,
              artifact.content_hash
            ),
-         configured_origin <- origin(opts),
-         true <- same_origin?(configured_origin, artifact.storage_origin) do
-      {:ok, String.trim_trailing(configured_origin, "/") <> "/" <> artifact.storage_key}
+         true <- trusted_recorded_origin?(artifact, opts) do
+      {:ok, String.trim_trailing(artifact.storage_origin, "/") <> "/" <> artifact.storage_key}
     else
       false -> {:error, :artifact_storage_identity_invalid}
     end
@@ -104,9 +218,23 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media do
   @impl true
   def discard(%SimulationArtifact{} = artifact, _opts) do
     with true <- artifact.storage_provider == @storage_provider,
+         true <- present?(artifact.storage_bucket),
+         true <-
+           artifact.storage_identity_version in [
+             @legacy_identity_version,
+             @current_identity_version
+           ],
          true <- valid_hash?(artifact.content_hash),
          paths when is_list(paths) and paths != [] <- manifest_paths(artifact.bundle_manifest),
-         :ok <- delete_paths(paths, artifact.id, artifact.version, artifact.content_hash) do
+         :ok <-
+           delete_paths(
+             paths,
+             artifact.id,
+             artifact.version,
+             artifact.content_hash,
+             artifact.storage_bucket,
+             artifact.storage_identity_version
+           ) do
       :ok
     else
       false -> {:error, :artifact_storage_identity_invalid}
@@ -119,16 +247,16 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media do
 
   def discard(_, _), do: {:error, :invalid_input}
 
-  defp upload_files(files, artifact_id, version, content_hash, opts) do
-    bucket = Keyword.get(opts, :bucket, Application.get_env(:oli, :s3_media_bucket_name))
-
+  defp upload_files(files, artifact_id, version, content_hash, bucket, identity_version) do
     result =
       files
       |> Enum.sort_by(&elem(&1, 0))
       |> Enum.reduce_while({:ok, []}, fn {path, contents}, {:ok, uploaded} ->
         request =
-          S3.put_object(bucket, storage_key(artifact_id, version, content_hash, path), contents,
-            acl: :public_read,
+          S3.put_object(
+            bucket,
+            storage_key(identity_version, artifact_id, version, content_hash, path),
+            contents,
             content_type: MIME.from_path(path),
             cache_control: "public, max-age=31536000, immutable"
           )
@@ -147,26 +275,18 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media do
         :ok
 
       {:error, reason, uploaded} ->
-        _ = delete_paths(uploaded, artifact_id, version, content_hash, bucket)
+        _ = delete_paths(uploaded, artifact_id, version, content_hash, bucket, identity_version)
         {:error, reason}
     end
   end
 
-  defp delete_paths(paths, artifact_id, version, content_hash),
-    do:
-      delete_paths(
-        paths,
-        artifact_id,
-        version,
-        content_hash,
-        Application.get_env(:oli, :s3_media_bucket_name)
-      )
-
-  defp delete_paths(paths, artifact_id, version, content_hash, bucket) do
+  defp delete_paths(paths, artifact_id, version, content_hash, bucket, identity_version) do
     paths
     |> Enum.reduce_while(:ok, fn path, :ok ->
       case bucket
-           |> S3.delete_object(storage_key(artifact_id, version, content_hash, path))
+           |> S3.delete_object(
+             storage_key(identity_version, artifact_id, version, content_hash, path)
+           )
            |> HTTP.aws().request() do
         {:ok, %{status_code: status}} when status in [200, 202, 204] -> {:cont, :ok}
         _response -> {:halt, {:error, :artifact_discard_failed}}
@@ -224,16 +344,20 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media do
 
   defp manifest_paths(_), do: []
 
-  defp storage_key(artifact_id, version, content_hash, path),
+  defp storage_key(@legacy_identity_version, artifact_id, version, content_hash, path),
     do:
       "generated-simulations/artifacts/#{artifact_id}/v#{version}/sha256/#{content_hash}/#{path}"
 
-  defp valid_storage_key?(key, artifact_id, version, content_hash)
-       when is_binary(key) and is_binary(artifact_id) and artifact_id != "" and
-              is_integer(version) and is_binary(content_hash),
-       do: key == storage_key(artifact_id, version, content_hash, "index.html")
+  defp storage_key(@current_identity_version, artifact_id, version, content_hash, path),
+    do:
+      "generated-simulations/storage-v2/artifacts/#{artifact_id}/v#{version}/sha256/#{content_hash}/#{path}"
 
-  defp valid_storage_key?(_, _, _, _), do: false
+  defp valid_storage_key?(identity_version, key, artifact_id, version, content_hash)
+       when is_binary(key) and is_binary(artifact_id) and artifact_id != "" and
+              is_integer(version) and is_binary(content_hash) and identity_version in [1, 2],
+       do: key == storage_key(identity_version, artifact_id, version, content_hash, "index.html")
+
+  defp valid_storage_key?(_, _, _, _, _), do: false
 
   defp validate_artifact_identity(%SimulationArtifact{id: id})
        when is_binary(id) and id != "",
@@ -250,18 +374,59 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage.S3Media do
 
   defp origin(opts), do: Keyword.get(opts, :origin, configured_origin())
 
+  defp bucket(opts), do: Keyword.get(opts, :bucket, configured_bucket())
+
   defp configured_origin do
     Application.get_env(:oli, :openstax_generated_simulation_origin)
   end
 
-  defp delivery_csp_enforced? do
-    Application.get_env(:oli, :env) in [:dev, :test] or
-      Application.get_env(:oli, :openstax_generated_simulation_csp_header_enforced, false) ==
-        true
+  defp configured_bucket do
+    Application.get_env(:oli, :openstax_generated_simulation_bucket_name) || legacy_bucket()
   end
 
-  defp same_origin?(left, right) do
-    normalize_origin(left) == normalize_origin(right) and not is_nil(normalize_origin(left))
+  defp legacy_bucket, do: Application.get_env(:oli, :s3_media_bucket_name)
+
+  defp delivery_ready? do
+    if Application.get_env(
+         :oli,
+         :openstax_generated_simulation_readiness_required,
+         false
+       ) do
+      Oli.OpenStax.CourseImport.Enrichment.SimulationDeliveryReadiness.ready?()
+    else
+      true
+    end
+  end
+
+  defp delivery_headers_enforced? do
+    Application.get_env(:oli, :env) in [:dev, :test] or
+      (Application.get_env(:oli, :openstax_generated_simulation_csp_header_enforced, false) ==
+         true and
+         Application.get_env(
+           :oli,
+           :openstax_generated_simulation_response_headers_enforced,
+           false
+         ) == true and configured_parent_origins() != [])
+  end
+
+  defp configured_parent_origins do
+    Application.get_env(:oli, :openstax_generated_simulation_frame_ancestors, [])
+    |> List.wrap()
+  end
+
+  defp trusted_recorded_origin?(artifact, opts) do
+    recorded = normalize_origin(artifact.storage_origin)
+
+    configured_origins =
+      opts
+      |> Keyword.get(:trusted_origins, [Keyword.get(opts, :origin, configured_origin())])
+      |> List.wrap()
+      |> Enum.map(&normalize_origin/1)
+      |> Enum.reject(&is_nil/1)
+
+    not is_nil(recorded) and
+      (recorded in configured_origins or
+         artifact.storage_identity_version == @legacy_identity_version)
   end
 
   defp valid_origin?(value), do: not is_nil(normalize_origin(value))

@@ -1,9 +1,9 @@
-defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
+defmodule Oli.OpenStax.CourseImport.BasicPipelineV7 do
   @moduledoc """
-  Resumable v5 Basic lesson workflow: architect, independent content critic,
+  Resumable v7 Basic lesson workflow: architect, independent content critic,
   architect repair, question writer, independent question critic, and writer
-  repair. Each specialist receives one initial candidate and at most three
-  repair rounds. Valid but unapproved semantic candidates are preserved for
+  repair. Each specialist receives one initial candidate and at most one
+  targeted repair. Valid but unapproved semantic candidates are preserved for
   author review instead of being reported as crashed lesson jobs.
   """
 
@@ -11,13 +11,15 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
   alias Oli.GenAI.Execution
 
   alias Oli.OpenStax.CourseImport.{
-    BasicPlanV5,
+    AIUsageLedger,
+    BasicPlanV7,
+    ModelRoutingPolicy,
     QualityCritic,
-    QuestionAgent
+    QuestionAgent,
+    StructuredPatch
   }
 
-  @feature :openstax_course_import
-  @max_repair_rounds 3
+  @max_repair_rounds 1
   @max_candidates @max_repair_rounds + 1
 
   @spec plan(map(), pos_integer(), map(), keyword()) ::
@@ -58,7 +60,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
     end
   end
 
-  def plan(_lesson, _index, _services, _opts), do: {:error, :invalid_v5_pipeline_context}
+  def plan(_lesson, _index, _services, _opts), do: {:error, :invalid_v7_pipeline_context}
 
   defp content_stage(lesson, index, services, checkpoint, opts) do
     cond do
@@ -98,7 +100,18 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
         )
 
       true ->
-        architect_loop(lesson, index, services, opts, 1, nil, [], [], nil, false)
+        architect_loop(
+          lesson,
+          index,
+          services,
+          opts,
+          1,
+          initial_repair(lesson, "content"),
+          [],
+          [],
+          nil,
+          false
+        )
     end
   end
 
@@ -115,12 +128,13 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
          resumed_from_checkpoint
        ) do
     with {:ok, candidate, usage} <-
-           architect_candidate(lesson, index, services.architect, repair_context, opts) do
+           architect_candidate(lesson, index, services.architect, repair_context, attempt, opts) do
       architect_attempt = %{"attempt" => attempt, "model_usage" => stringify(usage)}
 
-      case BasicPlanV5.build(candidate, lesson, index) do
+      case BasicPlanV7.build(candidate, lesson, index) do
         {:ok, content} ->
-          with {:ok, review} <- content_critic(lesson, content, services.critic, opts) do
+          with {:ok, review} <-
+                 content_critic(lesson, content, services.critic, attempt, opts) do
             attempts = attempts ++ [architect_attempt]
             reviews = reviews ++ [Map.put(review, "attempt", attempt)]
 
@@ -135,16 +149,68 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
                  }}
 
               true ->
+                partition =
+                  QualityCritic.partition_repair_findings(review, :basic_content_architect)
+
+                review =
+                  QualityCritic.demote_source_owned_findings(
+                    review,
+                    partition.source_resolvable ++ partition.source_advisory
+                  )
+
+                reviews = List.replace_at(reviews, -1, Map.put(review, "attempt", attempt))
+                repairable_findings = partition.repairable
+                fingerprint = QualityCritic.fingerprint_findings(repairable_findings)
+
                 with :ok <-
                        checkpoint(opts, "content_repair_pending", %{
                          content_attempts: attempts,
                          content_reviews: reviews,
                          repair_candidate: candidate,
-                         repair_findings: QualityCritic.repair_findings(review),
-                         previous_fingerprint: QualityCritic.fingerprint(review),
+                         repair_findings: repairable_findings,
+                         previous_fingerprint: fingerprint,
                          next_attempt: attempt + 1
                        }) do
                   cond do
+                    partition.source_resolvable != [] and repairable_findings == [] ->
+                      {:ok,
+                       %{
+                         content_payload: content,
+                         content_reviews: reviews,
+                         content_attempts: attempts,
+                         resumed_from_checkpoint: resumed_from_checkpoint
+                       }}
+
+                    repairable_findings == [] ->
+                      {:ok,
+                       attention_content_result(
+                         content,
+                         attempts,
+                         reviews,
+                         resumed_from_checkpoint,
+                         :content_critic_gate_failed
+                       )}
+
+                    full_critic_count(reviews) >= 2 ->
+                      {:ok,
+                       attention_content_result(
+                         content,
+                         attempts,
+                         reviews,
+                         resumed_from_checkpoint,
+                         :content_quality_re_review_failed
+                       )}
+
+                    attempt > 1 and fingerprint == previous_fingerprint ->
+                      {:ok,
+                       attention_content_result(
+                         content,
+                         attempts,
+                         reviews,
+                         resumed_from_checkpoint,
+                         :content_quality_stalled
+                       )}
+
                     attempt >= @max_candidates ->
                       {:ok,
                        attention_content_result(
@@ -155,16 +221,6 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
                          :content_quality_exhausted
                        )}
 
-                    QualityCritic.fingerprint(review) == previous_fingerprint ->
-                      {:ok,
-                       attention_content_result(
-                         content,
-                         attempts,
-                         reviews,
-                         resumed_from_checkpoint,
-                         :content_quality_stalled
-                       )}
-
                     true ->
                       architect_loop(
                         lesson,
@@ -172,10 +228,10 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
                         services,
                         opts,
                         attempt + 1,
-                        %{candidate: candidate, findings: QualityCritic.repair_findings(review)},
+                        %{candidate: candidate, findings: repairable_findings},
                         attempts,
                         reviews,
-                        QualityCritic.fingerprint(review),
+                        fingerprint,
                         resumed_from_checkpoint
                       )
                   end
@@ -200,13 +256,14 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
                        next_attempt: attempt + 1
                      }) do
                 cond do
+                  attempt > 1 and
+                      QualityCritic.fingerprint(review) == previous_fingerprint ->
+                    {:error,
+                     {:content_quality_stalled, quality_failure(attempt, review, reviews)}}
+
                   attempt >= @max_candidates ->
                     {:error,
                      {:content_quality_exhausted, quality_failure(attempt, review, reviews)}}
-
-                  QualityCritic.fingerprint(review) == previous_fingerprint ->
-                    {:error,
-                     {:content_quality_stalled, quality_failure(attempt, review, reviews)}}
 
                   true ->
                     architect_loop(
@@ -294,7 +351,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
           services,
           Keyword.put(opts, :content_checkpoint_state, content_result),
           1,
-          nil,
+          initial_repair(lesson, "questions"),
           [],
           [],
           nil,
@@ -320,12 +377,29 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
 
     writer_opts =
       opts
-      |> Keyword.take([:author_id, :project_id, :llm_bridge, :agent_start_fun, :agent_await_fun])
+      |> Keyword.take([
+        :author_id,
+        :project_id,
+        :run_id,
+        :lesson_id,
+        :llm_bridge,
+        :agent_start_fun,
+        :agent_await_fun
+      ])
+      |> Keyword.put(:authoring_mode, "basic")
       |> Keyword.put(:objective_ledger, objective_ledger)
       |> Keyword.put(:question_slots, content["question_slots"])
       |> maybe_put_repair_context(repair_context)
 
-    with {:ok, result} <- writer_fun.(lesson, content, services.question_writer, writer_opts),
+    writer_service =
+      ModelRoutingPolicy.for_attempt(
+        services.question_writer,
+        attempt,
+        :basic_question_writer,
+        BasicPlanV7.prompt_contract(lesson)
+      )
+
+    with {:ok, result} <- writer_fun.(lesson, content, writer_service, writer_opts),
          {:ok, review} <-
            question_critic(
              lesson,
@@ -333,6 +407,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
              result.questions_payload,
              objective_ledger,
              services.question_critic,
+             attempt,
              opts
            ) do
       attempts =
@@ -359,6 +434,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
 
         true ->
           content_state = Keyword.get(opts, :content_checkpoint_state, %{})
+          repair_findings = QualityCritic.repair_findings(review)
 
           with :ok <-
                  checkpoint(opts, "question_repair_pending", %{
@@ -369,11 +445,42 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
                    question_attempts: attempts,
                    question_reviews: reviews,
                    writer_metadata: result.generation_metadata,
-                   repair_findings: QualityCritic.repair_findings(review),
+                   repair_findings: repair_findings,
                    previous_fingerprint: QualityCritic.fingerprint(review),
                    next_attempt: attempt + 1
                  }) do
             cond do
+              repair_findings == [] ->
+                {:ok,
+                 attention_question_result(
+                   result,
+                   attempts,
+                   reviews,
+                   resumed_from_checkpoint,
+                   :question_critic_gate_failed
+                 )}
+
+              full_critic_count(reviews) >= 2 ->
+                {:ok,
+                 attention_question_result(
+                   result,
+                   attempts,
+                   reviews,
+                   resumed_from_checkpoint,
+                   :question_quality_re_review_failed
+                 )}
+
+              attempt > 1 and
+                  QualityCritic.fingerprint(review) == previous_fingerprint ->
+                {:ok,
+                 attention_question_result(
+                   result,
+                   attempts,
+                   reviews,
+                   resumed_from_checkpoint,
+                   :question_quality_stalled
+                 )}
+
               attempt >= @max_candidates ->
                 {:ok,
                  attention_question_result(
@@ -382,16 +489,6 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
                    reviews,
                    resumed_from_checkpoint,
                    :question_quality_exhausted
-                 )}
-
-              QualityCritic.fingerprint(review) == previous_fingerprint ->
-                {:ok,
-                 attention_question_result(
-                   result,
-                   attempts,
-                   reviews,
-                   resumed_from_checkpoint,
-                   :question_quality_stalled
                  )}
 
               true ->
@@ -416,15 +513,17 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
     end
   end
 
-  defp architect_candidate(lesson, index, service_config, repair_context, opts) do
+  defp architect_candidate(lesson, index, service_config, repair_context, attempt, opts) do
+    contract = BasicPlanV7.prompt_contract(lesson)
+
     messages = [
       Message.new(:system, architect_system_prompt()),
-      Message.new(:user, Jason.encode!(BasicPlanV5.prompt_contract(lesson)))
+      Message.new(:user, Jason.encode!(contract))
     ]
 
     messages =
       case repair_context do
-        %{candidate: candidate, findings: findings} ->
+        %{candidate: candidate, findings: findings} = repair ->
           messages ++
             [
               Message.new(:assistant, Jason.encode!(candidate)),
@@ -432,8 +531,9 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
                 :user,
                 Jason.encode!(%{
                   "required_action" =>
-                    "Repair every critic finding and return the complete v5 organization object.",
-                  "critic_findings" => findings
+                    "Return only a bounded JSON patch as {\"patch\":[{\"op\":\"add|replace|remove\",\"path\":\"/...\",\"value\":...}]}. Repair every finding and preserve unrelated fields. Allowed roots: #{Enum.join(StructuredPatch.allowed_roots(:basic_content_architect), ", ")}.",
+                  "critic_findings" => findings,
+                  "author_feedback" => repair[:author_feedback]
                 })
               )
             ]
@@ -442,15 +542,40 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
           messages
       end
 
-    request_ctx = %{
-      request_type: :generate,
-      feature: @feature,
-      phase: :v5_content_architect,
-      lesson_index: index
-    }
+    {service_config, ledger_role} =
+      if is_map(repair_context) do
+        {
+          ModelRoutingPolicy.service_config(service_config, :repair_patch_writer,
+            first_pass: false,
+            cache_material: contract
+          ),
+          :repair_patch_writer
+        }
+      else
+        {
+          ModelRoutingPolicy.for_attempt(
+            service_config,
+            attempt,
+            :basic_content_architect,
+            contract
+          ),
+          :basic_content_architect
+        }
+      end
+
+    request_ctx =
+      opts
+      |> Keyword.put(:authoring_mode, "basic")
+      |> AIUsageLedger.request_context(ledger_role, %{
+        candidate_number: attempt,
+        retry_category: if(attempt > 1, do: "contract_repair"),
+        finding_fingerprint:
+          repair_context && QualityCritic.fingerprint_findings(repair_context.findings)
+      })
+      |> Map.put(:lesson_index, index)
 
     execution_fun =
-      Keyword.get(opts, :v5_architect_execution_fun, &Execution.generate_with_metadata/4)
+      Keyword.get(opts, :v7_architect_execution_fun, &Execution.generate_with_metadata/4)
 
     result =
       case Function.info(execution_fun, :arity) do
@@ -460,28 +585,69 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
 
     with {:ok, %{content: content, metadata: metadata}} <- result,
          {:ok, decoded} <- Jason.decode(strip_code_fence(content)),
-         true <- is_map(decoded) do
-      {:ok, decoded, metadata || %{}}
+         true <- is_map(decoded),
+         {:ok, candidate} <- repaired_candidate(decoded, repair_context, :basic_content_architect) do
+      {:ok, candidate, metadata || %{}}
     else
-      false -> {:error, :invalid_v5_architect_response}
-      {:error, reason} -> {:error, {:v5_architect_failed, reason}}
-      other -> {:error, {:v5_architect_failed, {:invalid_response, other}}}
+      false ->
+        {:error, :invalid_v7_architect_response}
+
+      {:error, findings} when is_list(findings) ->
+        {:error, {:invalid_v7_repair_patch, findings}}
+
+      {:error, reason} ->
+        {:error, {:v7_architect_failed, reason}}
+
+      other ->
+        {:error, {:v7_architect_failed, {:invalid_response, other}}}
     end
   end
 
-  defp content_critic(lesson, content, service_config, opts) do
+  defp repaired_candidate(decoded, nil, _owner), do: {:ok, decoded}
+
+  defp repaired_candidate(decoded, %{candidate: candidate}, owner),
+    do: StructuredPatch.apply(candidate, decoded, owner)
+
+  defp content_critic(lesson, content, service_config, attempt, opts) do
     critic_fun = Keyword.get(opts, :content_critic_fun, &QualityCritic.review_content/4)
-    critic_fun.(lesson, content, service_config, critic_opts(opts))
+
+    service_config =
+      ModelRoutingPolicy.for_attempt(
+        service_config,
+        attempt,
+        :basic_content_critic,
+        BasicPlanV7.prompt_contract(lesson)
+      )
+
+    critic_fun.(lesson, content, service_config, critic_opts(opts, attempt, "basic"))
   end
 
-  defp question_critic(lesson, content, questions, ledger, service_config, opts) do
+  defp question_critic(lesson, content, questions, ledger, service_config, attempt, opts) do
     critic_fun = Keyword.get(opts, :question_critic_fun, &QualityCritic.review_questions/6)
-    critic_fun.(lesson, content, questions, ledger, service_config, critic_opts(opts))
+
+    service_config =
+      ModelRoutingPolicy.for_attempt(
+        service_config,
+        attempt,
+        :basic_question_critic,
+        BasicPlanV7.prompt_contract(lesson)
+      )
+
+    critic_fun.(
+      lesson,
+      content,
+      questions,
+      ledger,
+      service_config,
+      critic_opts(opts, attempt, "basic")
+    )
   end
 
-  defp critic_opts(opts) do
+  defp critic_opts(opts, attempt, mode) do
     opts
-    |> Keyword.take([:critic_execution_fun])
+    |> Keyword.take([:critic_execution_fun, :run_id, :lesson_id])
+    |> Keyword.put(:candidate_number, attempt)
+    |> Keyword.put(:authoring_mode, mode)
   end
 
   defp checkpoint(opts, stage, payload) do
@@ -537,7 +703,7 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
     findings = List.wrap(content_review["findings"]) ++ List.wrap(question_review["findings"])
 
     %{
-      "pipeline" => "openstax_basic_v5",
+      "pipeline" => "openstax_basic_v7",
       "quality_gate" => %{
         "approved" =>
           QualityCritic.approved?(content_review) and QualityCritic.approved?(question_review),
@@ -685,6 +851,12 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
     }
   end
 
+  defp full_critic_count(reviews) do
+    Enum.count(reviews, fn review ->
+      get_in(review, ["model_usage", "strategy"]) != "deterministic_contract"
+    end)
+  end
+
   defp quality_failure(attempt, review, history) do
     %{
       "attempts" => attempt,
@@ -711,6 +883,34 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
     |> Keyword.put(:previous_questions_payload, context.questions_payload)
     |> Keyword.put(:critic_findings, context.findings)
   end
+
+  defp initial_repair(lesson, phase) do
+    context = lesson["repair_context"] || lesson[:repair_context] || %{}
+    candidates = context["previous_candidates"] || context[:previous_candidates] || %{}
+    phase_findings = context["phase_findings"] || context[:phase_findings] || %{}
+    candidate = phase_value(candidates, phase)
+
+    if is_map(candidate) and candidate != %{} do
+      case phase do
+        "questions" ->
+          %{
+            questions_payload: candidate,
+            findings: List.wrap(phase_value(phase_findings, phase)),
+            author_feedback: context["author_feedback"] || context[:author_feedback]
+          }
+
+        _ ->
+          %{
+            candidate: candidate,
+            findings: List.wrap(phase_value(phase_findings, phase)),
+            author_feedback: context["author_feedback"] || context[:author_feedback]
+          }
+      end
+    end
+  end
+
+  defp phase_value(values, "content"), do: values["content"] || values[:content]
+  defp phase_value(values, "questions"), do: values["questions"] || values[:questions]
 
   defp stringify(metadata) when is_map(metadata),
     do: Map.new(metadata, fn {key, value} -> {to_string(key), value} end)
@@ -754,6 +954,11 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV5 do
     what you learned 3. Prefer one strong checkpoint at a boundary; a single question
     slot may cover multiple related objective IDs. Avoid slots that would repeat an
     example, application, or another checkpoint.
+
+    When repair_context is present, this is a user-requested regeneration. Disposition
+    every supplied author-feedback item and generated-content critic finding in the new
+    candidate. Repair generated organization and transitions, but never alter the
+    authoritative source blocks to conceal a source-owned diagnostic.
 
     Return JSON only with: title; orientation {overview}; content_groups [{id,title,
     instructional_purpose,transition,source_block_ids}]; question_slots [{id,purpose,

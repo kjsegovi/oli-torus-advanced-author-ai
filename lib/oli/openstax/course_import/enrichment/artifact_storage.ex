@@ -11,6 +11,8 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactStorage do
 
   @type staged_identity :: %{
           required(:storage_provider) => String.t(),
+          optional(:storage_bucket) => String.t(),
+          optional(:storage_identity_version) => pos_integer(),
           required(:storage_key) => String.t(),
           required(:storage_origin) => String.t(),
           required(:storage_state) => String.t(),

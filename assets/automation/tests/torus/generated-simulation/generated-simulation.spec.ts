@@ -8,9 +8,12 @@ const runId = `-${Date.now()}`;
 const courseTitle = `Generated Simulation Course${runId}`;
 const studentEmail = `generated-simulation-student${runId}@example.com`;
 const simulationOrigin = 'http://generated-simulations.localhost:9000';
-const simulationPath =
+const legacySimulationPath =
   '/torus-media-dev/generated-simulations/artifacts/artifact-gas-pressure-v1/v1/sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
-const simulationUrl = `${simulationOrigin}${simulationPath}/index.html`;
+const versionTwoSimulationPath =
+  '/torus-media-dev/generated-simulations/storage-v2/artifacts/artifact-gas-pressure-v2/v2/sha256/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const legacySimulationUrl = `${simulationOrigin}${legacySimulationPath}/index.html`;
+const versionTwoSimulationUrl = `${simulationOrigin}${versionTwoSimulationPath}/index.html`;
 const scenarioPath = path.resolve(__dirname, './generated-simulation.scenario.yaml');
 const password = 'changeme123456';
 
@@ -89,12 +92,16 @@ test.describe('generated simulation delivery security and accessibility', () => 
     await expect(lessonLink).toBeVisible();
     await lessonLink.click();
 
-    await expect
-      .poll(() => page.frames().some((frame) => frame.url() === simulationUrl))
-      .toBe(true);
+    for (const simulationUrl of [legacySimulationUrl, versionTwoSimulationUrl]) {
+      await expect
+        .poll(() => page.frames().some((frame) => frame.url() === simulationUrl))
+        .toBe(true);
+    }
 
-    const simulationFrame = page.frames().find((frame) => frame.url() === simulationUrl);
+    const simulationFrame = page.frames().find((frame) => frame.url() === legacySimulationUrl);
+    const versionTwoFrame = page.frames().find((frame) => frame.url() === versionTwoSimulationUrl);
     expect(simulationFrame).toBeDefined();
+    expect(versionTwoFrame).toBeDefined();
 
     const frameElement = await simulationFrame!.frameElement();
     expect(await frameElement.getAttribute('title')).toBe('Gas pressure model');
@@ -109,6 +116,15 @@ test.describe('generated simulation delivery security and accessibility', () => 
     expect(accessibleDescription).toContain('Change volume and observe the resulting pressure.');
 
     await expect(simulationFrame!.locator('#capi-status')).toContainText('Connected');
+    await expect(versionTwoFrame!.locator('#capi-status')).toContainText('Connected');
+
+    const versionTwoFrameElement = await versionTwoFrame!.frameElement();
+    expect(await versionTwoFrameElement.getAttribute('title')).toBe(
+      'Gas pressure model, storage version 2',
+    );
+    expect(await versionTwoFrameElement.getAttribute('sandbox')).toBe('allow-scripts');
+    expect(await versionTwoFrameElement.getAttribute('allow')).toBe('');
+    expect(await versionTwoFrameElement.getAttribute('referrerpolicy')).toBe('no-referrer');
 
     const slider = simulationFrame!.getByRole('slider', { name: /Model setting/i });
     await slider.focus();

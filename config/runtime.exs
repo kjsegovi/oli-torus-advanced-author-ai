@@ -40,14 +40,11 @@ runtime_env =
       end
   end
 
-openstax_advanced_pages_v6_default =
-  if runtime_env == :dev, do: "true", else: "false"
-
 config :oli,
-       :openstax_advanced_pages_v6_enabled,
+       :openstax_advanced_pages_enabled,
        get_env_as_boolean.(
-         "OPENSTAX_ADVANCED_PAGES_V6_ENABLED",
-         openstax_advanced_pages_v6_default
+         "OPENSTAX_ADVANCED_PAGES_ENABLED",
+         "true"
        )
 
 pilot_default = if runtime_env == :dev, do: "true", else: "false"
@@ -362,15 +359,42 @@ if clickhouse_olap_enabled do
 end
 
 if runtime_env != :test do
-  local_s3? = runtime_env == :dev
+  s3_host =
+    System.get_env(
+      "AWS_S3_HOST",
+      if(runtime_env == :dev, do: "localhost", else: "s3.amazonaws.com")
+    )
+
+  local_s3? = runtime_env == :dev or s3_host == "minio"
+
+  read_secret_file = fn variable ->
+    case System.get_env(variable) do
+      path when is_binary(path) and path != "" ->
+        case File.read(path) do
+          {:ok, value} -> String.trim(value)
+          {:error, _reason} -> nil
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  minio_access_key =
+    System.get_env("MINIO_ROOT_USER") || read_secret_file.("MINIO_ROOT_USER_FILE") ||
+      if(runtime_env == :dev, do: "your_minio_access_key")
+
+  minio_secret_key =
+    System.get_env("MINIO_ROOT_PASSWORD") || read_secret_file.("MINIO_ROOT_PASSWORD_FILE") ||
+      if(runtime_env == :dev, do: "your_minio_secret_key")
 
   s3_access_key_id =
     [{:system, "AWS_S3_ACCESS_KEY_ID"}, {:system, "AWS_ACCESS_KEY_ID"}] ++
-      if(local_s3?, do: ["your_minio_access_key"], else: [])
+      if(local_s3? and is_binary(minio_access_key), do: [minio_access_key], else: [])
 
   s3_secret_access_key =
     [{:system, "AWS_S3_SECRET_ACCESS_KEY"}, {:system, "AWS_SECRET_ACCESS_KEY"}] ++
-      if(local_s3?, do: ["your_minio_secret_key"], else: [])
+      if(local_s3? and is_binary(minio_secret_key), do: [minio_secret_key], else: [])
 
   config :ex_aws, :s3,
     region: [{:system, "AWS_S3_REGION"}, {:system, "AWS_REGION"}, "us-east-1"],
@@ -380,7 +404,7 @@ if runtime_env != :test do
     port:
       System.get_env("AWS_S3_PORT", if(local_s3?, do: "9000", else: "443"))
       |> String.to_integer(),
-    host: System.get_env("AWS_S3_HOST", if(local_s3?, do: "localhost", else: "s3.amazonaws.com"))
+    host: s3_host
 end
 
 force_ssl_default = if runtime_env == :prod, do: "true", else: "false"
@@ -478,10 +502,32 @@ if runtime_env == :prod do
       For example: your_s3_media_bucket_url.s3.amazonaws.com
       """
 
-  # Generated bundles must use a dedicated origin rather than inheriting the
-  # general media origin. When this is not configured, generated enrichment is
-  # visibly unavailable while the core importer continues normally.
-  generated_simulation_origin = System.get_env("GENERATED_SIMULATION_ORIGIN")
+  public_scheme = System.get_env("SCHEME", "https")
+  public_port = String.to_integer(System.get_env("PORT", "443"))
+
+  public_authority =
+    case {public_scheme, public_port} do
+      {"https", 443} -> host
+      {"http", 80} -> host
+      _ -> "#{host}:#{public_port}"
+    end
+
+  simulation_host = System.get_env("SIMULATION_HOST", "generated-simulations.#{host}")
+
+  # Preserve an explicitly configured origin during upgrades. Fresh
+  # self-hosted installations derive a dedicated sibling origin automatically.
+  generated_simulation_origin =
+    System.get_env("GENERATED_SIMULATION_ORIGIN") ||
+      "#{public_scheme}://#{simulation_host}"
+
+  generated_simulation_frame_ancestors =
+    case System.get_env("GENERATED_SIMULATION_FRAME_ANCESTORS", "")
+         |> String.split(",", trim: true)
+         |> Enum.map(&String.trim/1)
+         |> Enum.reject(&(&1 == "")) do
+      [] -> ["#{public_scheme}://#{public_authority}"]
+      configured -> configured
+    end
 
   enrichment_generator =
     case System.get_env("OPENSTAX_ENRICHMENT_GENERATOR", "disabled") do
@@ -522,12 +568,29 @@ if runtime_env == :prod do
     depot_warmer_days_lookback: System.get_env("DEPOT_WARMER_DAYS_LOOKBACK", "5"),
     depot_warmer_max_number_of_entries: System.get_env("DEPOT_WARMER_MAX_NUMBER_OF_ENTRIES", "0"),
     s3_media_bucket_name: s3_media_bucket_name,
+    openstax_generated_simulation_bucket_name:
+      System.get_env("GENERATED_SIMULATION_BUCKET_NAME", "torus-simulations"),
     s3_xapi_bucket_name: s3_xapi_bucket_name,
     media_url: media_url,
     openstax_generated_simulation_origin: generated_simulation_origin,
     generated_simulation_origins: List.wrap(generated_simulation_origin),
     openstax_generated_simulation_csp_header_enforced:
       get_env_as_boolean.("GENERATED_SIMULATION_CSP_HEADER_ENFORCED", "false"),
+    openstax_generated_simulation_response_headers_enforced:
+      get_env_as_boolean.("GENERATED_SIMULATION_RESPONSE_HEADERS_ENFORCED", "false"),
+    openstax_generated_simulation_frame_ancestors: generated_simulation_frame_ancestors,
+    openstax_generated_simulation_readiness_required:
+      get_env_as_boolean.("GENERATED_SIMULATION_READINESS_REQUIRED", "false"),
+    openstax_generated_simulation_readiness_interval_ms:
+      get_env_as_integer.("GENERATED_SIMULATION_READINESS_INTERVAL_MS", "30000"),
+    openstax_ai_cost_guard_enabled: get_env_as_boolean.("OPENSTAX_AI_COST_GUARD_ENABLED", "true"),
+    openstax_ai_lesson_limit_cents: get_env_as_integer.("OPENSTAX_AI_LESSON_LIMIT_CENTS", "300"),
+    openstax_ai_simulation_limit_cents:
+      get_env_as_integer.("OPENSTAX_AI_SIMULATION_LIMIT_CENTS", "1000"),
+    openstax_ai_import_warning_cents:
+      get_env_as_integer.("OPENSTAX_AI_IMPORT_WARNING_CENTS", "10000"),
+    openstax_ai_import_stop_cents: get_env_as_integer.("OPENSTAX_AI_IMPORT_STOP_CENTS", "20000"),
+    openstax_ai_daily_stop_cents: get_env_as_integer.("OPENSTAX_AI_DAILY_STOP_CENTS", "100000"),
     openstax_enrichment_generator: enrichment_generator,
     openstax_enrichment_research:
       Oli.OpenStax.CourseImport.Enrichment.Research.ResponsesWebSearch,
@@ -718,13 +781,14 @@ if runtime_env == :prod do
     secret_key_base: secret_key_base,
     live_view: [signing_salt: live_view_salt]
 
-  if System.get_env("SSL_CERT_PATH") && System.get_env("SSL_KEY_PATH") do
+  if System.get_env("SSL_CERT_PATH") && System.get_env("SSL_KEY_PATH") &&
+       not get_env_as_boolean.("TORUS_BEHIND_EDGE", "false") do
     config :oli, OliWeb.Endpoint,
       https: [
         port: String.to_integer(System.get_env("HTTPS_PORT", "443")),
         otp_app: :oli,
-        keyfile: System.get_env("SSL_CERT_PATH", "priv/ssl/localhost.key"),
-        certfile: System.get_env("SSL_KEY_PATH", "priv/ssl/localhost.crt"),
+        keyfile: System.get_env("SSL_KEY_PATH", "priv/ssl/localhost.key"),
+        certfile: System.get_env("SSL_CERT_PATH", "priv/ssl/localhost.crt"),
         protocol_options: [
           max_header_name_length: http_max_header_name_length,
           max_header_value_length: http_max_header_value_length,

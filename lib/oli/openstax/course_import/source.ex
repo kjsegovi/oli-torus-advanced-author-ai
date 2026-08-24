@@ -95,6 +95,46 @@ defmodule Oli.OpenStax.CourseImport.Source do
 
   def ingest(_, _, _), do: {:error, :invalid_scope_snapshot}
 
+  @doc "Refetches only the exact canonical OpenStax section URLs supplied by preflight."
+  @spec ingest_urls(snapshot(), [String.t()], keyword()) :: {:ok, [map()]} | {:error, term()}
+  def ingest_urls(snapshot, urls, opts \\ [])
+
+  def ingest_urls(%{"book_slug" => book_slug, "chapters" => chapters}, urls, opts)
+      when is_binary(book_slug) and is_list(chapters) and is_list(urls) do
+    requested = MapSet.new(urls)
+
+    scoped_chapters =
+      chapters
+      |> Enum.map(fn chapter ->
+        chapter
+        |> Map.put(
+          "sections",
+          chapter
+          |> Map.get("sections", [])
+          |> Enum.filter(&MapSet.member?(requested, &1["url"]))
+        )
+        |> Map.put("assessment_sources", [])
+      end)
+      |> Enum.reject(&(Map.get(&1, "sections", []) == []))
+
+    found_urls =
+      scoped_chapters
+      |> Enum.flat_map(&Map.get(&1, "sections", []))
+      |> MapSet.new(& &1["url"])
+
+    with true <- MapSet.equal?(requested, found_urls),
+         false <- MapSet.size(requested) == 0,
+         {:ok, ingested_chapters} <- ingest_chapters(scoped_chapters, book_slug, opts) do
+      {:ok, Enum.flat_map(ingested_chapters, &Map.get(&1, "sections", []))}
+    else
+      false -> {:error, :canonical_sections_not_found}
+      true -> {:error, :no_sections_requested}
+      {:error, _} = error -> error
+    end
+  end
+
+  def ingest_urls(_, _, _), do: {:error, :invalid_scope_snapshot}
+
   @doc false
   def parse_section_page(body, url, opts \\ [])
 

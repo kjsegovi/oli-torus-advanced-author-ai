@@ -13,7 +13,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.OutlineWorker do
     ]
 
   alias Oli.OpenStax.CourseImport
-  alias Oli.OpenStax.CourseImport.{Parser, RichSource, Run, Source}
+  alias Oli.OpenStax.CourseImport.{Parser, RichSource, Run, Source, SourceIntegrity}
 
   @impl Oban.Worker
   def perform(%Oban.Job{
@@ -92,12 +92,13 @@ defmodule Oli.OpenStax.CourseImport.Worker.OutlineWorker do
     with {:ok, outline} <-
            Parser.build_outline(snapshot, plan_schema_version: run.plan_schema_version),
          {:ok, _units} <- CourseImport.upsert_units_and_lessons(run.id, outline),
+         :ok <- SourceIntegrity.ensure(run.id, snapshot, source_options(run)),
          {:ok, _run} <- CourseImport.transition_run(run.id, :awaiting_outline_approval) do
       :ok
     end
   end
 
-  defp planning_snapshot(%Run{source_schema_version: 3} = run),
+  defp planning_snapshot(%Run{source_schema_version: 4} = run),
     do: RichSource.load_snapshot(run.id, run.preflight_snapshot || %{})
 
   defp planning_snapshot(%Run{source_schema_version: version}),

@@ -9,7 +9,7 @@ defmodule Oli.OpenStax.CourseImport.Parser do
   @exceptional_average_chunk_word_threshold 900
   @exceptional_chunk_threshold 10
   @max_pedagogical_chunks_per_lesson 4
-  @current_plan_schema_version 6
+  @current_plan_schema_version 7
   @deterministically_omittable_block_kinds ~w(
     navigation duplicated_boilerplate boilerplate unsafe_media
   )
@@ -38,11 +38,11 @@ defmodule Oli.OpenStax.CourseImport.Parser do
   def verify_book_url(url), do: parse_openstax_url(url)
 
   @doc """
-  Builds the schema 6 run outline. Source sections are never merged; only an
+  Builds the schema 7 run outline. Source sections are never merged; only an
   exceptional section may be split at an existing pedagogical boundary.
   """
   @spec build_outline(map()) :: {:ok, outline()} | {:error, term()}
-  def build_outline(snapshot), do: build_outline(snapshot, plan_schema_version: 6)
+  def build_outline(snapshot), do: build_outline(snapshot, plan_schema_version: 7)
 
   @spec build_outline(map(), keyword()) :: {:ok, outline()} | {:error, term()}
   def build_outline(%{"book_slug" => book_slug, "chapters" => chapters} = snapshot, opts)

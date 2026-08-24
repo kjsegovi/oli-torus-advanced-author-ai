@@ -30,12 +30,13 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
 
     def candidate, do: @candidate
 
-    def next_decision_with_metadata(messages, _opts) do
-      reviewed? = Enum.any?(messages, &(&1[:name] == "review_openstax_questions"))
-      tool_name = if reviewed?, do: "submit_openstax_questions", else: "review_openstax_questions"
-
-      {:ok, %Decision{next_action: "tool", tool_name: tool_name, arguments: @candidate},
-       %{input_tokens: 120, output_tokens: 80}}
+    def next_decision_with_metadata(_messages, _opts) do
+      {:ok,
+       %Decision{
+         next_action: "tool",
+         tool_name: "validate_and_submit_openstax_questions",
+         arguments: @candidate
+       }, %{input_tokens: 120, output_tokens: 80}}
     end
   end
 
@@ -44,7 +45,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
       attempts = Process.get({__MODULE__, :attempts}, 0)
       Process.put({__MODULE__, :attempts}, attempts + 1)
 
-      if attempts < 2,
+      if attempts < 1,
         do: {:error, :timeout},
         else:
           Oli.OpenStax.CourseImport.QuestionAgentTest.SuccessfulBridge.next_decision_with_metadata(
@@ -58,20 +59,31 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
     def next_decision_with_metadata(messages, _opts) do
       candidate = Oli.OpenStax.CourseImport.QuestionAgentTest.SuccessfulBridge.candidate()
 
-      case Enum.find(messages, &(&1[:name] == "review_openstax_questions")) do
+      case Enum.find(messages, &(&1[:name] == "validate_and_submit_openstax_questions")) do
         nil ->
+          invalid =
+            put_in(
+              candidate,
+              ["questions_payload", "items", Access.at(0), "prompt"],
+              "Start here"
+            )
+
           {:ok,
            %Decision{
              next_action: "tool",
-             tool_name: "review_openstax_questions",
-             arguments: candidate
+             tool_name: "validate_and_submit_openstax_questions",
+             arguments: invalid
            }, %{input_tokens: 120, output_tokens: 80}}
 
-        %{tool_call_id: call_id, tool_arguments: ^candidate} when is_binary(call_id) ->
+        %{tool_call_id: call_id, tool_arguments: tool_arguments, content: content}
+        when is_binary(call_id) ->
+          false = Jason.decode!(content)["valid"]
+          true = is_map(tool_arguments)
+
           {:ok,
            %Decision{
              next_action: "tool",
-             tool_name: "submit_openstax_questions",
+             tool_name: "validate_and_submit_openstax_questions",
              arguments: candidate
            }, %{input_tokens: 120, output_tokens: 80}}
 
@@ -98,35 +110,34 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
 
   defmodule RevisionBridge do
     def next_decision_with_metadata(messages, _opts) do
-      reviewed =
+      validation =
         messages
-        |> Enum.filter(&(&1[:name] == "review_openstax_questions"))
+        |> Enum.filter(&(&1[:name] == "validate_and_submit_openstax_questions"))
         |> List.last()
 
-      {tool_name, candidate} =
-        case reviewed do
+      candidate =
+        case validation do
           nil ->
-            invalid =
-              Oli.OpenStax.CourseImport.QuestionAgentTest.SuccessfulBridge.candidate()
-              |> put_in(
-                ["questions_payload", "items", Access.at(0), "prompt"],
-                "Start here"
-              )
-
-            {"review_openstax_questions", invalid}
+            Oli.OpenStax.CourseImport.QuestionAgentTest.SuccessfulBridge.candidate()
+            |> put_in(
+              ["questions_payload", "items", Access.at(0), "prompt"],
+              "Start here"
+            )
 
           %{content: content} ->
             if Jason.decode!(content)["valid"] do
-              {"submit_openstax_questions",
-               Oli.OpenStax.CourseImport.QuestionAgentTest.SuccessfulBridge.candidate()}
+              raise "agent should stop immediately after an accepted atomic validation"
             else
-              {"review_openstax_questions",
-               Oli.OpenStax.CourseImport.QuestionAgentTest.SuccessfulBridge.candidate()}
+              Oli.OpenStax.CourseImport.QuestionAgentTest.SuccessfulBridge.candidate()
             end
         end
 
-      {:ok, %Decision{next_action: "tool", tool_name: tool_name, arguments: candidate},
-       %{input_tokens: 120, output_tokens: 80}}
+      {:ok,
+       %Decision{
+         next_action: "tool",
+         tool_name: "validate_and_submit_openstax_questions",
+         arguments: candidate
+       }, %{input_tokens: 120, output_tokens: 80}}
     end
   end
 
@@ -159,7 +170,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
     end
   end
 
-  test "reviews, submits, and persists an accepted Basic question draft" do
+  test "validates, submits, and persists an accepted Basic question draft in one turn" do
     {lesson, content} = lesson_context()
 
     assert {:ok, result} =
@@ -174,8 +185,8 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
     assert question["objective_ids"] == ["objective-1"]
     assert question["mapped_objectives"] == ["Compare algorithms under one computation model"]
 
-    assert result.generation_metadata["attempts"] == %{"reviews" => 1, "submissions" => 1}
-    assert result.generation_metadata["token_usage"]["total"] == 400
+    assert result.generation_metadata["attempts"] == %{"validations" => 1}
+    assert result.generation_metadata["token_usage"]["total"] == 200
     assert result.generation_metadata["terminal_status"] == "completed"
 
     run_id = result.generation_metadata["run_id"]
@@ -183,8 +194,8 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
 
     assert {:ok, durable_result} = Agent.await_result(run_id, 1_000)
     assert durable_result.terminal_status == :completed
-    assert durable_result.input_tokens == 240
-    assert durable_result.output_tokens == 160
+    assert durable_result.input_tokens == 120
+    assert durable_result.output_tokens == 80
   end
 
   test "await_result waits for a durable running agent instead of timing out on server responsiveness" do
@@ -241,7 +252,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
                llm_bridge: ToolHistoryBridge
              )
 
-    assert result.generation_metadata["attempts"] == %{"reviews" => 1, "submissions" => 1}
+    assert result.generation_metadata["attempts"] == %{"validations" => 2}
   end
 
   @tag capture_log: true
@@ -259,7 +270,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
   end
 
   @tag capture_log: true
-  test "retries provider timeouts before completing the reviewed submission" do
+  test "retries an identical provider timeout once before completing the atomic submission" do
     {lesson, content} = lesson_context()
 
     assert {:ok, result} =
@@ -268,10 +279,10 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
              )
 
     assert result.generation_metadata["terminal_status"] == "completed"
-    assert result.generation_metadata["attempts"]["reviews"] == 1
+    assert result.generation_metadata["attempts"]["validations"] == 1
   end
 
-  test "repairs a rejected review before submitting the accepted whole set" do
+  test "repairs a rejected validation before atomically submitting the accepted whole set" do
     {lesson, content} = lesson_context()
 
     assert {:ok, result} =
@@ -279,7 +290,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
                llm_bridge: RevisionBridge
              )
 
-    assert result.generation_metadata["attempts"] == %{"reviews" => 2, "submissions" => 1}
+    assert result.generation_metadata["attempts"] == %{"validations" => 2}
     assert hd(result.questions_payload["items"])["prompt"] =~ "shared computation model"
   end
 
@@ -293,7 +304,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
              )
 
     assert result.generation_metadata["terminal_status"] == "completed"
-    assert result.generation_metadata["attempts"]["submissions"] == 1
+    assert result.generation_metadata["attempts"]["validations"] == 1
   end
 
   test "reports agent budget exhaustion as a terminal quality failure" do
@@ -345,7 +356,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgentTest do
     }
 
     content = %{
-      "schema_version" => 5,
+      "schema_version" => 7,
       "authoring_mode" => "basic",
       "title" => "Computation models",
       "learning_objectives" => ["Compare algorithms under one computation model"],

@@ -7,7 +7,7 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
   Author pages.
   """
 
-  alias Oli.OpenStax.CourseImport.{AuthoringCompiler, Enrichment}
+  alias Oli.OpenStax.CourseImport.{AuthoringCompiler, Enrichment, ImportContract}
 
   @spec dry_run(map()) :: {:ok, map()} | {:error, term()}
   def dry_run(run), do: dry_run(run, [])
@@ -37,18 +37,7 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
 
   def dry_run(_, _), do: {:error, :invalid_run}
 
-  defp require_current_run_schema(%{plan_schema_version: 6, source_schema_version: 3}), do: :ok
-
-  defp require_current_run_schema(%{
-         plan_schema_version: plan_version,
-         source_schema_version: source_version
-       }),
-       do: {:error, {:unsupported_openstax_schema_contract, source_version, plan_version}}
-
-  defp require_current_run_schema(%{plan_schema_version: version}),
-    do: {:error, {:unsupported_openstax_plan_schema, version}}
-
-  defp require_current_run_schema(_run), do: {:error, :missing_openstax_plan_schema}
+  defp require_current_run_schema(run), do: ImportContract.ensure_current_run(run)
 
   defp compile_units(units, opts) do
     units
@@ -129,13 +118,13 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
   defp inject_approved_enrichments(content, run_id, lesson_id, plan_mode, opts)
        when is_map(content) do
     case {Keyword.get(opts, :plan_schema_version), plan_mode, content["schema_version"]} do
-      {6, "basic", 5} ->
+      {7, "basic", 7} ->
         inject_current_enrichments(content, run_id, lesson_id, plan_mode, opts)
 
-      {6, "advanced", 6} ->
+      {7, "advanced", 7} ->
         inject_current_enrichments(content, run_id, lesson_id, plan_mode, opts)
 
-      {6, _mode, _content_schema} ->
+      {7, _mode, _content_schema} ->
         {:error, :plan_schema_version_mismatch}
 
       {version, _mode, _content_schema} ->
@@ -166,12 +155,12 @@ defmodule Oli.OpenStax.CourseImport.Compiler do
           {:ok, remove_generated_references(content)}
 
         true ->
-          inject_generated_proposals_v6(content, generated)
+          inject_generated_proposals_v7(content, generated)
       end
     end
   end
 
-  defp inject_generated_proposals_v6(content, proposals) do
+  defp inject_generated_proposals_v7(content, proposals) do
     with {:ok, references} <- build_generated_references(proposals),
          {:ok, blueprint} <-
            place_generated_references(content["experience_blueprint"], references) do
