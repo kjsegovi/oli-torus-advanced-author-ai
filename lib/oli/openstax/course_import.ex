@@ -17,6 +17,7 @@ defmodule Oli.OpenStax.CourseImport do
 
   alias Oli.OpenStax.CourseImport.{
     AdvancedPlanV7,
+    AIBackend,
     BasicPlanV7,
     Checks,
     Compiler,
@@ -119,8 +120,10 @@ defmodule Oli.OpenStax.CourseImport do
   end
 
   @doc "Returns project-scoped enrichment availability for the author review UI."
-  @spec enrichment_capabilities(Project.t()) :: map()
-  def enrichment_capabilities(%Project{} = project) do
+  @spec enrichment_capabilities(Project.t(), AIBackend.backend()) :: map()
+  def enrichment_capabilities(project, ai_backend \\ :openai_api)
+
+  def enrichment_capabilities(%Project{} = project, ai_backend) do
     generated_enabled =
       project_feature_enabled?(
         project,
@@ -152,7 +155,7 @@ defmodule Oli.OpenStax.CourseImport do
     kill_switch =
       Application.get_env(:oli, :openstax_generated_simulation_kill_switch, true) == true
 
-    generator_available = Generator.available?()
+    generator_available = Generator.available?(AIBackend.generator_options(ai_backend))
     sandbox_available = Sandbox.available?()
     storage_available = ArtifactStorage.available?()
 
@@ -167,7 +170,9 @@ defmodule Oli.OpenStax.CourseImport do
       storage_available: storage_available,
       generated_available:
         generated_enabled and generator_available and sandbox_available and storage_available,
-      research_available: generated_enabled and web_research_enabled and Research.available?(),
+      research_available:
+        generated_enabled and web_research_enabled and
+          Research.available?(AIBackend.research_options(ai_backend)),
       delivery_available: generated_enabled and delivery_enabled and not kill_switch
     }
   rescue
@@ -187,7 +192,7 @@ defmodule Oli.OpenStax.CourseImport do
       }
   end
 
-  def enrichment_capabilities(_),
+  def enrichment_capabilities(_, _),
     do: %{
       generated_enabled: false,
       web_research_enabled: false,
@@ -207,33 +212,38 @@ defmodule Oli.OpenStax.CourseImport do
       ScopedFeatureFlags.enabled?(scoped_feature, project)
   end
 
-  @spec start_import(Project.t(), Revision.t() | integer(), Author.t(), String.t()) ::
+  @spec start_import(Project.t(), Revision.t() | integer(), Author.t(), String.t(), keyword()) ::
           {:ok, Run.t()} | {:error, term()}
+  def start_import(project, target_container, author, source_url, opts \\ [])
+
   def start_import(
         %Project{} = project,
         target_container,
         %Author{} = author,
-        source_url
+        source_url,
+        opts
       )
-      when is_binary(source_url) do
+      when is_binary(source_url) and is_list(opts) do
     source_url = String.trim(source_url)
+    ai_backend = Keyword.get(opts, :ai_backend, :openai_api)
 
     with :ok <- authorize_project(project, author),
          :ok <- ensure_feature_available(project),
+         :ok <- AIBackend.validate_start(ai_backend),
          {:ok, target_resource_id} <- target_resource_id(target_container),
          :ok <- ensure_project_root_empty(project, target_resource_id),
          :ok <- ensure_no_active_run(project.id, target_resource_id) do
       case Parser.parse_openstax_url(source_url) do
         {:ok, book_slug} ->
-          create_run(project, author, target_resource_id, source_url, book_slug)
+          create_run(project, author, target_resource_id, source_url, book_slug, ai_backend)
 
         {:error, :invalid_openstax_url} ->
-          create_invalid_source_run(project, author, target_resource_id, source_url)
+          create_invalid_source_run(project, author, target_resource_id, source_url, ai_backend)
       end
     end
   end
 
-  def start_import(%Project{}, _target, _author, _source_url), do: {:error, :invalid_input}
+  def start_import(%Project{}, _target, _author, _source_url, _opts), do: {:error, :invalid_input}
 
   @spec get_run(Project.t(), Author.t(), Ecto.UUID.t()) ::
           {:ok, Run.t()} | {:error, term()}
@@ -930,7 +940,7 @@ defmodule Oli.OpenStax.CourseImport do
       when is_binary(run_id) and is_binary(proposal_id) do
     with {:ok, run} <- authorized_run(run_id, author),
          :ok <- ensure_status(run.status, :awaiting_lesson_approval),
-         true <- enrichment_capabilities(run_project(run)).research_available,
+         true <- enrichment_capabilities(run_project(run), run.ai_backend).research_available,
          {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
          true <-
            proposal.run_id == run.id and
@@ -1070,7 +1080,7 @@ defmodule Oli.OpenStax.CourseImport do
     with {:ok, author_feedback} <- normalize_simulation_author_feedback(author_feedback),
          {:ok, run} <- authorized_run(run_id, author),
          :ok <- ensure_status(run.status, :awaiting_lesson_approval),
-         true <- enrichment_capabilities(run_project(run)).generated_available,
+         true <- enrichment_capabilities(run_project(run), run.ai_backend).generated_available,
          {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
          true <- proposal.run_id == run.id,
          true <-
@@ -1272,7 +1282,7 @@ defmodule Oli.OpenStax.CourseImport do
                media_urls: discovery_media_urls,
                attribution: source_attribution(run),
                generated_simulation_delivery_enabled:
-                 enrichment_capabilities(project).delivery_available
+                 enrichment_capabilities(project, run.ai_backend).delivery_available
              ),
            compiled_media_ids <- MediaIngestor.required_media_ids(dry_run),
            true <- compiled_media_ids == planned_media_ids,
@@ -1770,6 +1780,7 @@ defmodule Oli.OpenStax.CourseImport do
                  approved_objective_ledger(run.id, lesson.planning_position || job_args.position),
                planning_position: lesson.planning_position || job_args.position,
                plan_schema_version: run.plan_schema_version,
+               ai_backend: AIBackend.backend(run),
                advanced_enabled: not is_nil(project) and advanced_enabled?(project)
              }}
           end
@@ -2454,7 +2465,7 @@ defmodule Oli.OpenStax.CourseImport do
     Repo.delete_all(from(run in Run, where: run.id == ^run_id))
   end
 
-  defp create_run(project, author, target_resource_id, source_url, book_slug) do
+  defp create_run(project, author, target_resource_id, source_url, book_slug, ai_backend) do
     {source_schema_version, _plan_schema_version} = rich_content_versions(project)
     now = DateTime.utc_now()
 
@@ -2463,6 +2474,7 @@ defmodule Oli.OpenStax.CourseImport do
       author_id: author.id,
       target_root_container_resource_id: target_resource_id,
       source_url: source_url,
+      ai_backend: ai_backend,
       book_slug: book_slug,
       scope_manifest: %{"book_slug" => book_slug, "chapters" => []},
       progress:
@@ -2472,7 +2484,7 @@ defmodule Oli.OpenStax.CourseImport do
       source_schema_version: source_schema_version,
       plan_schema_version: ImportContract.plan_schema_version(),
       lesson_planning_strategy: :parallel_v1,
-      lesson_planning_parallelism: configured_lesson_planning_parallelism(),
+      lesson_planning_parallelism: lesson_planning_parallelism(ai_backend),
       started_at: now
     }
 
@@ -2498,7 +2510,7 @@ defmodule Oli.OpenStax.CourseImport do
     end
   end
 
-  defp create_invalid_source_run(project, author, target_resource_id, source_url) do
+  defp create_invalid_source_run(project, author, target_resource_id, source_url, ai_backend) do
     now = DateTime.utc_now()
 
     error = %{
@@ -2514,6 +2526,7 @@ defmodule Oli.OpenStax.CourseImport do
       target_root_container_resource_id: target_resource_id,
       status: :failed,
       source_url: source_url,
+      ai_backend: ai_backend,
       book_slug: "invalid-source",
       scope_manifest: %{},
       progress: build_progress(:failed, %{}, now),
@@ -3418,7 +3431,7 @@ defmodule Oli.OpenStax.CourseImport do
     case {run_project(run), Repo.get(Lesson, proposal.lesson_id)} do
       {%Project{} = project, %Lesson{plan_mode: "advanced", run_id: run_id}}
       when run_id == run.id ->
-        if enrichment_capabilities(project).generated_available do
+        if enrichment_capabilities(project, run.ai_backend).generated_available do
           :ok
         else
           {:error, :simulation_generation_unavailable}
@@ -3440,7 +3453,7 @@ defmodule Oli.OpenStax.CourseImport do
     case {run_project(run), Repo.get(Lesson, proposal.lesson_id)} do
       {%Project{} = project, %Lesson{plan_mode: "advanced", run_id: run_id}}
       when run_id == run.id ->
-        if enrichment_capabilities(project).generated_enabled,
+        if enrichment_capabilities(project, run.ai_backend).generated_enabled,
           do: :ok,
           else: {:error, :simulation_generation_unavailable}
 
@@ -3828,7 +3841,7 @@ defmodule Oli.OpenStax.CourseImport do
 
   defp transition_to_parallel_lesson_planning(%Run{} = run, attrs) do
     generation = run.lesson_planning_generation + 1
-    parallelism = configured_lesson_planning_parallelism()
+    parallelism = lesson_planning_parallelism(run.ai_backend)
 
     transition_with_job(
       run,
@@ -3859,7 +3872,7 @@ defmodule Oli.OpenStax.CourseImport do
       %{
         lesson_planning_strategy: :parallel_v1,
         lesson_planning_generation: generation,
-        lesson_planning_parallelism: configured_lesson_planning_parallelism()
+        lesson_planning_parallelism: lesson_planning_parallelism(run.ai_backend)
       }
     )
   end
@@ -3875,6 +3888,9 @@ defmodule Oli.OpenStax.CourseImport do
     |> max(1)
     |> min(8)
   end
+
+  defp lesson_planning_parallelism(:local_codex), do: 1
+  defp lesson_planning_parallelism(_ai_backend), do: configured_lesson_planning_parallelism()
 
   defp transition_with_job(%Run{} = run, next_status, attrs, job_changeset) do
     attrs =
@@ -4989,7 +5005,7 @@ defmodule Oli.OpenStax.CourseImport do
             |> Run.update_changeset(%{
               lesson_planning_strategy: :parallel_v1,
               lesson_planning_generation: generation,
-              lesson_planning_parallelism: configured_lesson_planning_parallelism()
+              lesson_planning_parallelism: lesson_planning_parallelism(locked_run.ai_backend)
             })
             |> Repo.update!()
           else

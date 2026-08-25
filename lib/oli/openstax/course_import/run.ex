@@ -50,6 +50,7 @@ defmodule Oli.OpenStax.CourseImport.Run do
   ]
 
   @lesson_planning_strategies [:parallel_v1]
+  @ai_backends [:openai_api, :local_codex]
 
   @create_fields [
     :project_id,
@@ -57,6 +58,7 @@ defmodule Oli.OpenStax.CourseImport.Run do
     :target_root_container_resource_id,
     :status,
     :source_url,
+    :ai_backend,
     :book_slug,
     :scope_manifest,
     :progress,
@@ -113,6 +115,7 @@ defmodule Oli.OpenStax.CourseImport.Run do
 
     field :status, Ecto.Enum, values: @statuses, default: :preflighting
     field :source_url, :string
+    field :ai_backend, Ecto.Enum, values: @ai_backends, default: :openai_api
     field :book_slug, :string
     field :scope_manifest, :map, default: %{}
     field :progress, :map, default: %{}
@@ -156,12 +159,14 @@ defmodule Oli.OpenStax.CourseImport.Run do
 
   def statuses, do: @statuses
   def lesson_planning_strategies, do: @lesson_planning_strategies
+  def ai_backends, do: @ai_backends
 
   def create_changeset(run, attrs) do
     run
     |> cast(attrs, @create_fields)
     |> validate_required([:project_id, :author_id, :source_url, :book_slug])
     |> validate_inclusion(:status, @statuses)
+    |> validate_inclusion(:ai_backend, @ai_backends)
     |> validate_length(:source_url, min: 1)
     |> validate_inclusion(:lesson_planning_strategy, @lesson_planning_strategies)
     |> validate_number(:lesson_planning_generation, greater_than_or_equal_to: 0)
@@ -187,6 +192,7 @@ defmodule Oli.OpenStax.CourseImport.Run do
     |> check_constraint(:lesson_planning_parallelism,
       name: :course_import_runs_lesson_planning_parallelism
     )
+    |> check_constraint(:ai_backend, name: :course_import_runs_ai_backend)
   end
 
   def update_changeset(run, attrs) do

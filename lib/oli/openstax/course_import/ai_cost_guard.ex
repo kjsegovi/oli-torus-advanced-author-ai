@@ -226,11 +226,15 @@ defmodule Oli.OpenStax.CourseImport.AICostGuard do
 
   defp reservation_metadata(request) do
     %{
+      "billing_source" => billing_source(request[:model]),
       "input_tokens" => request[:input_tokens] || 0,
       "max_output_tokens" => request[:max_output_tokens] || 0,
       "pricing_version" => AIPricing.pricing_version()
     }
   end
+
+  defp billing_source("codex-proxy/" <> _model), do: "chatgpt_plan"
+  defp billing_source(_model), do: "usage_based_api"
 
   defp configured_limit(key, default_cents) do
     :oli

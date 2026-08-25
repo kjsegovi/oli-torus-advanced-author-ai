@@ -5,6 +5,7 @@ defmodule Oli.OpenStax.CourseImport.ParallelPlanningSchemaTest do
 
   test "new runs and lessons default to bounded parallel planning" do
     assert %Run{
+             ai_backend: :openai_api,
              lesson_planning_strategy: :parallel_v1,
              lesson_planning_generation: 0,
              lesson_planning_parallelism: 3
@@ -36,6 +37,12 @@ defmodule Oli.OpenStax.CourseImport.ParallelPlanningSchemaTest do
     refute Run.create_changeset(%Run{}, %{attrs | lesson_planning_parallelism: 0}).valid?
     refute Run.create_changeset(%Run{}, %{attrs | lesson_planning_parallelism: 9}).valid?
     refute Run.create_changeset(%Run{}, %{attrs | lesson_planning_strategy: :unknown}).valid?
+
+    assert Run.create_changeset(%Run{}, Map.put(attrs, :ai_backend, :local_codex)).valid?
+    refute Run.create_changeset(%Run{}, Map.put(attrs, :ai_backend, :unknown)).valid?
+
+    refute Run.update_changeset(%Run{ai_backend: :openai_api}, %{ai_backend: :local_codex})
+           |> Ecto.Changeset.changed?(:ai_backend)
   end
 
   test "lesson changesets validate durable job identity and lifecycle values" do

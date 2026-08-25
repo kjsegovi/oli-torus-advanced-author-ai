@@ -25,4 +25,16 @@ defmodule Oli.OpenStax.CourseImport.AIPricingTest do
              max_output_tokens: 12_000
            }) == 73_000
   end
+
+  test "Codex proxy calls retain tokens but receive zero API-dollar attribution" do
+    usage = %{input_tokens: 50_000, cached_input_tokens: 10_000, output_tokens: 5_000}
+
+    assert AIPricing.estimate_microdollars(
+             "codex-proxy/gpt-5.6-sol",
+             "standard",
+             usage
+           ) == 0
+
+    assert usage.input_tokens + usage.output_tokens == 55_000
+  end
 end

@@ -34,6 +34,12 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Generator.UntrustedGenerated do
   end
 
   @impl true
+  def available?(opts) do
+    Application.get_env(:oli, :openstax_generated_enrichment_enabled, false) == true and
+      (match?(%ServiceConfig{}, Keyword.get(opts, :service)) or available?())
+  end
+
+  @impl true
   def runtime_profile, do: :untrusted_generated
 
   @impl true
@@ -48,8 +54,9 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Generator.UntrustedGenerated do
          "generator_name" => "openai_untrusted_generated",
          "generator_version" => @prompt_version,
          "runtime_profile" => "untrusted_generated",
-         "provider" => "open_ai",
-         "model" => model_name(opts),
+         "provider" => logical_provider(opts),
+         "billing_source" => billing_source(opts),
+         "model" => selected_model(opts),
          "provider_usage" => stringify(usage),
          "source_repair_count" => repair_count,
          "source_generation_history" => history,
@@ -362,6 +369,27 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Generator.UntrustedGenerated do
     do:
       Keyword.get(opts, :model) || System.get_env("OPENSTAX_SIMULATION_BUILDER_MODEL") ||
         @default_model
+
+  defp selected_model(opts) do
+    case Keyword.get(opts, :service) do
+      %ServiceConfig{primary_model: %{model: model}} -> model
+      _ -> model_name(opts)
+    end
+  end
+
+  defp logical_provider(opts) do
+    case selected_model(opts) do
+      "codex-proxy/" <> _ -> "codex_cli"
+      _ -> "open_ai"
+    end
+  end
+
+  defp billing_source(opts) do
+    case selected_model(opts) do
+      "codex-proxy/" <> _ -> "chatgpt_plan"
+      _ -> "usage_based_api"
+    end
+  end
 
   defp strip_code_fence(content),
     do:

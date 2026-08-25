@@ -79,6 +79,59 @@
             )}
           </p>
         </div>
+        <fieldset id="openstax-ai-backend" class="space-y-3">
+          <legend class="text-sm font-semibold text-gray-900">{gettext("AI backend")}</legend>
+          <label class="flex items-start gap-3 rounded border border-gray-200 p-3">
+            <input
+              type="radio"
+              name="openstax_course_import[ai_backend]"
+              value="openai_api"
+              checked={@form[:ai_backend].value != "local_codex"}
+              disabled={!@available? || @unfinished_legacy_run?}
+              class="mt-1"
+            />
+            <span>
+              <span class="block text-sm font-semibold text-gray-900">
+                {gettext("OpenAI API — standard API billing")}
+              </span>
+              <span class="block text-xs text-gray-500">
+                {gettext("Existing import behavior and the default for new runs.")}
+              </span>
+            </span>
+          </label>
+          <label
+            :if={@codex_poc_enabled}
+            class={[
+              "flex items-start gap-3 rounded border p-3",
+              @codex_readiness.ready? && "border-gray-200",
+              !@codex_readiness.ready? && "border-amber-300 bg-amber-50"
+            ]}
+          >
+            <input
+              type="radio"
+              name="openstax_course_import[ai_backend]"
+              value="local_codex"
+              checked={@form[:ai_backend].value == "local_codex"}
+              disabled={!@available? || @unfinished_legacy_run? || !@codex_readiness.ready?}
+              class="mt-1"
+            />
+            <span>
+              <span class="block text-sm font-semibold text-gray-900">
+                {gettext("Local Codex (POC) — uses this machine’s ChatGPT Codex allowance")}
+              </span>
+              <span
+                class={[
+                  "block text-xs",
+                  @codex_readiness.ready? && "text-green-700",
+                  !@codex_readiness.ready? && "text-amber-900"
+                ]}
+                role="status"
+              >
+                {@codex_readiness[:message] || gettext("Local Codex is not ready.")}
+              </span>
+            </span>
+          </label>
+        </fieldset>
         <div class="flex items-center gap-3">
           <.button
             type="submit"
@@ -135,6 +188,13 @@
           <p class="mt-1 text-sm text-gray-600">
             {gettext("Run ID")}:
             <code class="rounded bg-gray-100 px-1 py-0.5 text-xs">{@run.id}</code>
+          </p>
+          <p id="openstax-ai-backend-locked" class="mt-1 text-sm text-gray-600">
+            {gettext("AI backend")}:
+            <span class="font-semibold">
+              {AIBackend.display_name(@run.ai_backend)}
+            </span>
+            <span class="text-xs">{gettext("(locked for this run)")}</span>
           </p>
           <.link
             navigate={run_path(@project.slug, @run.id)}

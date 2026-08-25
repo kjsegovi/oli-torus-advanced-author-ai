@@ -83,7 +83,7 @@ defmodule Oli.OpenStax.CourseImport.ModelRoutingPolicy do
     role_model = %{
       base.primary_model
       | name: "openstax-#{role_name}",
-        model: model_name,
+        model: transport_model(base, model_name),
         service_tier: if(Keyword.get(opts, :first_pass, true), do: "flex", else: "default"),
         reasoning_effort: "medium",
         prompt_cache_key: cache_key,
@@ -132,7 +132,7 @@ defmodule Oli.OpenStax.CourseImport.ModelRoutingPolicy do
         primary_model: %{
           service.primary_model
           | name: "openstax-#{role_name}-terra-escalation",
-            model: @generation_model,
+            model: transport_model(service, @generation_model),
             service_tier: "default",
             reasoning_effort: "medium"
         }
@@ -190,4 +190,9 @@ defmodule Oli.OpenStax.CourseImport.ModelRoutingPolicy do
     do: if(String.trim(value) == "", do: nil, else: value)
 
   defp blank_to_nil(_value), do: nil
+
+  defp transport_model(%ServiceConfig{primary_model: %{model: "codex-proxy/" <> _}}, model),
+    do: "codex-proxy/#{model}"
+
+  defp transport_model(_service, model), do: model
 end

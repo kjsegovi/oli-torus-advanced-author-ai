@@ -15,6 +15,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
   alias Oli.Authoring.Editing.Utils, as: EditingUtils
 
   alias Oli.OpenStax.CourseImport.{
+    AIBackend,
     EnrichmentProposal,
     EnrichmentResearchSet,
     Lesson,
@@ -24,6 +25,8 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
     SimulationSpec,
     Telemetry
   }
+
+  alias Oli.OpenStax.CourseImport
 
   alias Oli.OpenStax.CourseImport.Enrichment.{
     ArtifactStorage,
@@ -356,8 +359,10 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
 
   def research_proposal(proposal_id, opts) when is_binary(proposal_id) do
     with {:ok, proposal} <- fetch_proposal(proposal_id),
+         {:ok, run} <- CourseImport.fetch_run(proposal.run_id),
          {:ok, running} <- mark_research_running(proposal.id) do
       started_at = System.monotonic_time(:millisecond)
+      opts = Keyword.merge(opts, AIBackend.research_options(run.ai_backend))
 
       result =
         running
@@ -651,13 +656,20 @@ defmodule Oli.OpenStax.CourseImport.Enrichment do
 
   def generate_spec(proposal_id, opts) when is_binary(proposal_id) do
     with {:ok, spec} <- begin_spec_generation(proposal_id),
+         {:ok, run} <- CourseImport.fetch_run(spec.run_id),
          {:ok, proposal} <- fetch_proposal(proposal_id),
          {:ok, research} <- fetch_research_set(spec.research_set_id) do
+      opts = maybe_put_backend_services(opts, run.ai_backend)
       record_spec_result(spec.id, SimulationSpecDesigner.generate(proposal, research, opts))
     end
   end
 
   def generate_spec(_, _), do: {:error, :invalid_input}
+
+  defp maybe_put_backend_services(opts, :local_codex),
+    do: Keyword.put(opts, :services, AIBackend.simulation_spec_services(:local_codex))
+
+  defp maybe_put_backend_services(opts, _backend), do: opts
 
   @spec begin_artifact_generation(Ecto.UUID.t(), map()) ::
           {:ok, SimulationArtifact.t()} | {:error, term()}

@@ -18,7 +18,7 @@ defmodule Oli.OpenStax.CourseImport.AIPricing do
   @spec estimate_microdollars(String.t() | nil, String.t() | atom() | nil, map()) ::
           non_neg_integer()
   def estimate_microdollars(model, tier, usage) do
-    rate = Map.get(@rates, model, %{input: 0.0, cached_input: 0.0, output: 0.0})
+    rate = rate(model)
     input = number(usage, :input_tokens)
     cached = min(number(usage, :cached_input_tokens), input)
     uncached = max(input - cached, 0)
@@ -39,6 +39,11 @@ defmodule Oli.OpenStax.CourseImport.AIPricing do
     |> Float.ceil()
     |> trunc()
   end
+
+  # Local Codex consumes ChatGPT plan allowance, so it has no API-dollar
+  # attribution. Token usage is still recorded independently by the ledger.
+  defp rate("codex-proxy/" <> _model), do: %{input: 0.0, cached_input: 0.0, output: 0.0}
+  defp rate(model), do: Map.get(@rates, model, %{input: 0.0, cached_input: 0.0, output: 0.0})
 
   @spec estimate_max_microdollars(String.t() | nil, String.t() | atom() | nil, map()) ::
           non_neg_integer()

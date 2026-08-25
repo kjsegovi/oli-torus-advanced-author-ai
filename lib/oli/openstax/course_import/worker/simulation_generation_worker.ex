@@ -29,6 +29,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
   alias Oli.Authoring.Course.Project
 
   alias Oli.OpenStax.CourseImport.{
+    AIBackend,
     Enrichment,
     PubSub,
     SimulationArtifact,
@@ -179,6 +180,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
         operation_id: artifact.id,
         cost_scope: :simulation
       ]
+      |> Kernel.++(AIBackend.generator_options(backend_for(artifact.run_id)))
       |> maybe_put_option(:author_feedback, artifact_author_feedback(artifact))
       |> maybe_put_option(:repair, repair)
 
@@ -271,13 +273,14 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
        ) do
     validation = compact_validation(validated)
 
-    critic_opts = [
-      run_id: artifact.run_id,
-      lesson_id: artifact.lesson_id,
-      operation_id: artifact.id,
-      candidate_number: attempt,
-      cost_scope: :simulation
-    ]
+    critic_opts =
+      [
+        run_id: artifact.run_id,
+        lesson_id: artifact.lesson_id,
+        operation_id: artifact.id,
+        candidate_number: attempt,
+        cost_scope: :simulation
+      ] ++ AIBackend.artifact_critic_options(backend_for(artifact.run_id))
 
     case ArtifactCritic.review(spec, research, generated, validated, critic_opts) do
       {:ok, criticism} ->
@@ -607,6 +610,13 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
     case CourseImport.fetch_run(run_id) do
       {:ok, %{status: :awaiting_lesson_approval}} -> :ok
       _ -> {:error, :run_not_reviewable}
+    end
+  end
+
+  defp backend_for(run_id) do
+    case CourseImport.fetch_run(run_id) do
+      {:ok, run} -> AIBackend.backend(run)
+      _ -> raise "OpenStax run disappeared while resolving its immutable AI backend"
     end
   end
 

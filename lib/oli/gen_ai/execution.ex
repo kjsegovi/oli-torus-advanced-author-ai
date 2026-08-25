@@ -329,9 +329,13 @@ defmodule Oli.GenAI.Execution do
   defp release_admission!(_), do: :ok
 
   defp generation_metadata(plan, %ServiceConfig{id: service_config_id}) do
+    model = plan.selected_model.model
+
     %{
-      model: plan.selected_model.model,
-      provider: plan.selected_model.provider,
+      model: model,
+      provider: logical_provider(model, plan.selected_model.provider),
+      transport_provider: plan.selected_model.provider,
+      billing_source: billing_source(model),
       registered_model_id: plan.selected_model.id,
       service_config_id: service_config_id,
       service_tier: plan.selected_model.service_tier || to_string(plan.tier),
@@ -340,6 +344,12 @@ defmodule Oli.GenAI.Execution do
       max_output_tokens: plan.selected_model.max_output_tokens
     }
   end
+
+  defp logical_provider("codex-proxy/" <> _model, _provider), do: :codex_cli
+  defp logical_provider(_model, provider), do: provider
+
+  defp billing_source("codex-proxy/" <> _model), do: "chatgpt_plan"
+  defp billing_source(_model), do: "usage_based_api"
 
   defp breaker_result({:ok, %{content: content}}), do: {:ok, content}
   defp breaker_result(result), do: result

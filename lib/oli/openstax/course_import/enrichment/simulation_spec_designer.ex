@@ -5,6 +5,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.SimulationSpecDesigner do
   alias Oli.GenAI.Execution
 
   alias Oli.OpenStax.CourseImport.{
+    AIBackend,
     AIUsageLedger,
     EnrichmentProposal,
     EnrichmentResearchSet,
@@ -62,7 +63,8 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.SimulationSpecDesigner do
                  validation: Map.put(validation, "content_hash", content_hash),
                  criticism: criticism,
                  repair_count: attempt - 1,
-                 provider: "open_ai",
+                 provider: AIBackend.logical_provider(model_name(services.designer), :open_ai),
+                 billing_source: AIBackend.billing_source(model_name(services.designer)),
                  model: model_name(services.designer),
                  prompt_version: @prompt_version,
                  content_hash: content_hash,

@@ -18,7 +18,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
   require Logger
 
   alias Oli.OpenStax.CourseImport
-  alias Oli.OpenStax.CourseImport.AIPlanner
+  alias Oli.OpenStax.CourseImport.{AIBackend, AIPlanner}
 
   @provider_attempt_limit 2
   @advanced_contract_categories [
@@ -110,18 +110,19 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
       CourseImport.persist_lesson_generation_checkpoint(job_args, stage, payload)
     end
 
-    opts = [
-      plan_schema_version: claim.plan_schema_version,
-      advanced_enabled: claim.advanced_enabled,
-      run_id: claim.run_id,
-      lesson_id: claim.lesson_id,
-      planning_request_id: claim.planning_request_id,
-      author_id: claim.author_id,
-      project_id: claim.project_id,
-      generation_checkpoint: claim.generation_checkpoint,
-      objective_ledger: claim.objective_ledger,
-      checkpoint_fun: checkpoint_fun
-    ]
+    opts =
+      [
+        plan_schema_version: claim.plan_schema_version,
+        advanced_enabled: claim.advanced_enabled,
+        run_id: claim.run_id,
+        lesson_id: claim.lesson_id,
+        planning_request_id: claim.planning_request_id,
+        author_id: claim.author_id,
+        project_id: claim.project_id,
+        generation_checkpoint: claim.generation_checkpoint,
+        objective_ledger: claim.objective_ledger,
+        checkpoint_fun: checkpoint_fun
+      ] ++ AIBackend.planner_options(claim.ai_backend)
 
     source = Map.put(claim.source, "id", claim.lesson_id)
 

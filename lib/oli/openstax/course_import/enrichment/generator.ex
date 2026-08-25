@@ -20,18 +20,25 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Generator do
         }
 
   @callback available?() :: boolean()
+  @callback available?(keyword()) :: boolean()
   @callback runtime_profile() :: :audited_static | :untrusted_generated
   @callback generate(EnrichmentProposal.t(), keyword()) ::
               {:ok, bundle()} | {:error, term()}
 
-  @optional_callbacks runtime_profile: 0
+  @optional_callbacks available?: 1, runtime_profile: 0
 
   @spec available?(keyword()) :: boolean()
   def available?(opts \\ []) do
     adapter = adapter(opts)
 
-    function_exported?(adapter, :available?, 0) and adapter.available?() == true and
-      generation_profile_supported?(adapter)
+    available =
+      cond do
+        function_exported?(adapter, :available?, 1) -> adapter.available?(opts) == true
+        function_exported?(adapter, :available?, 0) -> adapter.available?() == true
+        true -> false
+      end
+
+    available and generation_profile_supported?(adapter)
   rescue
     _ -> false
   end

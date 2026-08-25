@@ -9,7 +9,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
   use OliWeb, :live_view
 
   alias Oli.OpenStax.CourseImport
-  alias Oli.OpenStax.CourseImport.{Enrichment, Estimator, PubSub}
+  alias Oli.OpenStax.CourseImport.{AIBackend, Enrichment, Estimator, PubSub}
   alias Oli.Publishing.AuthoringResolver
   alias Phoenix.Component
 
@@ -41,6 +41,10 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     project = socket.assigns.project
     author = socket.assigns.current_author
     target_container = AuthoringResolver.root_container(project.slug)
+    codex_poc_enabled = AIBackend.poc_enabled?()
+
+    codex_readiness =
+      if codex_poc_enabled, do: AIBackend.readiness(), else: %{ready?: false, code: :disabled}
 
     {:ok,
      assign(socket,
@@ -57,6 +61,8 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
        approve_all_enabled: CourseImport.approve_all_lessons_enabled?(),
        test_conveniences_enabled: CourseImport.test_conveniences_enabled?(),
        enrichment_capabilities: CourseImport.enrichment_capabilities(project),
+       codex_poc_enabled: codex_poc_enabled,
+       codex_readiness: codex_readiness,
        form: import_form(),
        run: nil,
        run_estimate: nil,
@@ -122,6 +128,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
 
   def handle_event("start", %{"openstax_course_import" => attrs}, socket) do
     source_url = String.trim(Map.get(attrs, "source_url", ""))
+    ai_backend = ai_backend(attrs)
 
     with false <- socket.assigns.unfinished_legacy_run?,
          true <- socket.assigns.available?,
@@ -131,7 +138,8 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
              socket.assigns.project,
              socket.assigns.target_container,
              socket.assigns.author,
-             source_url
+             source_url,
+             ai_backend: ai_backend
            ) do
       {:noreply,
        socket
@@ -153,7 +161,10 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
         {:noreply, assign(socket, error_message: gettext("Enter a valid OpenStax book URL."))}
 
       {:error, reason} ->
-        {:noreply, assign(socket, error_message: course_import_error(reason))}
+        {:noreply,
+         socket
+         |> maybe_refresh_codex_readiness(ai_backend)
+         |> assign(error_message: course_import_error(reason))}
     end
   end
 
@@ -623,7 +634,12 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     |> cancel_poll()
     |> cancel_pubsub_refresh()
     |> subscribe_to_run(run)
-    |> assign(run: run, run_estimate: Estimator.estimate(run))
+    |> assign(
+      run: run,
+      run_estimate: Estimator.estimate(run),
+      enrichment_capabilities:
+        CourseImport.enrichment_capabilities(socket.assigns.project, run.ai_backend)
+    )
     |> ensure_selected_lesson(run)
     |> assign_scope_selection(run)
     |> schedule_poll(run)
@@ -715,8 +731,21 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
     do:
       ~p"/workspaces/course_author/#{project_slug}/curriculum/import/openstax?run_id=#{run_id}&lesson_id=#{lesson_id}"
 
-  defp import_form, do: Component.to_form(%{"source_url" => ""}, as: @form_name)
-  defp form_with_errors(attrs), do: Component.to_form(attrs, as: @form_name)
+  defp import_form,
+    do: Component.to_form(%{"source_url" => "", "ai_backend" => "openai_api"}, as: @form_name)
+
+  defp form_with_errors(attrs) do
+    attrs = Map.put(attrs, "ai_backend", Atom.to_string(ai_backend(attrs)))
+    Component.to_form(attrs, as: @form_name)
+  end
+
+  defp ai_backend(%{"ai_backend" => "local_codex"}), do: :local_codex
+  defp ai_backend(_attrs), do: :openai_api
+
+  defp maybe_refresh_codex_readiness(socket, :local_codex),
+    do: assign(socket, codex_readiness: AIBackend.readiness())
+
+  defp maybe_refresh_codex_readiness(socket, _backend), do: socket
 
   defp progress_heading(:preflighting), do: gettext("Checking the OpenStax link")
   defp progress_heading(:awaiting_scope), do: gettext("Preparing the book scope")
@@ -2931,6 +2960,19 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLive do
 
   defp course_import_error(:feature_disabled),
     do: gettext("OpenStax course import is not available for this project.")
+
+  defp course_import_error(:local_codex_disabled),
+    do:
+      gettext("Local Codex is available only in local development when the POC flag is enabled.")
+
+  defp course_import_error({:local_codex_unavailable, _code}),
+    do:
+      gettext(
+        "Local Codex is not ready. Start the bridge and authenticate Codex with ChatGPT, then try again."
+      )
+
+  defp course_import_error(:invalid_ai_backend),
+    do: gettext("Choose a supported AI backend for this import.")
 
   defp course_import_error(:project_root_not_empty),
     do:

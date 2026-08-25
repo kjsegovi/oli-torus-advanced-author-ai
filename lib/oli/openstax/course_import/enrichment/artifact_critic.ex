@@ -5,6 +5,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactCritic do
   alias Oli.GenAI.Execution
 
   alias Oli.OpenStax.CourseImport.{
+    AIBackend,
     AIUsageLedger,
     EnrichmentResearchSet,
     ModelRoutingPolicy,
@@ -44,7 +45,8 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.ArtifactCritic do
            :ok <- validate_approval(criticism) do
         {:ok,
          Map.merge(criticism, %{
-           "provider" => "open_ai",
+           "provider" => AIBackend.logical_provider(model_name(service), :open_ai),
+           "billing_source" => AIBackend.billing_source(model_name(service)),
            "model" => model_name(service),
            "provider_usage" => stringify(usage),
            "prompt_version" => @prompt_version

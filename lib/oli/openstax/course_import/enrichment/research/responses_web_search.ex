@@ -87,7 +87,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Research.ResponsesWebSearch do
     }
   end
 
-  defp research_prompt(proposal, domain, query) do
+  def research_prompt(proposal, domain, query) do
     Jason.encode!(%{
       "role" => "simulation evidence researcher",
       "domain" => domain,
@@ -172,9 +172,48 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Research.ResponsesWebSearch do
       |> Enum.flat_map(&normalize_source(&1, allowed_domains))
       |> Enum.uniq_by(& &1["url"])
 
+    build_evidence(
+      %{
+        "retrieved_sources" => retrieved,
+        "claims" => output_text(output),
+        "search_count" => search_count,
+        "provider" => "open_ai",
+        "billing_source" => "usage_based_api",
+        "model" => response["model"],
+        "usage" => response["usage"] || %{}
+      },
+      proposal,
+      domain,
+      query,
+      allowed_domains,
+      opts
+    )
+  end
+
+  def build_evidence(response, proposal, domain, query, allowed_domains, opts \\ []) do
+    response = stringify(response)
+
+    retrieved =
+      response["retrieved_sources"]
+      |> List.wrap()
+      |> Enum.flat_map(&normalize_source(&1, allowed_domains))
+      |> Enum.uniq_by(& &1["url"])
+
+    claims_result =
+      case response["claims"] do
+        claims when is_list(claims) ->
+          claims = Enum.flat_map(claims, &normalize_claim/1)
+          if claims == [], do: {:error, :invalid_research_claims}, else: {:ok, claims}
+
+        raw ->
+          decode_claims(raw)
+      end
+
+    search_count = response["search_count"]
+
     with true <- search_count in 1..@max_searches,
          true <- length(retrieved) in @min_proposed_sources..@max_retrieved_sources,
-         {:ok, claims} <- decode_claims(output_text(output)),
+         {:ok, claims} <- claims_result,
          :ok <- validate_claims(claims, retrieved),
          proposed <- proposed_sources(claims, retrieved),
          true <- length(proposed) in @min_proposed_sources..@max_proposed_sources,
@@ -192,7 +231,8 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Research.ResponsesWebSearch do
         "claims" => claims,
         "search_count" => search_count,
         "source_count" => length(retrieved),
-        "provider" => "open_ai",
+        "provider" => response["provider"] || "open_ai",
+        "billing_source" => response["billing_source"] || "usage_based_api",
         "model" => response["model"],
         "provider_usage" => response["usage"] || %{},
         "prompt_version" => @prompt_version,

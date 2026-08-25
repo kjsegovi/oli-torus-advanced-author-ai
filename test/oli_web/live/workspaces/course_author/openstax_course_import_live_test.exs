@@ -234,6 +234,90 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
 
     assert has_element?(view, "#openstax-course-import-form button", "Plan course")
     assert has_element?(view, "#openstax-course-import", "full book can take several hours")
+    assert has_element?(view, "#openstax-ai-backend legend", "AI backend")
+
+    assert has_element?(
+             view,
+             "#openstax-ai-backend input[value='openai_api'][checked]"
+           )
+
+    refute has_element?(view, "#openstax-ai-backend input[value='local_codex']")
+  end
+
+  test "shows disabled local Codex with a sanitized readiness message", %{
+    conn: conn,
+    project: project
+  } do
+    enable_codex_poc(fn _url ->
+      {:ok, 503, Jason.encode!(%{ok: false, code: "not_authenticated"})}
+    end)
+
+    {:ok, view, _html} =
+      live(conn, ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax")
+
+    assert has_element?(
+             view,
+             "#openstax-ai-backend input[value='local_codex'][disabled]"
+           )
+
+    assert has_element?(view, "#openstax-ai-backend", "Codex is not authenticated")
+  end
+
+  test "rechecks Codex readiness before creating a run", %{conn: conn, project: project} do
+    enable_codex_poc(fn _url ->
+      {:ok, 200, Jason.encode!(%{ok: true, auth_method: "chatgpt"})}
+    end)
+
+    {:ok, view, _html} =
+      live(conn, ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax")
+
+    Application.put_env(:oli, :openstax_codex_readiness_fun, fn _url ->
+      {:ok, 503, Jason.encode!(%{ok: false, code: "not_authenticated"})}
+    end)
+
+    html =
+      view
+      |> form("#openstax-course-import-form",
+        openstax_course_import: %{
+          source_url: "https://openstax.org/details/books/sample-book",
+          ai_backend: "local_codex"
+        }
+      )
+      |> render_submit()
+
+    assert html =~ "Local Codex is not ready"
+    refute Oli.Repo.exists?(from(run in Run, where: run.project_id == ^project.id))
+  end
+
+  test "persists and displays the locked local Codex backend", %{
+    conn: conn,
+    project: project
+  } do
+    enable_codex_poc(fn _url ->
+      {:ok, 200, Jason.encode!(%{ok: true, auth_method: "chatgpt"})}
+    end)
+
+    {:ok, view, _html} =
+      live(conn, ~p"/workspaces/course_author/#{project.slug}/curriculum/import/openstax")
+
+    view
+    |> form("#openstax-course-import-form",
+      openstax_course_import: %{
+        source_url: "https://openstax.org/details/books/sample-book",
+        ai_backend: "local_codex"
+      }
+    )
+    |> render_submit()
+
+    run = Oli.Repo.one!(from(run in Run, where: run.project_id == ^project.id))
+    assert run.ai_backend == :local_codex
+    assert run.lesson_planning_parallelism == 1
+
+    assert has_element?(
+             view,
+             "#openstax-ai-backend-locked",
+             "Local Codex (POC)"
+           )
   end
 
   test "explains that course creation requires an empty project root", %{
@@ -1475,6 +1559,28 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     assert html =~ "Curriculum | #{project.title}"
     assert has_element?(curriculum_view, "[phx-value-slug]")
   end
+
+  defp enable_codex_poc(readiness_fun) do
+    original_env = Application.get_env(:oli, :env)
+    original_enabled = Application.get_env(:oli, :openstax_codex_poc_enabled)
+    original_readiness_fun = Application.get_env(:oli, :openstax_codex_readiness_fun)
+    original_url = Application.get_env(:oli, :openstax_codex_proxy_url)
+
+    Application.put_env(:oli, :env, :dev)
+    Application.put_env(:oli, :openstax_codex_poc_enabled, true)
+    Application.put_env(:oli, :openstax_codex_proxy_url, "http://127.0.0.1:4001")
+    Application.put_env(:oli, :openstax_codex_readiness_fun, readiness_fun)
+
+    on_exit(fn ->
+      restore_application_env(:env, original_env)
+      restore_application_env(:openstax_codex_poc_enabled, original_enabled)
+      restore_application_env(:openstax_codex_readiness_fun, original_readiness_fun)
+      restore_application_env(:openstax_codex_proxy_url, original_url)
+    end)
+  end
+
+  defp restore_application_env(key, nil), do: Application.delete_env(:oli, key)
+  defp restore_application_env(key, value), do: Application.put_env(:oli, key, value)
 
   defp lesson_review_run(project, root, author),
     do: lesson_review_run(project, root, author, ["chapter-1"])

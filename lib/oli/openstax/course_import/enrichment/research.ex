@@ -17,13 +17,21 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Research do
         }
 
   @callback available?() :: boolean()
+  @callback available?(keyword()) :: boolean()
   @callback research(EnrichmentProposal.t(), keyword()) ::
               {:ok, result()} | {:error, term()}
+
+  @optional_callbacks available?: 1
 
   @spec available?(keyword()) :: boolean()
   def available?(opts \\ []) do
     adapter = adapter(opts)
-    function_exported?(adapter, :available?, 0) and adapter.available?() == true
+
+    cond do
+      function_exported?(adapter, :available?, 1) -> adapter.available?(opts) == true
+      function_exported?(adapter, :available?, 0) -> adapter.available?() == true
+      true -> false
+    end
   rescue
     _ -> false
   end

@@ -17,7 +17,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.EnrichmentResearchWorker do
 
   alias Oli.OpenStax.CourseImport
   alias Oli.OpenStax.CourseImport.Enrichment.Research
-  alias Oli.OpenStax.CourseImport.{Enrichment, PubSub}
+  alias Oli.OpenStax.CourseImport.{AIBackend, Enrichment, PubSub}
 
   @impl Oban.Worker
   def perform(%Oban.Job{
@@ -26,10 +26,11 @@ defmodule Oli.OpenStax.CourseImport.Worker.EnrichmentResearchWorker do
         max_attempts: max_attempts
       }) do
     with :ok <- ensure_reviewable(run_id),
+         {:ok, run} <- CourseImport.fetch_run(run_id),
          {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
          true <- proposal.run_id == run_id,
          {:ok, running} <- Enrichment.mark_research_running(proposal.id),
-         result <- Research.research(running),
+         result <- Research.research(running, AIBackend.research_options(run.ai_backend)),
          :ok <- ensure_reviewable(run_id) do
       persist_result(proposal_id, run_id, result, attempt, max_attempts)
     else

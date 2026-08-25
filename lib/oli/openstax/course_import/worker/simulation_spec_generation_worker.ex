@@ -19,6 +19,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationSpecGenerationWorker do
   alias Oli.OpenStax.CourseImport
 
   alias Oli.OpenStax.CourseImport.{
+    AIBackend,
     Enrichment,
     PubSub,
     SimulationSpec
@@ -57,19 +58,26 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationSpecGenerationWorker do
     started_at = System.monotonic_time(:millisecond)
 
     with :ok <- ensure_reviewable(spec.run_id),
+         {:ok, run} <- CourseImport.fetch_run(spec.run_id),
          {:ok, proposal} <- Enrichment.fetch_proposal(spec.proposal_id),
          {:ok, research} <- Enrichment.fetch_research_set(spec.research_set_id),
          true <- proposal.run_id == spec.run_id and research.run_id == spec.run_id,
          true <- research.status == "approved" and research.content_hash == spec.evidence_hash,
-         result <-
-           SimulationSpecDesigner.generate(
-             proposal,
-             research,
+         designer_opts <-
+           [
              three_d_enabled: three_d_enabled?(spec.project_id),
              run_id: spec.run_id,
              lesson_id: spec.lesson_id,
              operation_id: spec.id,
-             cost_scope: :simulation
+             cost_scope: :simulation,
+             ai_backend: run.ai_backend
+           ]
+           |> maybe_put_services(AIBackend.simulation_spec_services(run.ai_backend)),
+         result <-
+           SimulationSpecDesigner.generate(
+             proposal,
+             research,
+             designer_opts
            )
            |> put_duration(elapsed_milliseconds(started_at)),
          :ok <- ensure_reviewable(spec.run_id) do
@@ -158,4 +166,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationSpecGenerationWorker do
 
   defp elapsed_milliseconds(started_at),
     do: max(System.monotonic_time(:millisecond) - started_at, 0)
+
+  defp maybe_put_services(opts, nil), do: opts
+  defp maybe_put_services(opts, services), do: Keyword.put(opts, :services, services)
 end
