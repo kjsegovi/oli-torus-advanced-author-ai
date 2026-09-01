@@ -77,7 +77,7 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
       url_template: proxy_url(),
       api_key: "local-codex-chatgpt-plan",
       timeout: 30_000,
-      recv_timeout: 300_000,
+      recv_timeout: 310_000,
       pool_class: :slow,
       max_concurrent: 1,
       routing_breaker_error_rate_threshold: 0.0,

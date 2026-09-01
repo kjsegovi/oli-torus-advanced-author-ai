@@ -5,7 +5,7 @@ defmodule Mix.Tasks.GenAi.SetupLocalCodex do
   ## Examples
 
       mix gen_ai.setup_local_codex
-      mix gen_ai.setup_local_codex --url http://localhost:4001 --model codex-proxy
+      mix gen_ai.setup_local_codex --url http://localhost:4001 --model codex-proxy/gpt-5.6-terra
       mix gen_ai.setup_local_codex --section-id 123
       mix gen_ai.setup_local_codex --feature instructor_dashboard_recommendation
 

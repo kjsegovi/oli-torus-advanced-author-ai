@@ -11,6 +11,7 @@ defmodule Oli.GenAI.Execution do
   alias Oli.GenAI.Telemetry
   alias Oli.GenAI.Completions
   alias Oli.GenAI.Completions.ServiceConfig
+  alias Oli.GenAI.ModuleCapabilities
 
   @doc """
   Executes a synchronous completion request with routing.
@@ -162,7 +163,7 @@ defmodule Oli.GenAI.Execution do
     start_ms = System.monotonic_time(:millisecond)
 
     result =
-      if function_exported?(completer, :generate_with_metadata, 3) do
+      if ModuleCapabilities.supports?(completer, :generate_with_metadata, 3) do
         completer.generate_with_metadata(messages, functions, plan.selected_model)
       else
         completer.generate(messages, functions, plan.selected_model)

@@ -127,6 +127,28 @@ defmodule Oli.GenAI.ExecutionTest do
     assert selected_model_id == service_config.secondary_model.id
   end
 
+  test "preserves provider metadata from a cold completer module" do
+    service_config = build_service_config(33, secondary_model: nil, backup_model: nil)
+
+    make_reloadable(MetadataCompletions)
+    :code.purge(MetadataCompletions)
+    :code.delete(MetadataCompletions)
+
+    result =
+      Execution.generate_with_metadata(
+        %{request_type: :generate},
+        [],
+        [],
+        service_config,
+        completions_mod: MetadataCompletions
+      )
+
+    assert {:ok, %{content: "metadata", metadata: metadata}} = result
+    assert metadata.input_tokens == 11
+    assert metadata.output_tokens == 7
+    assert metadata.cached_input_tokens == 3
+  end
+
   test "routes to backup when primary and secondary breakers are open" do
     Process.put(:execution_test_pid, self())
 
@@ -390,6 +412,39 @@ defmodule Oli.GenAI.ExecutionTest do
 
   defp restore_env(key, nil), do: System.delete_env(key)
   defp restore_env(key, value), do: System.put_env(key, value)
+
+  defp make_reloadable(module) do
+    directory =
+      Path.join(System.tmp_dir!(), "execution_test_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(directory)
+    source_path = Path.join(directory, "metadata_completions.ex")
+
+    source =
+      [
+        "defmodule ",
+        inspect(module),
+        " do\n",
+        "  def generate(_messages, _functions, _model), do: {:ok, \"fallback\"}\n",
+        "  def generate_with_metadata(_messages, _functions, _model) do\n",
+        "    {:ok, %{content: \"metadata\", response: %{\"id\" => \"first-call\", ",
+        "\"usage\" => %{\"prompt_tokens\" => 11, \"completion_tokens\" => 7, ",
+        "\"prompt_tokens_details\" => %{\"cached_tokens\" => 3}}}}}\n",
+        "  end\nend\n"
+      ]
+      |> IO.iodata_to_binary()
+
+    File.write!(source_path, source)
+    Kernel.ParallelCompiler.compile_to_path([source_path], directory, return_diagnostics: true)
+    :code.add_patha(String.to_charlist(directory))
+
+    on_exit(fn ->
+      :code.purge(module)
+      :code.delete(module)
+      :code.del_path(String.to_charlist(directory))
+      File.rm_rf!(directory)
+    end)
+  end
 
   defp clear_tables do
     if :ets.whereis(:genai_counters) != :undefined do
