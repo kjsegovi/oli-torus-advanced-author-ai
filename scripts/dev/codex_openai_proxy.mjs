@@ -19,6 +19,11 @@ import { fileURLToPath } from "node:url";
 const HOST = "127.0.0.1";
 const PORT = positiveInteger(process.env.PORT, 4001);
 const CODEX_BIN = process.env.CODEX_BIN || "codex";
+const CODEX_PROXY_TOKEN = process.env.CODEX_PROXY_TOKEN || "";
+const CODEX_PROXY_TOKEN_DIGEST = crypto
+  .createHash("sha256")
+  .update(CODEX_PROXY_TOKEN)
+  .digest();
 const EXECUTION_TIMEOUT_MS = positiveInteger(
   process.env.CODEX_PROXY_TIMEOUT_MS,
   300_000,
@@ -26,6 +31,10 @@ const EXECUTION_TIMEOUT_MS = positiveInteger(
 const LOGIN_TIMEOUT_MS = positiveInteger(
   process.env.CODEX_PROXY_LOGIN_TIMEOUT_MS,
   5_000,
+);
+const READINESS_CACHE_TTL_MS = Math.min(
+  positiveInteger(process.env.CODEX_PROXY_HEALTH_CACHE_TTL_MS, 2_000),
+  60_000,
 );
 const MAX_REQUEST_BYTES = positiveInteger(
   process.env.CODEX_PROXY_MAX_REQUEST_BYTES,
@@ -159,6 +168,54 @@ class BridgeError extends Error {
     this.code = code;
     this.status = status;
   }
+}
+
+function isLoopbackHostname(hostname) {
+  return ["127.0.0.1", "localhost", "[::1]"].includes(hostname.toLowerCase());
+}
+
+function validHost(host) {
+  if (typeof host !== "string") return false;
+  try {
+    const parsed = new URL(`http://${host}`);
+    return (
+      isLoopbackHostname(parsed.hostname) &&
+      parsed.username === "" &&
+      parsed.password === "" &&
+      parsed.pathname === "/" &&
+      parsed.search === "" &&
+      parsed.hash === ""
+    );
+  } catch {
+    return false;
+  }
+}
+
+function validOrigin(origin) {
+  if (origin === undefined) return true;
+  if (typeof origin !== "string") return false;
+  try {
+    const parsed = new URL(origin);
+    return (
+      ["http:", "https:"].includes(parsed.protocol) &&
+      isLoopbackHostname(parsed.hostname) &&
+      parsed.origin === origin
+    );
+  } catch {
+    return false;
+  }
+}
+
+function validBearerToken(authorization) {
+  if (typeof authorization !== "string" || !authorization.startsWith("Bearer ")) {
+    return false;
+  }
+
+  const supplied = crypto
+    .createHash("sha256")
+    .update(authorization.slice("Bearer ".length))
+    .digest();
+  return crypto.timingSafeEqual(CODEX_PROXY_TOKEN_DIGEST, supplied);
 }
 
 function positiveInteger(value, fallback) {
@@ -944,6 +1001,27 @@ export function createServer() {
     maxQueued: MAX_QUEUED_REQUESTS,
     timeoutMs: QUEUE_TIMEOUT_MS,
   });
+  let readinessCache = null;
+  let readinessInFlight = null;
+  const readiness = () => {
+    if (readinessCache && Date.now() < readinessCache.expiresAt) {
+      return Promise.resolve(readinessCache.status);
+    }
+    if (!readinessInFlight) {
+      readinessInFlight = loginReadiness()
+        .then((status) => {
+          readinessCache = {
+            expiresAt: Date.now() + READINESS_CACHE_TTL_MS,
+            status,
+          };
+          return status;
+        })
+        .finally(() => {
+          readinessInFlight = null;
+        });
+    }
+    return readinessInFlight;
+  };
 
   return http.createServer(async (req, res) => {
     const id = crypto.randomUUID().slice(0, 8);
@@ -957,8 +1035,33 @@ export function createServer() {
     res.once("close", abortClosedResponse);
 
     try {
+      const protectedRoute =
+        (req.method === "GET" && req.url === "/health") ||
+        (req.method === "POST" &&
+          ["/v1/chat/completions", "/v1/codex/research"].includes(req.url));
+      if (protectedRoute && CODEX_PROXY_TOKEN.trim() === "") {
+        throw new BridgeError("proxy_token_unconfigured", 503);
+      }
+      if (protectedRoute && !validBearerToken(req.headers.authorization)) {
+        throw new BridgeError("unauthorized", 401);
+      }
+      if (
+        protectedRoute &&
+        (!validHost(req.headers.host) || !validOrigin(req.headers.origin))
+      ) {
+        throw new BridgeError("forbidden", 403);
+      }
+      if (
+        protectedRoute &&
+        req.method === "POST" &&
+        req.headers["content-type"]?.split(";", 1)[0].trim().toLowerCase() !==
+          "application/json"
+      ) {
+        throw new BridgeError("unsupported_media_type", 415);
+      }
+
       if (req.method === "GET" && req.url === "/health") {
-        const status = await loginReadiness();
+        const status = await readiness();
         writeJson(res, status.ok ? 200 : 503, status);
         logMetadata(id, {
           code: status.code,

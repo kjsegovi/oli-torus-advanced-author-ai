@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
+import http from "node:http";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -30,6 +31,14 @@ const tool = {
 const bridgePath = fileURLToPath(
   new URL("./codex_openai_proxy.mjs", import.meta.url),
 );
+const proxyToken = "codex-proxy-test-token";
+
+function authenticatedHeaders(headers = {}) {
+  return {
+    authorization: `Bearer ${proxyToken}`,
+    ...headers,
+  };
+}
 
 async function unusedPort() {
   const server = net.createServer();
@@ -39,9 +48,32 @@ async function unusedPort() {
   return port;
 }
 
+async function postWithHeaders(url, headers, body) {
+  return new Promise((resolve, reject) => {
+    const request = http.request(url, { method: "POST", headers }, (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => chunks.push(chunk));
+      response.on("end", () => {
+        resolve({
+          body: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+          status: response.statusCode,
+        });
+      });
+    });
+    request.on("error", reject);
+    request.end(body);
+  });
+}
+
 async function fakeCodex(
   tmpDir,
-  { auth = "chatgpt", chatResult, delayMs = 0, mode = "normal" } = {},
+  {
+    auth = "chatgpt",
+    chatResult,
+    delayMs = 0,
+    healthDelayMs = 0,
+    mode = "normal",
+  } = {},
 ) {
   const executable = path.join(tmpDir, "fake-codex");
   const capturePath = path.join(tmpDir, "capture.jsonl");
@@ -55,10 +87,16 @@ async function fakeCodex(
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 const mode = ${JSON.stringify(mode)};
+const healthDelayMs = ${healthDelayMs};
 const failMarker = ${JSON.stringify(path.join(tmpDir, "fail-first.marker"))};
-if (args[0] === 'login') { console.log(${JSON.stringify(authText)}); process.exit(0); }
-if (mode === 'immediate-exit') process.exit(17);
-if (mode === 'ignore-term') {
+if (args[0] === 'login') {
+  fs.appendFileSync(${JSON.stringify(eventPath)}, JSON.stringify({ event: 'login-status' }) + '\\n');
+  setTimeout(() => {
+    console.log(${JSON.stringify(authText)});
+    process.exit(0);
+  }, healthDelayMs);
+} else if (mode === 'immediate-exit') process.exit(17);
+else if (mode === 'ignore-term') {
   process.on('SIGTERM', () => {});
   process.stdin.resume();
   setInterval(() => {}, 1000);
@@ -133,7 +171,13 @@ async function startBridge(t, options = {}) {
     env: {
       ...process.env,
       CODEX_BIN: options.codexBin || fake.executable,
+      CODEX_PROXY_TOKEN:
+        options.proxyToken === undefined ? proxyToken : options.proxyToken,
       CODEX_PROXY_KILL_GRACE_MS: String(options.killGraceMs || 2_000),
+      CODEX_PROXY_LOGIN_TIMEOUT_MS: String(options.loginTimeoutMs || 5_000),
+      CODEX_PROXY_HEALTH_CACHE_TTL_MS: String(
+        options.healthCacheTtlMs ?? 2_000,
+      ),
       CODEX_PROXY_MAX_PROCESS_OUTPUT_BYTES: String(
         options.maxProcessOutputBytes || 64_000,
       ),
@@ -214,6 +258,7 @@ async function startRealBridge(t) {
     env: {
       ...process.env,
       CODEX_BIN: process.env.CODEX_BIN || "codex",
+      CODEX_PROXY_TOKEN: proxyToken,
       PORT: String(port),
     },
     stdio: ["ignore", "pipe", "pipe"],
@@ -269,7 +314,7 @@ test("fake Codex executions are serial within one server", async (t) => {
   const request = (content) =>
     fetch(`${bridge.baseUrl}/v1/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authenticatedHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ messages: [{ role: "user", content }] }),
     });
 
@@ -301,7 +346,7 @@ test("a cancelled queued request never launches Codex", async (t) => {
   const bridge = await startBridge(t, { delayMs: 250 });
   const requestBody = (content) => ({
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ messages: [{ role: "user", content }] }),
   });
 
@@ -336,7 +381,7 @@ test("cancelling a running request terminates its Codex child", async (t) => {
   const controller = new AbortController();
   const request = fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       messages: [{ role: "user", content: "cancel-running" }],
     }),
@@ -360,7 +405,7 @@ test("cancelling a running request terminates its Codex child", async (t) => {
 
   const recovered = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       messages: [{ role: "user", content: "after-running-cancel" }],
     }),
@@ -379,7 +424,7 @@ test("queue capacity overflow returns bridge_busy without launching", async (t) 
   const request = (content) =>
     fetch(`${bridge.baseUrl}/v1/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authenticatedHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ messages: [{ role: "user", content }] }),
     });
 
@@ -413,7 +458,7 @@ test("queue wait deadline returns queue_timeout without launching", async (t) =>
   const request = (content) =>
     fetch(`${bridge.baseUrl}/v1/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authenticatedHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ messages: [{ role: "user", content }] }),
     });
 
@@ -440,7 +485,7 @@ test("a later request succeeds after a Codex process failure", async (t) => {
   const request = (content) =>
     fetch(`${bridge.baseUrl}/v1/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authenticatedHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({ messages: [{ role: "user", content }] }),
     });
 
@@ -723,10 +768,162 @@ test("ordinary and research executions have distinct web-search configuration", 
   assert.match(prompt, /at most four search actions/i);
 });
 
+test("empty CODEX_PROXY_TOKEN fails every protected route closed", async (t) => {
+  const bridge = await startBridge(t, { proxyToken: "" });
+  const requests = [
+    fetch(`${bridge.baseUrl}/health`, { headers: authenticatedHeaders() }),
+    fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: authenticatedHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ messages: [] }),
+    }),
+    fetch(`${bridge.baseUrl}/v1/codex/research`, {
+      method: "POST",
+      headers: authenticatedHeaders({ "content-type": "application/json" }),
+      body: JSON.stringify({ prompt: "research", allowed_domains: ["nist.gov"] }),
+    }),
+  ];
+
+  for (const response of await Promise.all(requests)) {
+    assert.equal(response.status, 503);
+    assert.deepEqual(await response.json(), {
+      error: { code: "proxy_token_unconfigured", type: "bridge_error" },
+    });
+  }
+  assert.deepEqual(await readEvents(bridge.eventPath), []);
+});
+
+test("missing or wrong bearer credentials return 401 without launching Codex", async (t) => {
+  const bridge = await startBridge(t);
+  const routes = [
+    { path: "/health", init: {} },
+    {
+      path: "/v1/chat/completions",
+      init: {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ messages: [] }),
+      },
+    },
+    {
+      path: "/v1/codex/research",
+      init: {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          prompt: "research",
+          allowed_domains: ["nist.gov"],
+        }),
+      },
+    },
+  ];
+
+  for (const { init, path: routePath } of routes) {
+    for (const authorization of [undefined, "Bearer wrong-token"]) {
+      const headers = { ...init.headers };
+      if (authorization) headers.authorization = authorization;
+      const response = await fetch(`${bridge.baseUrl}${routePath}`, {
+        ...init,
+        headers,
+      });
+      assert.equal(response.status, 401, `${routePath}: ${authorization}`);
+      assert.deepEqual(await response.json(), {
+        error: { code: "unauthorized", type: "bridge_error" },
+      });
+    }
+  }
+  assert.deepEqual(await readEvents(bridge.eventPath), []);
+});
+
+test("untrusted Origin and non-loopback Host are rejected before body parsing", async (t) => {
+  const bridge = await startBridge(t);
+  const cases = [
+    { name: "untrusted origin", headers: { origin: "https://attacker.example" } },
+    { name: "non-loopback host", headers: { host: "attacker.example" } },
+  ];
+
+  for (const { headers, name } of cases) {
+    const response = await postWithHeaders(
+      `${bridge.baseUrl}/v1/chat/completions`,
+      authenticatedHeaders({
+        ...headers,
+        "content-type": "application/json",
+      }),
+      "{not-json",
+    );
+    assert.equal(response.status, 403, name);
+    assert.deepEqual(response.body, {
+      error: { code: "forbidden", type: "bridge_error" },
+    });
+  }
+  assert.deepEqual(await readEvents(bridge.eventPath), []);
+});
+
+test("non-JSON POST content type is rejected before body parsing", async (t) => {
+  const bridge = await startBridge(t);
+
+  for (const routePath of [
+    "/v1/chat/completions",
+    "/v1/codex/research",
+  ]) {
+    const response = await fetch(`${bridge.baseUrl}${routePath}`, {
+      method: "POST",
+      headers: authenticatedHeaders({ "content-type": "text/plain" }),
+      body: "{not-json",
+    });
+
+    assert.equal(response.status, 415, routePath);
+    assert.deepEqual(await response.json(), {
+      error: { code: "unsupported_media_type", type: "bridge_error" },
+    });
+  }
+  assert.deepEqual(await readEvents(bridge.eventPath), []);
+});
+
+test("concurrent authenticated health requests coalesce one login-status child", async (t) => {
+  const bridge = await startBridge(t, { healthDelayMs: 150 });
+  const responses = await Promise.all(
+    Array.from({ length: 8 }, () =>
+      fetch(`${bridge.baseUrl}/health`, { headers: authenticatedHeaders() }),
+    ),
+  );
+
+  assert.deepEqual(
+    responses.map((response) => response.status),
+    Array(8).fill(200),
+  );
+  const loginEvents = (await readEvents(bridge.eventPath)).filter(
+    (event) => event.event === "login-status",
+  );
+  assert.equal(loginEvents.length, 1);
+});
+
+test("authenticated health readiness is cached only until the configured TTL", async (t) => {
+  const bridge = await startBridge(t, { healthCacheTtlMs: 80 });
+  const requestHealth = () =>
+    fetch(`${bridge.baseUrl}/health`, { headers: authenticatedHeaders() });
+
+  assert.equal((await requestHealth()).status, 200);
+  assert.equal((await requestHealth()).status, 200);
+  let loginEvents = (await readEvents(bridge.eventPath)).filter(
+    (event) => event.event === "login-status",
+  );
+  assert.equal(loginEvents.length, 1, "second request should use the cache");
+
+  await new Promise((resolve) => setTimeout(resolve, 120));
+  assert.equal((await requestHealth()).status, 200);
+  loginEvents = (await readEvents(bridge.eventPath)).filter(
+    (event) => event.event === "login-status",
+  );
+  assert.equal(loginEvents.length, 2, "expired cache should launch one probe");
+});
+
 test("a fake Codex executable verifies readiness, modern history, research, and usage", async (t) => {
   const bridge = await startBridge(t);
 
-  const health = await fetch(`${bridge.baseUrl}/health`);
+  const health = await fetch(`${bridge.baseUrl}/health`, {
+    headers: authenticatedHeaders({ origin: "http://localhost:4000" }),
+  });
   assert.equal(health.status, 200);
   assert.deepEqual(await health.json(), {
     auth_method: "chatgpt",
@@ -736,7 +933,7 @@ test("a fake Codex executable verifies readiness, modern history, research, and 
 
   const completion = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       model: "codex-proxy/gpt-5.6-sol",
       tools: [{ type: "function", function: tool }],
@@ -761,7 +958,7 @@ test("a fake Codex executable verifies readiness, modern history, research, and 
 
   const research = await fetch(`${bridge.baseUrl}/v1/codex/research`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       model: "codex-proxy/gpt-5.6-terra",
       prompt: "research contract",
@@ -791,7 +988,7 @@ test("an immediate Codex exit contains EPIPE and leaves the proxy healthy", asyn
   const fixtureSecret = "PROMPT_FIXTURE_SECRET";
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       messages: [
         { role: "user", content: fixtureSecret + "x".repeat(500_000) },
@@ -806,7 +1003,9 @@ test("an immediate Codex exit contains EPIPE and leaves the proxy healthy", asyn
   });
   assert.doesNotMatch(responseText, new RegExp(fixtureSecret));
 
-  const health = await fetch(`${bridge.baseUrl}/health`);
+  const health = await fetch(`${bridge.baseUrl}/health`, {
+    headers: authenticatedHeaders(),
+  });
   assert.equal(health.status, 200);
   assert.equal((await health.json()).code, "ready");
 });
@@ -819,7 +1018,7 @@ test("large subprocess diagnostics are bounded and redacted", async (t) => {
   const promptSecret = "PROMPT_FIXTURE_SECRET";
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       messages: [{ role: "user", content: promptSecret }],
     }),
@@ -845,7 +1044,7 @@ test("a missing Codex executable returns a typed service error", async (t) => {
   });
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
   });
 
@@ -854,7 +1053,9 @@ test("a missing Codex executable returns a typed service error", async (t) => {
     error: { code: "codex_missing", type: "bridge_error" },
   });
 
-  const health = await fetch(`${bridge.baseUrl}/health`);
+  const health = await fetch(`${bridge.baseUrl}/health`, {
+    headers: authenticatedHeaders(),
+  });
   assert.equal(health.status, 503);
   assert.deepEqual(await health.json(), { code: "codex_missing", ok: false });
 });
@@ -863,7 +1064,7 @@ test("a successful Codex exit without an output file is typed", async (t) => {
   const bridge = await startBridge(t, { mode: "missing-output" });
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
   });
 
@@ -877,7 +1078,7 @@ test("malformed Codex output returns the typed validation error", async (t) => {
   const bridge = await startBridge(t, { mode: "malformed-output" });
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
   });
 
@@ -894,7 +1095,7 @@ test("oversized Codex output is rejected before it is read", async (t) => {
   });
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
   });
 
@@ -908,7 +1109,7 @@ test("Codex output must be a directly opened regular file", async (t) => {
   const bridge = await startBridge(t, { mode: "symlink-output" });
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
   });
 
@@ -926,7 +1127,7 @@ test("unsupported models are rejected before temporary directory creation", asyn
   const bridge = await startBridge(t, { tmpRoot: missingTmpRoot });
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       model: "codex-proxy/unsupported-model",
       messages: [{ role: "user", content: "hello" }],
@@ -951,7 +1152,7 @@ test("timeout honors the configured kill grace for SIGTERM-resistant children", 
   const startedAt = Date.now();
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ messages: [{ role: "user", content: "timeout" }] }),
   });
   const elapsedMs = Date.now() - startedAt;
@@ -976,7 +1177,7 @@ test("an unknown Codex function call is rejected before formatting", async (t) =
   });
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       tools: [{ type: "function", function: tool }],
       messages: [{ role: "user", content: "Review this." }],
@@ -993,7 +1194,7 @@ test("a non-object Codex result is rejected before formatting", async (t) => {
   const bridge = await startBridge(t, { chatResult: "not an object" });
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({ messages: [{ role: "user", content: "Reply." }] }),
   });
 
@@ -1005,7 +1206,9 @@ test("a non-object Codex result is rejected before formatting", async (t) => {
 
 test("health rejects API-key authentication", async (t) => {
   const bridge = await startBridge(t, { auth: "api_key" });
-  const response = await fetch(`${bridge.baseUrl}/health`);
+  const response = await fetch(`${bridge.baseUrl}/health`, {
+    headers: authenticatedHeaders(),
+  });
 
   assert.equal(response.status, 503);
   assert.deepEqual(await response.json(), {
@@ -1018,7 +1221,7 @@ test("request limits and execution timeouts fail with sanitized bridge codes", a
   const limited = await startBridge(t, { maxBytes: 128 });
   const tooLarge = await fetch(`${limited.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       messages: [{ role: "user", content: "x".repeat(500) }],
     }),
@@ -1031,7 +1234,7 @@ test("request limits and execution timeouts fail with sanitized bridge codes", a
   const slow = await startBridge(t, { delayMs: 500, timeoutMs: 50 });
   const timeout = await fetch(`${slow.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       model: "codex-proxy/gpt-5.6-terra",
       messages: [{ role: "user", content: "timeout" }],
@@ -1047,7 +1250,7 @@ test("malformed JSON returns a typed client error", async (t) => {
   const bridge = await startBridge(t);
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: "{not-json",
   });
 
@@ -1073,7 +1276,7 @@ test("invalid completion bodies return typed client errors", async (t) => {
   for (const { body, code, name } of cases) {
     const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authenticatedHeaders({ "content-type": "application/json" }),
       body,
     });
 
@@ -1090,7 +1293,7 @@ test("malformed research body returns a typed client error", async (t) => {
   const bridge = await startBridge(t);
   const response = await fetch(`${bridge.baseUrl}/v1/codex/research`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: "[]",
   });
 
@@ -1104,7 +1307,7 @@ test("modern tool streams use indexed calls and complete with a stable empty del
   const bridge = await startBridge(t);
   const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       stream: true,
       tools: [{ type: "function", function: tool }],
@@ -1128,7 +1331,7 @@ test("message and legacy function-call streams retain their response shapes", as
   const bridge = await startBridge(t);
   const message = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       stream: true,
       messages: [{ role: "user", content: "Reply normally." }],
@@ -1141,7 +1344,7 @@ test("message and legacy function-call streams retain their response shapes", as
 
   const legacy = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: authenticatedHeaders({ "content-type": "application/json" }),
     body: JSON.stringify({
       stream: true,
       functions: [tool],
@@ -1162,12 +1365,14 @@ test(
   { skip: process.env.OPENSTAX_REAL_CODEX_SMOKE !== "1" },
   async (t) => {
     const baseUrl = await startRealBridge(t);
-    const health = await fetch(`${baseUrl}/health`);
+    const health = await fetch(`${baseUrl}/health`, {
+      headers: authenticatedHeaders(),
+    });
     assert.equal(health.status, 200);
 
     const response = await fetch(`${baseUrl}/v1/chat/completions`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: authenticatedHeaders({ "content-type": "application/json" }),
       body: JSON.stringify({
         model: "codex-proxy/gpt-5.6-luna",
         messages: [
