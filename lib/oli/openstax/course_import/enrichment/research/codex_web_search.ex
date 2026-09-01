@@ -54,7 +54,12 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Research.CodexWebSearch do
   end
 
   defp request(payload, opts) do
+    headers = AIBackend.authorization_headers()
+
     case Keyword.get(opts, :request_fun) do
+      fun when is_function(fun, 2) ->
+        fun.(payload, headers)
+
       fun when is_function(fun, 1) ->
         fun.(payload)
 
@@ -73,7 +78,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Research.CodexWebSearch do
         case HTTPoison.post(
                url,
                Jason.encode!(payload),
-               [{"Content-Type", "application/json"}],
+               [{"Content-Type", "application/json"} | headers],
                request_opts
              ) do
           {:ok, %HTTPoison.Response{status_code: 200, body: body}} ->

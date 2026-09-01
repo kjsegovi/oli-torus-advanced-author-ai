@@ -81,7 +81,8 @@ config :oli,
 config :oli,
   openstax_codex_poc_enabled:
     runtime_env == :dev and get_env_as_boolean.("OPENSTAX_CODEX_POC_ENABLED", "false"),
-  openstax_codex_proxy_url: System.get_env("OPENSTAX_CODEX_PROXY_URL", "http://127.0.0.1:4001")
+  openstax_codex_proxy_url: System.get_env("OPENSTAX_CODEX_PROXY_URL", "http://127.0.0.1:4001"),
+  openstax_codex_proxy_token: System.get_env("OPENSTAX_CODEX_PROXY_TOKEN")
 
 openstax_course_import_lesson_planning_strategy =
   case System.get_env("OPENSTAX_COURSE_IMPORT_PLANNING_STRATEGY", "parallel_v1")
