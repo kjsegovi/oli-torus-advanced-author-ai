@@ -209,3 +209,19 @@ jobs:
 
       - name: ⚙️ Test
         run: yarn --cwd assets run test
+
+  codex-bridge-test:
+    name: Codex bridge protocol tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run deterministic bridge tests
+        run: node --test scripts/dev/codex_openai_proxy.test.mjs

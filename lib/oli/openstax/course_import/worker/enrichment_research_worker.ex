@@ -27,10 +27,11 @@ defmodule Oli.OpenStax.CourseImport.Worker.EnrichmentResearchWorker do
       }) do
     with :ok <- ensure_reviewable(run_id),
          {:ok, run} <- CourseImport.fetch_run(run_id),
+         {:ok, research_opts} <- AIBackend.research_options(run.ai_backend),
          {:ok, proposal} <- Enrichment.fetch_proposal(proposal_id),
          true <- proposal.run_id == run_id,
          {:ok, running} <- Enrichment.mark_research_running(proposal.id),
-         result <- Research.research(running, AIBackend.research_options(run.ai_backend)),
+         result <- Research.research(running, research_opts),
          :ok <- ensure_reviewable(run_id) do
       persist_result(proposal_id, run_id, result, attempt, max_attempts)
     else

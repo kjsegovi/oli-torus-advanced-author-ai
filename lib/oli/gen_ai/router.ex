@@ -137,22 +137,25 @@ defmodule Oli.GenAI.Router do
     }
   end
 
-  defp build_plan(request_type, selected, tier, pool_name, reason, admission) do
-    build_plan(request_type, selected, tier, pool_name, reason, admission, false)
-  end
-
   defp attempt_primary_only(nil, _request_type), do: {:error, :primary_unavailable}
 
   defp attempt_primary_only(primary, request_type) do
-    {:ok,
-     build_plan(
-       request_type,
-       primary,
-       :primary,
-       HackneyPool.pool_name(primary),
-       :kill_switch_primary_only,
-       :bypass
-     )}
+    case admit_model_if_enabled(primary) do
+      {:ok, model_admitted} ->
+        {:ok,
+         build_plan(
+           request_type,
+           primary,
+           :primary,
+           HackneyPool.pool_name(primary),
+           :kill_switch_primary_only,
+           :bypass,
+           model_admitted
+         )}
+
+      {:error, reason} ->
+        {:error, reason}
+    end
   end
 
   defp breaker_enabled_for_model?(model) do
@@ -171,9 +174,11 @@ defmodule Oli.GenAI.Router do
     |> Kernel.in(["1", "true", "yes", "on"])
   end
 
-  defp model_limit_enabled?(model) do
-    breaker_enabled_for_model?(model)
-  end
+  defp model_limit_enabled?(%{max_concurrent: max_concurrent})
+       when is_integer(max_concurrent) and max_concurrent >= 0,
+       do: true
+
+  defp model_limit_enabled?(_model), do: false
 
   defp admit_model_if_enabled(model) do
     if model_limit_enabled?(model) do
@@ -260,11 +265,6 @@ defmodule Oli.GenAI.Router do
       {:error, reason} ->
         {:error, reason}
     end
-  end
-
-  defp admit_model(%{id: model_id, max_concurrent: nil}) do
-    AdmissionControl.increment_model(model_id)
-    :ok
   end
 
   defp admit_model(%{id: model_id, max_concurrent: max_concurrent})
