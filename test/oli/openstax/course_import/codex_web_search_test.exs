@@ -5,16 +5,21 @@ defmodule Oli.OpenStax.CourseImport.CodexWebSearchTest do
   alias Oli.OpenStax.CourseImport.EnrichmentProposal
 
   setup do
+    original_env = Application.get_env(:oli, :env)
+    original_enabled = Application.get_env(:oli, :openstax_codex_poc_enabled)
+    original_url = Application.get_env(:oli, :openstax_codex_proxy_url)
     original_token = Application.get_env(:oli, :openstax_codex_proxy_token)
     original_openai_key = System.get_env("OPENAI_API_KEY")
+    Application.put_env(:oli, :env, :dev)
+    Application.put_env(:oli, :openstax_codex_poc_enabled, true)
+    Application.put_env(:oli, :openstax_codex_proxy_url, "http://127.0.0.1:4001")
     Application.put_env(:oli, :openstax_codex_proxy_token, "research-test-bridge-token")
 
     on_exit(fn ->
-      case original_token do
-        nil -> Application.delete_env(:oli, :openstax_codex_proxy_token)
-        token -> Application.put_env(:oli, :openstax_codex_proxy_token, token)
-      end
-
+      restore_application_env(:env, original_env)
+      restore_application_env(:openstax_codex_poc_enabled, original_enabled)
+      restore_application_env(:openstax_codex_proxy_url, original_url)
+      restore_application_env(:openstax_codex_proxy_token, original_token)
       restore_system_env("OPENAI_API_KEY", original_openai_key)
     end)
   end
@@ -109,6 +114,43 @@ defmodule Oli.OpenStax.CourseImport.CodexWebSearchTest do
     end
 
     assert {:ok, _result} = CodexWebSearch.research(proposal, request_fun: request_fun)
+  end
+
+  test "resumed Local Codex research stops before HTTP execution when runtime policy changes" do
+    global_key = "synthetic-research-policy-openai-key-must-not-escape"
+    bridge_token = "synthetic-research-policy-bridge-token-must-not-escape"
+    System.put_env("OPENAI_API_KEY", global_key)
+    Application.put_env(:oli, :openstax_codex_proxy_token, bridge_token)
+
+    proposal = %EnrichmentProposal{
+      kind: "generated_simulation",
+      learner_task: "Compare pressure.",
+      instructional_rationale: "Use evidence.",
+      source_evidence: %{"block-1" => %{"summary" => "Evidence"}},
+      metadata: %{"domain" => "chemistry", "research_query" => "pressure"}
+    }
+
+    invalid_policies = [
+      {:disabled, :dev, false, "http://127.0.0.1:4001"},
+      {:non_loopback_url, :dev, true, "https://codex.example.com"}
+    ]
+
+    for {reason, env, enabled, url} <- invalid_policies do
+      Application.put_env(:oli, :env, env)
+      Application.put_env(:oli, :openstax_codex_poc_enabled, enabled)
+      Application.put_env(:oli, :openstax_codex_proxy_url, url)
+
+      result =
+        CodexWebSearch.research(proposal,
+          request_fun: fn _payload, _headers ->
+            flunk("invalid Local Codex runtime policy must stop before research HTTP execution")
+          end
+        )
+
+      assert {:error, {:local_codex_configuration_error, ^reason}} = result
+      refute inspect(result) =~ global_key
+      refute inspect(result) =~ bridge_token
+    end
   end
 
   test "missing bridge token fails before research provider requests or global key fallback" do

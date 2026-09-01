@@ -15,7 +15,7 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
 
   @type backend :: :openai_api | :local_codex
   @type configuration_error ::
-          {:local_codex_configuration_error, :missing_proxy_token}
+          {:local_codex_configuration_error, :disabled | :non_loopback_url | :missing_proxy_token}
   @type readiness ::
           %{ready?: true, code: :ready, message: String.t()}
           | %{ready?: false, code: atom(), message: String.t()}
@@ -45,18 +45,12 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
 
   @spec readiness(keyword()) :: readiness()
   def readiness(opts \\ []) do
-    cond do
-      not poc_enabled?() ->
-        unavailable(:disabled, "Local Codex is disabled for this environment.")
+    case runtime_configuration() do
+      {:ok, runtime} ->
+        request_readiness(runtime, opts)
 
-      not loopback_url?(proxy_url()) ->
-        unavailable(:non_loopback_url, "The Codex bridge must use a loopback URL.")
-
-      is_nil(proxy_token()) ->
-        unavailable(:missing_proxy_token, "The Codex bridge token is not configured.")
-
-      true ->
-        request_readiness(opts)
+      {:error, {:local_codex_configuration_error, reason}} ->
+        unavailable(reason, configuration_message(reason))
     end
   rescue
     _ -> unavailable(:unreachable, "The Codex bridge is unreachable.")
@@ -66,7 +60,7 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
   def planner_options(:local_codex) do
     [
       ai_backend: :local_codex,
-      service_config_loader: fn -> service_config(:local_codex) end
+      service_config_loader: &runtime_service_config/0
     ]
   end
 
@@ -74,16 +68,12 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
 
   @spec service_config(:local_codex) ::
           {:ok, ServiceConfig.t()} | {:error, configuration_error()}
-  def service_config(:local_codex) do
-    with {:ok, token} <- require_proxy_token() do
-      {:ok, build_service_config(token)}
-    end
-  end
+  def service_config(:local_codex), do: runtime_service_config()
 
   @spec simulation_spec_services(backend()) ::
           {:ok, map() | nil} | {:error, configuration_error()}
   def simulation_spec_services(:local_codex) do
-    with {:ok, base} <- service_config(:local_codex) do
+    with {:ok, base} <- runtime_service_config() do
       {:ok, %{designer: base, critic: base}}
     end
   end
@@ -93,7 +83,7 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
   @spec generator_options(backend()) ::
           {:ok, keyword()} | {:error, configuration_error()}
   def generator_options(:local_codex) do
-    with {:ok, service} <- service_config(:local_codex) do
+    with {:ok, service} <- runtime_service_config() do
       {:ok, [service: service, ai_backend: :local_codex]}
     end
   end
@@ -103,7 +93,7 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
   @spec artifact_critic_options(backend()) ::
           {:ok, keyword()} | {:error, configuration_error()}
   def artifact_critic_options(:local_codex) do
-    with {:ok, service} <- service_config(:local_codex) do
+    with {:ok, service} <- runtime_service_config() do
       {:ok, [artifact_critic_service: service, ai_backend: :local_codex]}
     end
   end
@@ -113,11 +103,11 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
   @spec research_options(backend()) ::
           {:ok, keyword()} | {:error, configuration_error()}
   def research_options(:local_codex) do
-    with {:ok, token} <- require_proxy_token() do
+    with {:ok, %{proxy_url: url, token: token}} <- runtime_configuration() do
       {:ok,
        [
          research: CodexWebSearch,
-         proxy_url: proxy_url(),
+         proxy_url: url,
          model: @default_model,
          authorization_headers: authorization_headers(token),
          ai_backend: :local_codex
@@ -166,33 +156,41 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
     end
   end
 
-  @spec authorization_headers() :: [{String.t(), String.t()}]
-  def authorization_headers do
-    case proxy_token() do
-      nil -> []
-      token -> authorization_headers(token)
-    end
-  end
-
   defp authorization_headers(token), do: [{"Authorization", "Bearer #{token}"}]
 
-  defp require_proxy_token do
-    case proxy_token() do
-      nil -> {:error, configuration_error()}
-      token -> {:ok, token}
+  defp runtime_service_config do
+    with {:ok, %{proxy_url: url, token: token}} <- runtime_configuration() do
+      {:ok, build_service_config(token, url)}
     end
   end
 
-  defp configuration_error,
-    do: {:local_codex_configuration_error, :missing_proxy_token}
+  defp runtime_configuration do
+    url = proxy_url()
+    token = proxy_token()
 
-  defp build_service_config(token) do
+    cond do
+      not poc_enabled?() -> {:error, configuration_error(:disabled)}
+      not loopback_url?(url) -> {:error, configuration_error(:non_loopback_url)}
+      is_nil(token) -> {:error, configuration_error(:missing_proxy_token)}
+      true -> {:ok, %{proxy_url: url, token: token}}
+    end
+  end
+
+  defp configuration_error(reason), do: {:local_codex_configuration_error, reason}
+
+  defp configuration_message(:disabled), do: "Local Codex is disabled for this environment."
+  defp configuration_message(:non_loopback_url), do: "The Codex bridge must use a loopback URL."
+
+  defp configuration_message(:missing_proxy_token),
+    do: "The Codex bridge token is not configured."
+
+  defp build_service_config(token, url) do
     model = %RegisteredModel{
       id: -9_001,
       name: "openstax-local-codex",
       provider: :open_ai,
       model: @default_model,
-      url_template: proxy_url(),
+      url_template: url,
       api_key: token,
       timeout: 30_000,
       recv_timeout: 310_000,
@@ -212,30 +210,33 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
     }
   end
 
-  defp request_readiness(opts) do
+  defp request_readiness(runtime, opts) do
+    url = runtime.proxy_url <> "/health"
+    headers = authorization_headers(runtime.token)
+
     case Keyword.get(opts, :request_fun) do
       fun when is_function(fun, 2) ->
-        normalize_readiness_response(fun.(proxy_url() <> "/health", authorization_headers()))
+        normalize_readiness_response(fun.(url, headers))
 
       fun when is_function(fun, 1) ->
-        normalize_readiness_response(fun.(proxy_url() <> "/health"))
+        normalize_readiness_response(fun.(url))
 
       _ ->
         case Application.get_env(:oli, :openstax_codex_readiness_fun) do
           fun when is_function(fun, 2) ->
-            normalize_readiness_response(fun.(proxy_url() <> "/health", authorization_headers()))
+            normalize_readiness_response(fun.(url, headers))
 
           fun when is_function(fun, 1) ->
-            normalize_readiness_response(fun.(proxy_url() <> "/health"))
+            normalize_readiness_response(fun.(url))
 
           _ ->
-            http_readiness()
+            http_readiness(url, headers)
         end
     end
   end
 
-  defp http_readiness do
-    case HTTPoison.get(proxy_url() <> "/health", authorization_headers(),
+  defp http_readiness(url, headers) do
+    case HTTPoison.get(url, headers,
            timeout: 2_000,
            recv_timeout: 2_000
          ) do

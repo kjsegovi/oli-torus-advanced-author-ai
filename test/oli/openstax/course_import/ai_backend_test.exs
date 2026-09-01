@@ -3,7 +3,14 @@ defmodule Oli.OpenStax.CourseImport.AIBackendTest do
 
   import ExUnit.CaptureLog
 
-  alias Oli.OpenStax.CourseImport.{AIBackend, ModelRoutingPolicy}
+  alias Oli.OpenStax.CourseImport.{
+    AIBackend,
+    EnrichmentProposal,
+    EnrichmentResearchSet,
+    ModelRoutingPolicy
+  }
+
+  alias Oli.OpenStax.CourseImport.Enrichment.SimulationSpecDesigner
 
   setup do
     original_env = Application.get_env(:oli, :env)
@@ -80,6 +87,122 @@ defmodule Oli.OpenStax.CourseImport.AIBackendTest do
     assert AIBackend.billing_source(sol.primary_model.model) == "chatgpt_plan"
   end
 
+  test "persisted Local Codex spec generation stops before provider execution when runtime policy changes" do
+    global_key = "synthetic-spec-openai-key-must-not-escape"
+    bridge_token = "synthetic-spec-bridge-token-must-not-escape"
+    System.put_env("OPENAI_API_KEY", global_key)
+    Application.put_env(:oli, :openstax_codex_proxy_token, bridge_token)
+
+    for {reason, env, enabled, url} <- invalid_runtime_policies() do
+      Application.put_env(:oli, :env, env)
+      Application.put_env(:oli, :openstax_codex_poc_enabled, enabled)
+      Application.put_env(:oli, :openstax_codex_proxy_url, url)
+
+      execution = fn _context, _messages, _functions, _service ->
+        flunk("invalid Local Codex runtime policy must stop before spec provider execution")
+      end
+
+      result =
+        with {:ok, services} <- AIBackend.simulation_spec_services(:local_codex) do
+          SimulationSpecDesigner.generate(
+            %EnrichmentProposal{},
+            %EnrichmentResearchSet{},
+            services: services,
+            spec_execution_fun: execution,
+            spec_critic_fun: execution
+          )
+        end
+
+      assert {:error, {:local_codex_configuration_error, ^reason}} = result
+      refute inspect(result) =~ global_key
+      refute inspect(result) =~ bridge_token
+    end
+  end
+
+  test "persisted Local Codex generation stops before provider execution when runtime policy changes" do
+    global_key = "synthetic-generation-openai-key-must-not-escape"
+    bridge_token = "synthetic-generation-bridge-token-must-not-escape"
+    System.put_env("OPENAI_API_KEY", global_key)
+    Application.put_env(:oli, :openstax_codex_proxy_token, bridge_token)
+
+    for {reason, env, enabled, url} <- invalid_runtime_policies() do
+      Application.put_env(:oli, :env, env)
+      Application.put_env(:oli, :openstax_codex_poc_enabled, enabled)
+      Application.put_env(:oli, :openstax_codex_proxy_url, url)
+
+      result =
+        with {:ok, _backend_opts} <- AIBackend.generator_options(:local_codex) do
+          flunk(
+            "invalid Local Codex runtime policy must stop before generation provider execution"
+          )
+        end
+
+      assert {:error, {:local_codex_configuration_error, ^reason}} = result
+      refute inspect(result) =~ global_key
+      refute inspect(result) =~ bridge_token
+    end
+  end
+
+  test "persisted Local Codex critic stops before provider execution when runtime policy changes" do
+    global_key = "synthetic-critic-openai-key-must-not-escape"
+    bridge_token = "synthetic-critic-bridge-token-must-not-escape"
+    System.put_env("OPENAI_API_KEY", global_key)
+    Application.put_env(:oli, :openstax_codex_proxy_token, bridge_token)
+
+    for {reason, env, enabled, url} <- invalid_runtime_policies() do
+      Application.put_env(:oli, :env, env)
+      Application.put_env(:oli, :openstax_codex_poc_enabled, enabled)
+      Application.put_env(:oli, :openstax_codex_proxy_url, url)
+
+      result =
+        with {:ok, _backend_opts} <- AIBackend.artifact_critic_options(:local_codex) do
+          flunk("invalid Local Codex runtime policy must stop before critic provider execution")
+        end
+
+      assert {:error, {:local_codex_configuration_error, ^reason}} = result
+      refute inspect(result) =~ global_key
+      refute inspect(result) =~ bridge_token
+    end
+  end
+
+  test "direct Local Codex service configuration rejects invalid runtime policy" do
+    global_key = "synthetic-direct-service-openai-key-must-not-escape"
+    bridge_token = "synthetic-direct-service-bridge-token-must-not-escape"
+    System.put_env("OPENAI_API_KEY", global_key)
+    Application.put_env(:oli, :openstax_codex_proxy_token, bridge_token)
+
+    for {reason, env, enabled, url} <- invalid_runtime_policies() do
+      Application.put_env(:oli, :env, env)
+      Application.put_env(:oli, :openstax_codex_poc_enabled, enabled)
+      Application.put_env(:oli, :openstax_codex_proxy_url, url)
+
+      result = AIBackend.service_config(:local_codex)
+
+      assert {:error, {:local_codex_configuration_error, ^reason}} = result
+      refute inspect(result) =~ global_key
+      refute inspect(result) =~ bridge_token
+    end
+  end
+
+  test "direct Local Codex research configuration rejects invalid runtime policy" do
+    global_key = "synthetic-direct-research-openai-key-must-not-escape"
+    bridge_token = "synthetic-direct-research-bridge-token-must-not-escape"
+    System.put_env("OPENAI_API_KEY", global_key)
+    Application.put_env(:oli, :openstax_codex_proxy_token, bridge_token)
+
+    for {reason, env, enabled, url} <- invalid_runtime_policies() do
+      Application.put_env(:oli, :env, env)
+      Application.put_env(:oli, :openstax_codex_poc_enabled, enabled)
+      Application.put_env(:oli, :openstax_codex_proxy_url, url)
+
+      result = AIBackend.research_options(:local_codex)
+
+      assert {:error, {:local_codex_configuration_error, ^reason}} = result
+      refute inspect(result) =~ global_key
+      refute inspect(result) =~ bridge_token
+    end
+  end
+
   test "missing or blank bridge tokens make enabled Local Codex unavailable" do
     Application.put_env(:oli, :env, :dev)
     Application.put_env(:oli, :openstax_codex_poc_enabled, true)
@@ -114,7 +237,7 @@ defmodule Oli.OpenStax.CourseImport.AIBackendTest do
 
   test "local service config uses the runtime bridge token without logging it" do
     token = "service-runtime-token"
-    Application.put_env(:oli, :openstax_codex_proxy_token, token)
+    configure_local_codex(token)
 
     assert {:ok, service} = AIBackend.service_config(:local_codex)
     assert service.primary_model.api_key == token
@@ -124,6 +247,7 @@ defmodule Oli.OpenStax.CourseImport.AIBackendTest do
   test "all Local Codex service loaders fail closed without selecting a global OpenAI key" do
     global_key = "synthetic-global-openai-key-must-not-escape"
     error = {:local_codex_configuration_error, :missing_proxy_token}
+    configure_local_codex("temporary-bridge-token")
     System.put_env("OPENAI_API_KEY", global_key)
 
     for token <- [nil, "", "   "] do
@@ -151,6 +275,20 @@ defmodule Oli.OpenStax.CourseImport.AIBackendTest do
     Application.put_env(:oli, :openstax_codex_proxy_url, "https://codex.example.com")
 
     assert %{ready?: false, code: :non_loopback_url} = AIBackend.readiness()
+  end
+
+  defp configure_local_codex(token) do
+    Application.put_env(:oli, :env, :dev)
+    Application.put_env(:oli, :openstax_codex_poc_enabled, true)
+    Application.put_env(:oli, :openstax_codex_proxy_url, "http://127.0.0.1:4001")
+    Application.put_env(:oli, :openstax_codex_proxy_token, token)
+  end
+
+  defp invalid_runtime_policies do
+    [
+      {:disabled, :dev, false, "http://127.0.0.1:4001"},
+      {:non_loopback_url, :dev, true, "https://codex.example.com"}
+    ]
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:oli, key)
