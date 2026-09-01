@@ -149,45 +149,76 @@ defmodule Oli.GenAI.RouterTest do
     assert {:error, :backup_breaker_open} = Router.route(request_ctx, service_config)
   end
 
-  test "ignores breaker and model limit when all breaker thresholds are zero, but still enforces pool size" do
+  @tag capture_log: true
+  test "enforces an integer model limit even when breaker thresholds are disabled" do
     ensure_hackney_started()
     previous_pool_size = HackneyPool.max_connections(:slow)
     on_exit(fn -> HackneyPool.set_max_connections(:slow, previous_pool_size) end)
-    HackneyPool.set_max_connections(:slow, 1)
+    HackneyPool.set_max_connections(:slow, 2)
+
+    model = %RegisteredModel{
+      id: 111,
+      name: "Serialized model",
+      provider: :null,
+      max_concurrent: 1,
+      routing_breaker_error_rate_threshold: 0.0,
+      routing_breaker_429_threshold: 0.0,
+      routing_breaker_latency_p95_ms: 0
+    }
 
     service_config =
       build_service_config(11,
-        primary_model: %RegisteredModel{
-          id: 111,
-          name: "Primary",
-          provider: :null,
-          max_concurrent: 0,
-          routing_breaker_error_rate_threshold: 0.0,
-          routing_breaker_429_threshold: 0.0,
-          routing_breaker_latency_p95_ms: 0
-        },
+        primary_model: model,
         secondary_model: nil,
         backup_model: nil
       )
 
-    request_ctx = %{request_type: :generate}
-    AdmissionControl.put_breaker_snapshot(service_config.primary_model.id, %{state: :open})
+    assert {:ok, first} = Router.route(%{request_type: :generate}, service_config)
+    assert first.model_admitted
 
-    assert {:ok, plan} = Router.route(request_ctx, service_config)
-    assert plan.selected_model.id == service_config.primary_model.id
-    assert AdmissionControl.model_count(service_config.primary_model.id) == 0
-    assert {:error, :over_capacity} = Router.route(request_ctx, service_config)
+    assert {:error, :over_capacity} =
+             Router.route(%{request_type: :generate}, service_config)
   end
 
-  test "kill switch always routes to primary and bypasses breaker and admission controls" do
+  test "treats nil max_concurrent as unlimited" do
+    ensure_hackney_started()
+    previous_pool_size = HackneyPool.max_connections(:slow)
+    on_exit(fn -> HackneyPool.set_max_connections(:slow, previous_pool_size) end)
+    HackneyPool.set_max_connections(:slow, 2)
+
+    model = %RegisteredModel{
+      id: 112,
+      name: "Unlimited model",
+      provider: :null,
+      max_concurrent: nil,
+      routing_breaker_error_rate_threshold: 0.0,
+      routing_breaker_429_threshold: 0.0,
+      routing_breaker_latency_p95_ms: 0
+    }
+
+    service_config =
+      build_service_config(12,
+        primary_model: model,
+        secondary_model: nil,
+        backup_model: nil
+      )
+
+    assert {:ok, first} = Router.route(%{request_type: :generate}, service_config)
+    assert {:ok, second} = Router.route(%{request_type: :generate}, service_config)
+    refute first.model_admitted
+    refute second.model_admitted
+  end
+
+  @tag capture_log: true
+  test "primary-only mode enforces the integer model limit while bypassing breaker and fallback selection" do
     with_env("GENAI_ROUTING_PRIMARY_ONLY", "true", fn ->
       service_config =
-        build_service_config(12,
+        build_service_config(13,
           primary_model: %RegisteredModel{
-            id: 121,
+            id: 131,
             name: "Primary",
             provider: :null,
-            max_concurrent: 0
+            max_concurrent: 1
           }
         )
 
@@ -197,14 +228,14 @@ defmodule Oli.GenAI.RouterTest do
       AdmissionControl.put_breaker_snapshot(service_config.secondary_model.id, %{state: :open})
       AdmissionControl.put_breaker_snapshot(service_config.backup_model.id, %{state: :open})
 
-      assert {:ok, plan_one} = Router.route(request_ctx, service_config)
-      assert plan_one.selected_model.id == service_config.primary_model.id
-      assert plan_one.reason == :kill_switch_primary_only
-      assert plan_one.admission == :bypass
+      assert {:ok, plan} = Router.route(request_ctx, service_config)
+      assert plan.selected_model.id == service_config.primary_model.id
+      assert plan.reason == :kill_switch_primary_only
+      assert plan.admission == :bypass
+      assert plan.model_admitted
 
-      assert {:ok, plan_two} = Router.route(request_ctx, service_config)
-      assert plan_two.selected_model.id == service_config.primary_model.id
-      assert AdmissionControl.model_count(service_config.primary_model.id) == 0
+      assert {:error, :over_capacity} = Router.route(request_ctx, service_config)
+      assert AdmissionControl.model_count(service_config.primary_model.id) == 1
       assert AdmissionControl.pool_count(:genai_slow_pool) == 0
     end)
   end

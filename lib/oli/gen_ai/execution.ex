@@ -317,6 +317,14 @@ defmodule Oli.GenAI.Execution do
   defp default_if_nil(nil, fallback), do: fallback
   defp default_if_nil(value, _fallback), do: value
 
+  defp release_admission!(%{
+         admission: :bypass,
+         model_admitted: true,
+         selected_model: %{id: model_id}
+       }) do
+    AdmissionControl.release_model(model_id)
+  end
+
   defp release_admission!(%{admission: :bypass}), do: :ok
 
   defp release_admission!(%{pool_name: pool_name, selected_model: %{id: model_id}} = plan) do
