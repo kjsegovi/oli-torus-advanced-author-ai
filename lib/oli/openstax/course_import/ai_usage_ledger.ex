@@ -52,7 +52,7 @@ defmodule Oli.OpenStax.CourseImport.AIUsageLedger do
 
   @spec prepare(map(), map()) :: {:ok, :proceed | {:replay, map()}} | {:error, term()}
   def prepare(context, request) when is_map(context) and is_map(request) do
-    case replay(context[:request_key]) do
+    case replay(context[:request_key], request[:request_payload_hash]) do
       {:ok, replayed} ->
         {:ok, {:replay, replayed}}
 
@@ -151,43 +151,46 @@ defmodule Oli.OpenStax.CourseImport.AIUsageLedger do
 
   defp retry_category(_outcome), do: nil
 
-  defp replay(request_key) when is_binary(request_key) do
+  defp replay(request_key, request_payload_hash)
+       when is_binary(request_key) and is_binary(request_payload_hash) do
     AIUsageEvent
     |> where(
       [event],
-      event.request_key == ^request_key and event.outcome == "succeeded" and
+      event.request_key == ^request_key and
+        event.request_payload_hash == ^request_payload_hash and
+        event.outcome == "succeeded" and
         not is_nil(event.response_payload)
     )
     |> order_by([event], desc: event.inserted_at)
     |> limit(1)
     |> Repo.one()
-    |> case do
-      %AIUsageEvent{} = event ->
-        content = event.response_payload["content"] || event.response_payload[:content]
-
-        if is_binary(content) do
-          {:ok,
-           %{
-             content: content,
-             metadata:
-               event.response_payload
-               |> Map.get("metadata", %{})
-               |> stringify()
-               |> Map.put("cache_status", "durable_replay")
-               |> Map.put("replayed_from_event_id", event.id)
-           }}
-        else
-          :miss
-        end
-
-      nil ->
-        :miss
-    end
+    |> replay_result()
   rescue
     _error -> :miss
   end
 
-  defp replay(_request_key), do: :miss
+  defp replay(_request_key, _request_payload_hash), do: :miss
+
+  defp replay_result(%AIUsageEvent{} = event) do
+    content = event.response_payload["content"] || event.response_payload[:content]
+
+    if is_binary(content) do
+      {:ok,
+       %{
+         content: content,
+         metadata:
+           event.response_payload
+           |> Map.get("metadata", %{})
+           |> stringify()
+           |> Map.put("cache_status", "durable_replay")
+           |> Map.put("replayed_from_event_id", event.id)
+       }}
+    else
+      :miss
+    end
+  end
+
+  defp replay_result(nil), do: :miss
 
   defp provider_attempt(request_key) when is_binary(request_key) do
     AIUsageEvent
