@@ -43,6 +43,14 @@ const MAX_RESULT_BYTES = positiveInteger(
   process.env.CODEX_PROXY_MAX_RESULT_BYTES,
   2_000_000,
 );
+const MAX_QUEUED_REQUESTS = positiveInteger(
+  process.env.CODEX_PROXY_MAX_QUEUED_REQUESTS,
+  2,
+);
+const QUEUE_TIMEOUT_MS = positiveInteger(
+  process.env.CODEX_PROXY_QUEUE_TIMEOUT_MS,
+  15_000,
+);
 const DEFAULT_MODEL = process.env.CODEX_MODEL || "gpt-5.6-terra";
 const ALLOWED_MODELS = new Set([
   "gpt-5.6-terra",
@@ -63,7 +71,87 @@ const PASSTHROUGH_ENV = [
   "NO_PROXY",
 ];
 
-let executionTail = Promise.resolve();
+class ExecutionQueue {
+  constructor({ maxQueued, timeoutMs }) {
+    this.active = false;
+    this.entries = [];
+    this.maxQueued = maxQueued;
+    this.timeoutMs = timeoutMs;
+  }
+
+  run(task, { signal } = {}) {
+    if (signal?.aborted) {
+      return Promise.reject(new BridgeError("request_cancelled", 499));
+    }
+
+    return new Promise((resolve, reject) => {
+      const entry = {
+        abort: null,
+        reject,
+        resolve,
+        settled: false,
+        signal,
+        task,
+        timer: null,
+      };
+      entry.abort = () => {
+        if (entry.settled) return;
+        entry.settled = true;
+        this.remove(entry);
+        reject(new BridgeError("request_cancelled", 499));
+      };
+
+      if (this.active) {
+        if (this.entries.length >= this.maxQueued) {
+          entry.settled = true;
+          reject(new BridgeError("bridge_busy", 503));
+          return;
+        }
+        signal?.addEventListener("abort", entry.abort, { once: true });
+        entry.timer = setTimeout(() => {
+          if (entry.settled) return;
+          entry.settled = true;
+          this.remove(entry);
+          reject(new BridgeError("queue_timeout", 503));
+        }, this.timeoutMs);
+        this.entries.push(entry);
+      } else {
+        this.start(entry);
+      }
+    });
+  }
+
+  remove(entry) {
+    const index = this.entries.indexOf(entry);
+    if (index >= 0) this.entries.splice(index, 1);
+    clearTimeout(entry.timer);
+    entry.signal?.removeEventListener("abort", entry.abort);
+  }
+
+  start(entry) {
+    this.active = true;
+    this.remove(entry);
+    Promise.resolve()
+      .then(entry.task)
+      .then(
+        (value) => {
+          if (entry.settled) return;
+          entry.settled = true;
+          entry.resolve(value);
+        },
+        (error) => {
+          if (entry.settled) return;
+          entry.settled = true;
+          entry.reject(error);
+        },
+      )
+      .finally(() => {
+        this.active = false;
+        const next = this.entries.shift();
+        if (next) this.start(next);
+      });
+  }
+}
 
 class BridgeError extends Error {
   constructor(code, status = 500) {
@@ -78,24 +166,32 @@ function positiveInteger(value, fallback) {
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
 }
 
+function canWrite(res) {
+  return !res.destroyed && !res.writableEnded;
+}
+
 function writeJson(res, status, body) {
+  if (!canWrite(res)) return;
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
 }
 
 function startSse(res) {
+  if (!canWrite(res)) return false;
   res.writeHead(200, {
     "cache-control": "no-cache, no-transform",
     connection: "keep-alive",
     "content-type": "text/event-stream",
   });
+  return true;
 }
 
 function writeSse(res, payload) {
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+  if (canWrite(res)) res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
 function finishSse(res) {
+  if (!canWrite(res)) return;
   res.write("data: [DONE]\n\n");
   res.end();
 }
@@ -376,7 +472,11 @@ function appendBounded(current, chunk, limit) {
   return next.length > limit ? next.subarray(next.length - limit) : next;
 }
 
-function runProcess(args, { cwd, input = "", timeoutMs }) {
+function runProcess(args, { cwd, input = "", signal, timeoutMs }) {
+  if (signal?.aborted) {
+    return Promise.reject(new BridgeError("request_cancelled", 499));
+  }
+
   return new Promise((resolve, reject) => {
     const child = spawn(CODEX_BIN, args, {
       cwd,
@@ -386,7 +486,7 @@ function runProcess(args, { cwd, input = "", timeoutMs }) {
     let stdout = Buffer.alloc(0);
     let stderr = Buffer.alloc(0);
     let settled = false;
-    let timedOut = false;
+    let terminationReason = null;
     let inputFailed = false;
     let killTimer;
 
@@ -395,16 +495,22 @@ function runProcess(args, { cwd, input = "", timeoutMs }) {
       settled = true;
       clearTimeout(timer);
       clearTimeout(killTimer);
+      signal?.removeEventListener("abort", abort);
       if (error) reject(error);
       else resolve(result);
     };
 
-    const timer = setTimeout(() => {
-      timedOut = true;
+    const terminate = (reason) => {
+      if (settled || terminationReason) return;
+      terminationReason = reason;
       child.kill("SIGTERM");
       killTimer = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
       killTimer.unref();
-    }, timeoutMs);
+    };
+    const abort = () => terminate("abort");
+    signal?.addEventListener("abort", abort, { once: true });
+
+    const timer = setTimeout(() => terminate("timeout"), timeoutMs);
 
     child.stdout.on("data", (chunk) => {
       stdout = appendBounded(stdout, chunk, MAX_PROCESS_OUTPUT_BYTES);
@@ -423,12 +529,16 @@ function runProcess(args, { cwd, input = "", timeoutMs }) {
           : new BridgeError("codex_execution_failed", 502);
       finish(bridgeError);
     });
-    child.on("close", (code, signal) => {
-      if (timedOut) {
+    child.on("close", (code, childSignal) => {
+      if (terminationReason === "abort") {
+        finish(new BridgeError("request_cancelled", 499));
+        return;
+      }
+      if (terminationReason === "timeout") {
         finish(new BridgeError("execution_timeout", 504));
         return;
       }
-      if (inputFailed || code !== 0 || signal) {
+      if (inputFailed || code !== 0 || childSignal) {
         finish(new BridgeError("codex_execution_failed", 502));
         return;
       }
@@ -439,7 +549,8 @@ function runProcess(args, { cwd, input = "", timeoutMs }) {
       });
     });
 
-    child.stdin.end(input);
+    if (signal?.aborted) abort();
+    if (terminationReason !== "abort") child.stdin.end(input);
   });
 }
 
@@ -520,6 +631,7 @@ async function executeCodex({
   prompt,
   research = false,
   schema,
+  signal,
 }) {
   const selectedModel = actualModel(model);
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "torus-codex-poc-"));
@@ -539,7 +651,12 @@ async function executeCodex({
         research,
         schemaPath,
       }),
-      { cwd: tmpDir, input: prompt, timeoutMs: EXECUTION_TIMEOUT_MS },
+      {
+        cwd: tmpDir,
+        input: prompt,
+        signal,
+        timeoutMs: EXECUTION_TIMEOUT_MS,
+      },
     );
     const result = JSON.parse(await readCodexOutput(outputPath));
     return {
@@ -554,12 +671,6 @@ async function executeCodex({
   } finally {
     await fs.rm(tmpDir, { force: true, recursive: true });
   }
-}
-
-function serialExecution(task) {
-  const next = executionTail.then(task, task);
-  executionTail = next.catch(() => undefined);
-  return next;
 }
 
 function completionId() {
@@ -798,9 +909,21 @@ function logMetadata(id, metadata) {
 }
 
 export function createServer() {
+  const executionQueue = new ExecutionQueue({
+    maxQueued: MAX_QUEUED_REQUESTS,
+    timeoutMs: QUEUE_TIMEOUT_MS,
+  });
+
   return http.createServer(async (req, res) => {
     const id = crypto.randomUUID().slice(0, 8);
     const startedAt = Date.now();
+    const controller = new AbortController();
+    const abortRequest = () => controller.abort();
+    const abortClosedResponse = () => {
+      if (!res.writableEnded) controller.abort();
+    };
+    req.once("aborted", abortRequest);
+    res.once("close", abortClosedResponse);
 
     try {
       if (req.method === "GET" && req.url === "/health") {
@@ -828,14 +951,17 @@ export function createServer() {
 
       if (req.url === "/v1/codex/research") {
         const allowedDomains = validateResearchBody(body);
-        const execution = await serialExecution(() =>
-          executeCodex({
-            allowedDomains,
-            model: body.model,
-            prompt: buildResearchPrompt(body.prompt, allowedDomains),
-            research: true,
-            schema: buildResearchSchema(),
-          }),
+        const execution = await executionQueue.run(
+          () =>
+            executeCodex({
+              allowedDomains,
+              model: body.model,
+              prompt: buildResearchPrompt(body.prompt, allowedDomains),
+              research: true,
+              schema: buildResearchSchema(),
+              signal: controller.signal,
+            }),
+          { signal: controller.signal },
         );
         writeJson(res, 200, {
           ...execution.result,
@@ -856,12 +982,15 @@ export function createServer() {
 
       const tools = normalizeTools(body);
       const messages = Array.isArray(body.messages) ? body.messages : [];
-      const execution = await serialExecution(() =>
-        executeCodex({
-          model: body.model,
-          prompt: buildPrompt({ messages, tools }),
-          schema: buildOutputSchema(tools),
-        }),
+      const execution = await executionQueue.run(
+        () =>
+          executeCodex({
+            model: body.model,
+            prompt: buildPrompt({ messages, tools }),
+            schema: buildOutputSchema(tools),
+            signal: controller.signal,
+          }),
+        { signal: controller.signal },
       );
       const response = asChatCompletion(
         validateChatResult(execution.result, tools),
@@ -887,6 +1016,9 @@ export function createServer() {
       const body = { error: { code, type: "bridge_error" } };
       writeJson(res, status, body);
       logMetadata(id, { code, duration_ms: Date.now() - startedAt, status });
+    } finally {
+      req.removeListener("aborted", abortRequest);
+      res.removeListener("close", abortClosedResponse);
     }
   });
 }
@@ -897,6 +1029,7 @@ export {
   buildPrompt,
   buildResearchPrompt,
   codexArgs,
+  ExecutionQueue,
   parseUsage,
   validateChatResult,
 };

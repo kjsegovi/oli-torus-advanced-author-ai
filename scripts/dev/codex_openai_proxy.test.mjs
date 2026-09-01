@@ -13,6 +13,7 @@ import {
   buildPrompt,
   buildResearchPrompt,
   codexArgs,
+  ExecutionQueue,
   parseUsage,
 } from "./codex_openai_proxy.mjs";
 
@@ -44,6 +45,7 @@ async function fakeCodex(
 ) {
   const executable = path.join(tmpDir, "fake-codex");
   const capturePath = path.join(tmpDir, "capture.jsonl");
+  const eventPath = path.join(tmpDir, "events.jsonl");
   const authText =
     auth === "chatgpt"
       ? "Logged in using ChatGPT"
@@ -53,6 +55,7 @@ async function fakeCodex(
 const fs = require('node:fs');
 const args = process.argv.slice(2);
 const mode = ${JSON.stringify(mode)};
+const failMarker = ${JSON.stringify(path.join(tmpDir, "fail-first.marker"))};
 if (args[0] === 'login') { console.log(${JSON.stringify(authText)}); process.exit(0); }
 if (mode === 'immediate-exit') process.exit(17);
 if (mode === 'ignore-term') {
@@ -63,6 +66,15 @@ if (mode === 'ignore-term') {
   let prompt = '';
   process.stdin.on('data', (chunk) => { prompt += chunk.toString(); });
   process.stdin.on('end', () => {
+    fs.appendFileSync(${JSON.stringify(eventPath)}, JSON.stringify({ event: 'start', prompt }) + '\\n');
+    process.on('SIGTERM', () => {
+      fs.appendFileSync(${JSON.stringify(eventPath)}, JSON.stringify({ event: 'terminated', prompt }) + '\\n');
+      process.exit(143);
+    });
+    if (mode === 'fail-first' && !fs.existsSync(failMarker)) {
+      fs.writeFileSync(failMarker, 'failed');
+      process.exit(17);
+    }
     setTimeout(() => {
       const outputIndex = args.indexOf('--output-last-message');
       const outputPath = args[outputIndex + 1];
@@ -88,6 +100,7 @@ if (mode === 'ignore-term') {
           ? { type: 'function_call', name: 'review_openstax_questions', arguments: { candidate: 'v2' } }
           : { type: 'message', content: 'ok' });
       fs.appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args, prompt }) + '\\n');
+      fs.appendFileSync(${JSON.stringify(eventPath)}, JSON.stringify({ event: 'finish', prompt }) + '\\n');
       if (mode === 'missing-output') {
         console.log(JSON.stringify({ type: 'turn.completed', usage: {} }));
         return;
@@ -109,7 +122,7 @@ if (mode === 'ignore-term') {
 `;
 
   await fs.writeFile(executable, source, { mode: 0o700 });
-  return { capturePath, executable };
+  return { capturePath, eventPath, executable };
 }
 
 async function startBridge(t, options = {}) {
@@ -125,7 +138,9 @@ async function startBridge(t, options = {}) {
         options.maxProcessOutputBytes || 64_000,
       ),
       CODEX_PROXY_MAX_REQUEST_BYTES: String(options.maxBytes || 1_000_000),
+      CODEX_PROXY_MAX_QUEUED_REQUESTS: String(options.maxQueued || 2),
       CODEX_PROXY_MAX_RESULT_BYTES: String(options.maxResultBytes || 2_000_000),
+      CODEX_PROXY_QUEUE_TIMEOUT_MS: String(options.queueTimeoutMs || 15_000),
       CODEX_PROXY_TIMEOUT_MS: String(options.timeoutMs || 2_000),
       PORT: String(port),
       ...(options.tmpRoot ? { TMPDIR: options.tmpRoot } : {}),
@@ -155,7 +170,34 @@ async function startBridge(t, options = {}) {
     await fs.rm(tmpDir, { force: true, recursive: true });
   });
 
-  return { baseUrl: `http://127.0.0.1:${port}`, capturePath: fake.capturePath };
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    capturePath: fake.capturePath,
+    eventPath: fake.eventPath,
+  };
+}
+
+async function readEvents(eventPath) {
+  try {
+    return (await fs.readFile(eventPath, "utf8"))
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map(JSON.parse);
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function waitForEvent(eventPath, predicate, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const events = await readEvents(eventPath);
+    if (events.some(predicate)) return events;
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+  throw new Error("fake Codex event timed out");
 }
 
 async function startRealBridge(t) {
@@ -189,6 +231,225 @@ async function startRealBridge(t) {
   t.after(() => child.kill("SIGTERM"));
   return `http://127.0.0.1:${port}`;
 }
+
+test("execution queue runs one task at a time", async () => {
+  const queue = new ExecutionQueue({ maxQueued: 2, timeoutMs: 1_000 });
+  let releaseFirst;
+  const firstGate = new Promise((resolve) => {
+    releaseFirst = resolve;
+  });
+  const events = [];
+
+  const first = queue.run(async () => {
+    events.push("first-start");
+    await firstGate;
+    events.push("first-finish");
+  });
+  const second = queue.run(async () => {
+    events.push("second-start");
+  });
+
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(events, ["first-start"]);
+  releaseFirst();
+  await Promise.all([first, second]);
+  assert.deepEqual(events, ["first-start", "first-finish", "second-start"]);
+});
+
+test("fake Codex executions are serial within one server", async (t) => {
+  const bridge = await startBridge(t, { delayMs: 200 });
+  const request = (content) =>
+    fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content }] }),
+    });
+
+  const first = request("serial-first");
+  await waitForEvent(
+    bridge.eventPath,
+    (event) => event.event === "start" && event.prompt.includes("serial-first"),
+  );
+  const second = request("serial-second");
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(
+    (await readEvents(bridge.eventPath)).filter(
+      (event) => event.event === "start",
+    ).length,
+    1,
+  );
+
+  assert.equal((await first).status, 200);
+  assert.equal((await second).status, 200);
+  assert.equal(
+    (await readEvents(bridge.eventPath)).filter(
+      (event) => event.event === "start",
+    ).length,
+    2,
+  );
+});
+
+test("a cancelled queued request never launches Codex", async (t) => {
+  const bridge = await startBridge(t, { delayMs: 250 });
+  const requestBody = (content) => ({
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content }] }),
+  });
+
+  const first = fetch(
+    `${bridge.baseUrl}/v1/chat/completions`,
+    requestBody("first-running"),
+  );
+  await waitForEvent(
+    bridge.eventPath,
+    (event) => event.event === "start" && event.prompt.includes("first-running"),
+  );
+
+  const controller = new AbortController();
+  const queued = fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    ...requestBody("second-cancelled"),
+    signal: controller.signal,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  controller.abort();
+  await assert.rejects(queued, { name: "AbortError" });
+  assert.equal((await first).status, 200);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
+  const starts = (await readEvents(bridge.eventPath)).filter(
+    (event) => event.event === "start",
+  );
+  assert.equal(starts.length, 1);
+});
+
+test("cancelling a running request terminates its Codex child", async (t) => {
+  const bridge = await startBridge(t, { delayMs: 1_000 });
+  const controller = new AbortController();
+  const request = fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      messages: [{ role: "user", content: "cancel-running" }],
+    }),
+    signal: controller.signal,
+  });
+
+  await waitForEvent(
+    bridge.eventPath,
+    (event) => event.event === "start" && event.prompt.includes("cancel-running"),
+  );
+  controller.abort();
+  await assert.rejects(request, { name: "AbortError" });
+  const events = await waitForEvent(
+    bridge.eventPath,
+    (event) =>
+      event.event === "terminated" && event.prompt.includes("cancel-running"),
+    500,
+  );
+  assert.equal(events.filter((event) => event.event === "start").length, 1);
+  assert.equal(events.filter((event) => event.event === "terminated").length, 1);
+
+  const recovered = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      messages: [{ role: "user", content: "after-running-cancel" }],
+    }),
+  });
+  assert.equal(recovered.status, 200);
+  assert.equal(
+    (await readEvents(bridge.eventPath)).filter(
+      (event) => event.event === "start",
+    ).length,
+    2,
+  );
+});
+
+test("queue capacity overflow returns bridge_busy without launching", async (t) => {
+  const bridge = await startBridge(t, { delayMs: 250, maxQueued: 1 });
+  const request = (content) =>
+    fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content }] }),
+    });
+
+  const first = request("capacity-first");
+  await waitForEvent(
+    bridge.eventPath,
+    (event) => event.event === "start" && event.prompt.includes("capacity-first"),
+  );
+  const second = request("capacity-second");
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  const overflow = await request("capacity-overflow");
+
+  assert.equal(overflow.status, 503);
+  assert.deepEqual(await overflow.json(), {
+    error: { code: "bridge_busy", type: "bridge_error" },
+  });
+  assert.equal((await first).status, 200);
+  assert.equal((await second).status, 200);
+  const starts = (await readEvents(bridge.eventPath)).filter(
+    (event) => event.event === "start",
+  );
+  assert.equal(starts.length, 2);
+});
+
+test("queue wait deadline returns queue_timeout without launching", async (t) => {
+  const bridge = await startBridge(t, {
+    delayMs: 300,
+    maxQueued: 1,
+    queueTimeoutMs: 50,
+  });
+  const request = (content) =>
+    fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content }] }),
+    });
+
+  const first = request("timeout-first");
+  await waitForEvent(
+    bridge.eventPath,
+    (event) => event.event === "start" && event.prompt.includes("timeout-first"),
+  );
+  const timedOut = await request("timeout-queued");
+
+  assert.equal(timedOut.status, 503);
+  assert.deepEqual(await timedOut.json(), {
+    error: { code: "queue_timeout", type: "bridge_error" },
+  });
+  assert.equal((await first).status, 200);
+  const starts = (await readEvents(bridge.eventPath)).filter(
+    (event) => event.event === "start",
+  );
+  assert.equal(starts.length, 1);
+});
+
+test("a later request succeeds after a Codex process failure", async (t) => {
+  const bridge = await startBridge(t, { mode: "fail-first" });
+  const request = (content) =>
+    fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content }] }),
+    });
+
+  const failed = await request("recovery-failure");
+  assert.equal(failed.status, 502);
+  assert.deepEqual(await failed.json(), {
+    error: { code: "codex_execution_failed", type: "bridge_error" },
+  });
+
+  const recovered = await request("recovery-success");
+  assert.equal(recovered.status, 200);
+  assert.equal((await recovered.json()).choices[0].message.content, "ok");
+  const starts = (await readEvents(bridge.eventPath)).filter(
+    (event) => event.event === "start",
+  );
+  assert.equal(starts.length, 2);
+});
 
 test("modern and legacy tool-call responses retain IDs and arguments", () => {
   const result = {
