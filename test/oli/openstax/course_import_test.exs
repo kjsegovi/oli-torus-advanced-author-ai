@@ -646,6 +646,63 @@ defmodule Oli.OpenStax.CourseImportTest do
     assert Ecto.Changeset.get_field(job_changeset, :queue) == "course_import_ai"
   end
 
+  for capacity_reason <- [:over_capacity, :secondary_over_capacity] do
+    test "lesson planning retries #{capacity_reason} once before bounded discard", %{
+      author: author,
+      project: project,
+      root: root
+    } do
+      capacity_reason = unquote(capacity_reason)
+
+      Application.put_env(
+        :oli,
+        :openstax_course_import_lesson_planner,
+        fn _source, _position, _opts ->
+          {:error, {:ai_planning_failed, capacity_reason}}
+        end
+      )
+
+      assert {:ok, run} =
+               CourseImport.start_import(
+                 project,
+                 root,
+                 author,
+                 "https://openstax.org/details/books/sample-book"
+               )
+
+      assert :ok = perform_job(PreflightWorker, %{"run_id" => run.id})
+      assert {:ok, _} = CourseImport.update_scope(run.id, author, ["chapter-1"])
+      assert :ok = perform_job(OutlineWorker, %{"run_id" => run.id})
+      assert {:ok, planning} = CourseImport.approve_outline(run.id, author)
+
+      assert {:ok, _run} =
+               CourseImport.initialize_parallel_lesson_planning(
+                 run.id,
+                 planning.lesson_planning_generation
+               )
+
+      {:ok, details} = CourseImport.get_run(project, author, run.id)
+      lesson = details.units |> Enum.flat_map(& &1.lessons) |> List.first()
+      job = Repo.get!(Oban.Job, lesson.planning_oban_job_id)
+
+      assert {:error, :provider_capacity} =
+               LessonPlanWorker.perform(%{job | attempt: 1, max_attempts: 4})
+
+      retrying = Repo.get!(CourseImport.Lesson, lesson.id)
+      assert retrying.planning_state == "retrying"
+      assert retrying.planning_error["category"] == "provider_capacity"
+      assert retrying.planning_error["retryable"]
+
+      assert {:discard, :provider_capacity} =
+               LessonPlanWorker.perform(%{job | attempt: 2, max_attempts: 4})
+
+      failed = Repo.get!(CourseImport.Lesson, lesson.id)
+      assert failed.planning_state == "failed"
+      assert failed.planning_error["category"] == "provider_capacity"
+      refute failed.planning_error["retryable"]
+    end
+  end
+
   test "terminal preflight timeouts release the active-import and root-change guards", %{
     author: author,
     project: project,
