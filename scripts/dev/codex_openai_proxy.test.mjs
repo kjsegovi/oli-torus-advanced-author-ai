@@ -200,6 +200,14 @@ async function waitForEvent(eventPath, predicate, timeoutMs = 2_000) {
   throw new Error("fake Codex event timed out");
 }
 
+function parseSseEvents(text) {
+  return text
+    .trim()
+    .split("\n\n")
+    .map((event) => event.replace(/^data: /, ""))
+    .map((payload) => (payload === "[DONE]" ? payload : JSON.parse(payload)));
+}
+
 async function startRealBridge(t) {
   const port = await unusedPort();
   const child = spawn(process.execPath, [bridgePath], {
@@ -1033,6 +1041,120 @@ test("request limits and execution timeouts fail with sanitized bridge codes", a
   assert.deepEqual(await timeout.json(), {
     error: { code: "execution_timeout", type: "bridge_error" },
   });
+});
+
+test("malformed JSON returns a typed client error", async (t) => {
+  const bridge = await startBridge(t);
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "{not-json",
+  });
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), {
+    error: { code: "invalid_json", type: "bridge_error" },
+  });
+});
+
+test("invalid completion bodies return typed client errors", async (t) => {
+  const bridge = await startBridge(t);
+  const cases = [
+    { name: "null", body: "null", code: "invalid_json" },
+    { name: "array", body: "[]", code: "invalid_json" },
+    { name: "missing messages", body: JSON.stringify({}), code: "invalid_completion_request" },
+    {
+      name: "malformed tools",
+      body: JSON.stringify({ messages: [], tools: {} }),
+      code: "invalid_completion_request",
+    },
+  ];
+
+  for (const { body, code, name } of cases) {
+    const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+    });
+
+    assert.equal(response.status, 400, name);
+    assert.deepEqual(
+      await response.json(),
+      { error: { code, type: "bridge_error" } },
+      name,
+    );
+  }
+});
+
+test("malformed research body returns a typed client error", async (t) => {
+  const bridge = await startBridge(t);
+  const response = await fetch(`${bridge.baseUrl}/v1/codex/research`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: "[]",
+  });
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), {
+    error: { code: "invalid_json", type: "bridge_error" },
+  });
+});
+
+test("modern tool streams use indexed calls and complete with a stable empty delta", async (t) => {
+  const bridge = await startBridge(t);
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      stream: true,
+      tools: [{ type: "function", function: tool }],
+      messages: [{ role: "user", content: "Use the review tool." }],
+    }),
+  });
+
+  assert.equal(response.status, 200);
+  const events = parseSseEvents(await response.text());
+  assert.equal(events.at(-1), "[DONE]");
+  assert.equal(events.length, 3);
+  assert.equal(events[0].choices[0].delta.tool_calls[0].index, 0);
+  assert.equal(events[1].choices[0].finish_reason, "tool_calls");
+  assert.deepEqual(events[1].choices[0].delta, {});
+  assert.equal(events[1].id, events[0].id);
+  assert.equal(events[1].model, events[0].model);
+  assert.equal(events[1].created, events[0].created);
+});
+
+test("message and legacy function-call streams retain their response shapes", async (t) => {
+  const bridge = await startBridge(t);
+  const message = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      stream: true,
+      messages: [{ role: "user", content: "Reply normally." }],
+    }),
+  });
+  const messageEvents = parseSseEvents(await message.text());
+  assert.equal(messageEvents[0].choices[0].delta.role, "assistant");
+  assert.equal(messageEvents[0].choices[0].delta.content, "ok");
+  assert.deepEqual(messageEvents[1].choices[0].delta, {});
+
+  const legacy = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      stream: true,
+      functions: [tool],
+      messages: [{ role: "user", content: "Use the review tool." }],
+    }),
+  });
+  const legacyEvents = parseSseEvents(await legacy.text());
+  assert.equal(
+    legacyEvents[0].choices[0].delta.function_call.name,
+    tool.name,
+  );
+  assert.equal(legacyEvents[0].choices[0].delta.tool_calls, undefined);
+  assert.deepEqual(legacyEvents[1].choices[0].delta, {});
 });
 
 test(

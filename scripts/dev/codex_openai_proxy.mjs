@@ -225,6 +225,31 @@ function readBody(req) {
   });
 }
 
+async function parseJsonBody(req) {
+  let body;
+  try {
+    body = JSON.parse(await readBody(req));
+  } catch (error) {
+    if (error instanceof BridgeError) throw error;
+    throw new BridgeError("invalid_json", 400);
+  }
+
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw new BridgeError("invalid_json", 400);
+  }
+  return body;
+}
+
+function validateCompletionBody(body) {
+  if (!Array.isArray(body.messages)) {
+    throw new BridgeError("invalid_completion_request", 400);
+  }
+  if (body.tools !== undefined && !Array.isArray(body.tools)) {
+    throw new BridgeError("invalid_completion_request", 400);
+  }
+  return body;
+}
+
 function normalizeTools(body) {
   if (Array.isArray(body.tools)) {
     return body.tools
@@ -837,15 +862,21 @@ function asChatCompletion(result, requestedModel, usage, modernTools) {
 function streamChatCompletion(res, response) {
   startSse(res);
   const choice = response.choices[0];
+  const delta = { ...choice.message };
+
+  if (Array.isArray(delta.tool_calls)) {
+    delta.tool_calls = delta.tool_calls.map((call, index) => ({ ...call, index }));
+  }
+
   writeSse(res, {
-    choices: [{ delta: choice.message, index: 0 }],
+    choices: [{ delta, index: 0 }],
     created: response.created,
     id: response.id,
     model: response.model,
     object: "chat.completion.chunk",
   });
   writeSse(res, {
-    choices: [{ finish_reason: choice.finish_reason, index: 0 }],
+    choices: [{ delta: {}, finish_reason: choice.finish_reason, index: 0 }],
     created: response.created,
     id: response.id,
     model: response.model,
@@ -947,7 +978,7 @@ export function createServer() {
         return;
       }
 
-      const body = JSON.parse(await readBody(req));
+      const body = await parseJsonBody(req);
 
       if (req.url === "/v1/codex/research") {
         const allowedDomains = validateResearchBody(body);
@@ -980,8 +1011,9 @@ export function createServer() {
         return;
       }
 
+      validateCompletionBody(body);
       const tools = normalizeTools(body);
-      const messages = Array.isArray(body.messages) ? body.messages : [];
+      const messages = body.messages;
       const execution = await executionQueue.run(
         () =>
           executeCodex({
