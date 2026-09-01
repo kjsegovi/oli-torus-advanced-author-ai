@@ -40,7 +40,7 @@ async function unusedPort() {
 
 async function fakeCodex(
   tmpDir,
-  { auth = "chatgpt", delayMs = 0, chatResult } = {},
+  { auth = "chatgpt", chatResult, delayMs = 0, mode = "normal" } = {},
 ) {
   const executable = path.join(tmpDir, "fake-codex");
   const capturePath = path.join(tmpDir, "capture.jsonl");
@@ -52,37 +52,60 @@ async function fakeCodex(
   const source = `#!/usr/bin/env node
 const fs = require('node:fs');
 const args = process.argv.slice(2);
+const mode = ${JSON.stringify(mode)};
 if (args[0] === 'login') { console.log(${JSON.stringify(authText)}); process.exit(0); }
-let prompt = '';
-process.stdin.on('data', (chunk) => { prompt += chunk.toString(); });
-process.stdin.on('end', () => {
-  setTimeout(() => {
-    const outputIndex = args.indexOf('--output-last-message');
-    const outputPath = args[outputIndex + 1];
-    const research = prompt.includes('Research the educational simulation evidence request');
-    const result = research
-      ? {
-          retrieved_sources: [
-            { url: 'https://www.nist.gov/a', title: 'NIST A' },
-            { url: 'https://pubchem.ncbi.nlm.nih.gov/b', title: 'PubChem B' }
-          ],
-          claims: [
-            { paraphrase: 'A grounded claim.', citation_urls: ['https://www.nist.gov/a'] },
-            { paraphrase: 'A second claim.', citation_urls: ['https://pubchem.ncbi.nlm.nih.gov/b'] }
-          ],
-          search_count: 2
-        }
-      : ${JSON.stringify(chatResult)} || (prompt.includes('review_openstax_questions')
-        ? { type: 'function_call', name: 'review_openstax_questions', arguments: { candidate: 'v2' } }
-        : { type: 'message', content: 'ok' });
-    fs.appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args, prompt }) + '\\n');
-    fs.writeFileSync(outputPath, JSON.stringify(result));
-    console.log(JSON.stringify({
-      type: 'turn.completed',
-      usage: { input_tokens: 120, cached_input_tokens: 20, output_tokens: 30 }
-    }));
-  }, ${delayMs});
-});
+if (mode === 'immediate-exit') process.exit(17);
+if (mode === 'ignore-term') {
+  process.on('SIGTERM', () => {});
+  process.stdin.resume();
+  setInterval(() => {}, 1000);
+} else {
+  let prompt = '';
+  process.stdin.on('data', (chunk) => { prompt += chunk.toString(); });
+  process.stdin.on('end', () => {
+    setTimeout(() => {
+      const outputIndex = args.indexOf('--output-last-message');
+      const outputPath = args[outputIndex + 1];
+      if (mode === 'nonzero-diagnostics') {
+        process.stdout.write('STDOUT_FIXTURE_SECRET'.repeat(60_000));
+        process.stderr.write('STDERR_FIXTURE_SECRET'.repeat(60_000));
+        process.exit(9);
+      }
+      const research = prompt.includes('Research the educational simulation evidence request');
+      const result = research
+        ? {
+            retrieved_sources: [
+              { url: 'https://www.nist.gov/a', title: 'NIST A' },
+              { url: 'https://pubchem.ncbi.nlm.nih.gov/b', title: 'PubChem B' }
+            ],
+            claims: [
+              { paraphrase: 'A grounded claim.', citation_urls: ['https://www.nist.gov/a'] },
+              { paraphrase: 'A second claim.', citation_urls: ['https://pubchem.ncbi.nlm.nih.gov/b'] }
+            ],
+            search_count: 2
+          }
+        : ${JSON.stringify(chatResult)} || (prompt.includes('review_openstax_questions')
+          ? { type: 'function_call', name: 'review_openstax_questions', arguments: { candidate: 'v2' } }
+          : { type: 'message', content: 'ok' });
+      fs.appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args, prompt }) + '\\n');
+      if (mode === 'missing-output') {
+        console.log(JSON.stringify({ type: 'turn.completed', usage: {} }));
+        return;
+      }
+      if (mode === 'malformed-output') fs.writeFileSync(outputPath, '{not-json');
+      else if (mode === 'oversized-output') fs.writeFileSync(outputPath, 'x'.repeat(10_000));
+      else if (mode === 'symlink-output') {
+        const targetPath = outputPath + '.target';
+        fs.writeFileSync(targetPath, JSON.stringify(result));
+        fs.symlinkSync(targetPath, outputPath);
+      } else fs.writeFileSync(outputPath, JSON.stringify(result));
+      console.log(JSON.stringify({
+        type: 'turn.completed',
+        usage: { input_tokens: 120, cached_input_tokens: 20, output_tokens: 30 }
+      }));
+    }, ${delayMs});
+  });
+}
 `;
 
   await fs.writeFile(executable, source, { mode: 0o700 });
@@ -96,10 +119,16 @@ async function startBridge(t, options = {}) {
   const child = spawn(process.execPath, [bridgePath], {
     env: {
       ...process.env,
-      CODEX_BIN: fake.executable,
-      CODEX_PROXY_MAX_REQUEST_BYTES: String(options.maxBytes || 100_000),
+      CODEX_BIN: options.codexBin || fake.executable,
+      CODEX_PROXY_KILL_GRACE_MS: String(options.killGraceMs || 2_000),
+      CODEX_PROXY_MAX_PROCESS_OUTPUT_BYTES: String(
+        options.maxProcessOutputBytes || 64_000,
+      ),
+      CODEX_PROXY_MAX_REQUEST_BYTES: String(options.maxBytes || 1_000_000),
+      CODEX_PROXY_MAX_RESULT_BYTES: String(options.maxResultBytes || 2_000_000),
       CODEX_PROXY_TIMEOUT_MS: String(options.timeoutMs || 2_000),
       PORT: String(port),
+      ...(options.tmpRoot ? { TMPDIR: options.tmpRoot } : {}),
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -485,6 +514,186 @@ test("a fake Codex executable verifies readiness, modern history, research, and 
   assert.ok(captures[1].args.includes('web_search="live"'));
   assert.ok(
     captures[1].args.some((value) => value.includes("allowed_domains")),
+  );
+});
+
+test("an immediate Codex exit contains EPIPE and leaves the proxy healthy", async (t) => {
+  const bridge = await startBridge(t, { mode: "immediate-exit" });
+  const fixtureSecret = "PROMPT_FIXTURE_SECRET";
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      messages: [
+        { role: "user", content: fixtureSecret + "x".repeat(500_000) },
+      ],
+    }),
+  });
+
+  assert.equal(response.status, 502);
+  const responseText = await response.text();
+  assert.deepEqual(JSON.parse(responseText), {
+    error: { code: "codex_execution_failed", type: "bridge_error" },
+  });
+  assert.doesNotMatch(responseText, new RegExp(fixtureSecret));
+
+  const health = await fetch(`${bridge.baseUrl}/health`);
+  assert.equal(health.status, 200);
+  assert.equal((await health.json()).code, "ready");
+});
+
+test("large subprocess diagnostics are bounded and redacted", async (t) => {
+  const bridge = await startBridge(t, {
+    maxProcessOutputBytes: 1_024,
+    mode: "nonzero-diagnostics",
+  });
+  const promptSecret = "PROMPT_FIXTURE_SECRET";
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      messages: [{ role: "user", content: promptSecret }],
+    }),
+  });
+
+  assert.equal(response.status, 502);
+  const responseText = await response.text();
+  assert.deepEqual(JSON.parse(responseText), {
+    error: { code: "codex_execution_failed", type: "bridge_error" },
+  });
+  for (const secret of [
+    promptSecret,
+    "STDOUT_FIXTURE_SECRET",
+    "STDERR_FIXTURE_SECRET",
+  ]) {
+    assert.doesNotMatch(responseText, new RegExp(secret));
+  }
+});
+
+test("a missing Codex executable returns a typed service error", async (t) => {
+  const bridge = await startBridge(t, {
+    codexBin: path.join(os.tmpdir(), "definitely-missing-codex"),
+  });
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+  });
+
+  assert.equal(response.status, 503);
+  assert.deepEqual(await response.json(), {
+    error: { code: "codex_missing", type: "bridge_error" },
+  });
+
+  const health = await fetch(`${bridge.baseUrl}/health`);
+  assert.equal(health.status, 503);
+  assert.deepEqual(await health.json(), { code: "codex_missing", ok: false });
+});
+
+test("a successful Codex exit without an output file is typed", async (t) => {
+  const bridge = await startBridge(t, { mode: "missing-output" });
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+  });
+
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), {
+    error: { code: "codex_output_missing", type: "bridge_error" },
+  });
+});
+
+test("malformed Codex output returns the typed validation error", async (t) => {
+  const bridge = await startBridge(t, { mode: "malformed-output" });
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+  });
+
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), {
+    error: { code: "invalid_codex_output", type: "bridge_error" },
+  });
+});
+
+test("oversized Codex output is rejected before it is read", async (t) => {
+  const bridge = await startBridge(t, {
+    maxResultBytes: 1_024,
+    mode: "oversized-output",
+  });
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+  });
+
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), {
+    error: { code: "codex_output_too_large", type: "bridge_error" },
+  });
+});
+
+test("Codex output must be a directly opened regular file", async (t) => {
+  const bridge = await startBridge(t, { mode: "symlink-output" });
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "hello" }] }),
+  });
+
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), {
+    error: { code: "invalid_codex_output", type: "bridge_error" },
+  });
+});
+
+test("unsupported models are rejected before temporary directory creation", async (t) => {
+  const missingTmpRoot = path.join(
+    os.tmpdir(),
+    `missing-codex-tmp-${process.pid}-${Date.now()}`,
+  );
+  const bridge = await startBridge(t, { tmpRoot: missingTmpRoot });
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      model: "codex-proxy/unsupported-model",
+      messages: [{ role: "user", content: "hello" }],
+    }),
+  });
+
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), {
+    error: { code: "unsupported_model", type: "bridge_error" },
+  });
+  await assert.rejects(fs.stat(missingTmpRoot), { code: "ENOENT" });
+});
+
+test("timeout honors the configured kill grace for SIGTERM-resistant children", async (t) => {
+  const timeoutMs = 50;
+  const killGraceMs = 100;
+  const bridge = await startBridge(t, {
+    killGraceMs,
+    mode: "ignore-term",
+    timeoutMs,
+  });
+  const startedAt = Date.now();
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "timeout" }] }),
+  });
+  const elapsedMs = Date.now() - startedAt;
+
+  assert.equal(response.status, 504);
+  assert.deepEqual(await response.json(), {
+    error: { code: "execution_timeout", type: "bridge_error" },
+  });
+  assert.ok(
+    elapsedMs <= timeoutMs + killGraceMs + 500,
+    `elapsed ${elapsedMs}ms exceeded timeout plus kill grace`,
   );
 });
 

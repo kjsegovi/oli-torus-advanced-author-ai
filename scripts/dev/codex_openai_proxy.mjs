@@ -13,7 +13,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { constants as fsConstants, promises as fs } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 const HOST = "127.0.0.1";
@@ -29,6 +29,18 @@ const LOGIN_TIMEOUT_MS = positiveInteger(
 );
 const MAX_REQUEST_BYTES = positiveInteger(
   process.env.CODEX_PROXY_MAX_REQUEST_BYTES,
+  2_000_000,
+);
+const KILL_GRACE_MS = positiveInteger(
+  process.env.CODEX_PROXY_KILL_GRACE_MS,
+  2_000,
+);
+const MAX_PROCESS_OUTPUT_BYTES = positiveInteger(
+  process.env.CODEX_PROXY_MAX_PROCESS_OUTPUT_BYTES,
+  64_000,
+);
+const MAX_RESULT_BYTES = positiveInteger(
+  process.env.CODEX_PROXY_MAX_RESULT_BYTES,
   2_000_000,
 );
 const DEFAULT_MODEL = process.env.CODEX_MODEL || "gpt-5.6-terra";
@@ -54,11 +66,10 @@ const PASSTHROUGH_ENV = [
 let executionTail = Promise.resolve();
 
 class BridgeError extends Error {
-  constructor(code, status = 500, details) {
+  constructor(code, status = 500) {
     super(code);
     this.code = code;
     this.status = status;
-    this.details = details;
   }
 }
 
@@ -360,6 +371,11 @@ function codexArgs({
   return args;
 }
 
+function appendBounded(current, chunk, limit) {
+  const next = Buffer.concat([current, chunk]);
+  return next.length > limit ? next.subarray(next.length - limit) : next;
+}
+
 function runProcess(args, { cwd, input = "", timeoutMs }) {
   return new Promise((resolve, reject) => {
     const child = spawn(CODEX_BIN, args, {
@@ -367,41 +383,59 @@ function runProcess(args, { cwd, input = "", timeoutMs }) {
       env: filteredEnvironment(),
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const stdout = [];
-    const stderr = [];
+    let stdout = Buffer.alloc(0);
+    let stderr = Buffer.alloc(0);
+    let settled = false;
     let timedOut = false;
+    let inputFailed = false;
+    let killTimer;
+
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      if (error) reject(error);
+      else resolve(result);
+    };
 
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+      killTimer = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
+      killTimer.unref();
     }, timeoutMs);
 
-    child.stdout.on("data", (chunk) => stdout.push(chunk));
-    child.stderr.on("data", (chunk) => stderr.push(chunk));
-    child.on("error", (error) => {
-      clearTimeout(timer);
-      reject(error);
+    child.stdout.on("data", (chunk) => {
+      stdout = appendBounded(stdout, chunk, MAX_PROCESS_OUTPUT_BYTES);
     });
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      if (timedOut) return reject(new BridgeError("execution_timeout", 504));
-
-      const stderrText = Buffer.concat(stderr).toString("utf8");
-      const stdoutText = Buffer.concat(stdout).toString("utf8");
-      if (code !== 0) {
-        return reject(
-          new BridgeError("codex_execution_failed", 502, {
-            exit_code: code,
-            stderr: stderrText.slice(-2000),
-            stdout: stdoutText.slice(-4000),
-          }),
-        );
+    child.stderr.on("data", (chunk) => {
+      stderr = appendBounded(stderr, chunk, MAX_PROCESS_OUTPUT_BYTES);
+    });
+    child.stdin.on("error", () => {
+      inputFailed = true;
+      child.kill("SIGTERM");
+    });
+    child.on("error", (error) => {
+      const bridgeError =
+        error?.code === "ENOENT"
+          ? new BridgeError("codex_missing", 503)
+          : new BridgeError("codex_execution_failed", 502);
+      finish(bridgeError);
+    });
+    child.on("close", (code, signal) => {
+      if (timedOut) {
+        finish(new BridgeError("execution_timeout", 504));
+        return;
+      }
+      if (inputFailed || code !== 0 || signal) {
+        finish(new BridgeError("codex_execution_failed", 502));
+        return;
       }
 
-      resolve({
-        stderr: stderrText,
-        stdout: stdoutText,
+      finish(null, {
+        stderr: stderr.toString("utf8"),
+        stdout: stdout.toString("utf8"),
       });
     });
 
@@ -435,6 +469,51 @@ function parseUsage(jsonl) {
   };
 }
 
+async function readCodexOutput(outputPath) {
+  let output;
+  try {
+    output = await fs.open(
+      outputPath,
+      fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK,
+    );
+  } catch (error) {
+    if (error?.code === "ENOENT") {
+      throw new BridgeError("codex_output_missing", 502);
+    }
+    throw new BridgeError("invalid_codex_output", 502);
+  }
+
+  try {
+    const outputStat = await output.stat();
+    if (!outputStat.isFile()) {
+      throw new BridgeError("invalid_codex_output", 502);
+    }
+    if (outputStat.size > MAX_RESULT_BYTES) {
+      throw new BridgeError("codex_output_too_large", 502);
+    }
+
+    const chunks = [];
+    let bytes = 0;
+    while (bytes <= MAX_RESULT_BYTES) {
+      const capacity = Math.min(64_000, MAX_RESULT_BYTES - bytes + 1);
+      const chunk = Buffer.allocUnsafe(capacity);
+      const { bytesRead } = await output.read(chunk, 0, capacity, bytes);
+      if (bytesRead === 0) break;
+      chunks.push(chunk.subarray(0, bytesRead));
+      bytes += bytesRead;
+    }
+    if (bytes > MAX_RESULT_BYTES) {
+      throw new BridgeError("codex_output_too_large", 502);
+    }
+    return Buffer.concat(chunks, bytes).toString("utf8");
+  } catch (error) {
+    if (error instanceof BridgeError) throw error;
+    throw new BridgeError("invalid_codex_output", 502);
+  } finally {
+    await output.close();
+  }
+}
+
 async function executeCodex({
   allowedDomains = [],
   model,
@@ -442,10 +521,10 @@ async function executeCodex({
   research = false,
   schema,
 }) {
+  const selectedModel = actualModel(model);
   const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "torus-codex-poc-"));
   const schemaPath = path.join(tmpDir, "schema.json");
   const outputPath = path.join(tmpDir, "output.json");
-  const selectedModel = actualModel(model);
 
   try {
     await fs.writeFile(schemaPath, JSON.stringify(schema), {
@@ -462,7 +541,7 @@ async function executeCodex({
       }),
       { cwd: tmpDir, input: prompt, timeoutMs: EXECUTION_TIMEOUT_MS },
     );
-    const result = JSON.parse(await fs.readFile(outputPath, "utf8"));
+    const result = JSON.parse(await readCodexOutput(outputPath));
     return {
       model: selectedModel,
       result,
@@ -685,7 +764,8 @@ async function loginReadiness() {
     }
     return { code: "not_authenticated", ok: false };
   } catch (error) {
-    if (error?.code === "ENOENT") return { code: "codex_missing", ok: false };
+    if (error?.code === "codex_missing")
+      return { code: "codex_missing", ok: false };
     if (error?.code === "execution_timeout")
       return { code: "login_status_timeout", ok: false };
     return { code: "not_authenticated", ok: false };
@@ -805,9 +885,6 @@ export function createServer() {
       const status = error instanceof BridgeError ? error.status : 500;
       const code = error instanceof BridgeError ? error.code : "bridge_failed";
       const body = { error: { code, type: "bridge_error" } };
-      if (error instanceof BridgeError && error.details) {
-        body.error.details = error.details;
-      }
       writeJson(res, status, body);
       logMetadata(id, { code, duration_ms: Date.now() - startedAt, status });
     }
