@@ -171,20 +171,20 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
          repair,
          history
        ) do
-    generator_opts =
-      [
-        simulation_spec: spec,
-        research_set: research,
-        run_id: artifact.run_id,
-        lesson_id: artifact.lesson_id,
-        operation_id: artifact.id,
-        cost_scope: :simulation
-      ]
-      |> Kernel.++(AIBackend.generator_options(backend_for(artifact.run_id)))
-      |> maybe_put_option(:author_feedback, artifact_author_feedback(artifact))
-      |> maybe_put_option(:repair, repair)
-
-    with :ok <- ensure_reviewable(artifact.run_id),
+    with {:ok, backend_opts} <- AIBackend.generator_options(backend_for(artifact.run_id)),
+         generator_opts <-
+           [
+             simulation_spec: spec,
+             research_set: research,
+             run_id: artifact.run_id,
+             lesson_id: artifact.lesson_id,
+             operation_id: artifact.id,
+             cost_scope: :simulation
+           ]
+           |> Kernel.++(backend_opts)
+           |> maybe_put_option(:author_feedback, artifact_author_feedback(artifact))
+           |> maybe_put_option(:repair, repair),
+         :ok <- ensure_reviewable(artifact.run_id),
          {:ok, generated} <- Generator.generate(proposal, generator_opts) do
       case assemble_libraries(generated, project_id) do
         {:ok, assembled} ->
@@ -273,75 +273,78 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationGenerationWorker do
        ) do
     validation = compact_validation(validated)
 
-    critic_opts =
-      [
-        run_id: artifact.run_id,
-        lesson_id: artifact.lesson_id,
-        operation_id: artifact.id,
-        candidate_number: attempt,
-        cost_scope: :simulation
-      ] ++ AIBackend.artifact_critic_options(backend_for(artifact.run_id))
+    with {:ok, backend_opts} <-
+           AIBackend.artifact_critic_options(backend_for(artifact.run_id)) do
+      critic_opts =
+        [
+          run_id: artifact.run_id,
+          lesson_id: artifact.lesson_id,
+          operation_id: artifact.id,
+          candidate_number: attempt,
+          cost_scope: :simulation
+        ] ++ backend_opts
 
-    case ArtifactCritic.review(spec, research, generated, validated, critic_opts) do
-      {:ok, criticism} ->
-        with {:ok, persisted_attempt} <-
-               persist_builder_attempt(
-                 artifact,
-                 generated,
-                 "accepted",
-                 [],
-                 validation,
-                 criticism,
-                 validated
-               ) do
-          accepted = %{
-            "attempt" => persisted_attempt.attempt_number,
-            "status" => "accepted",
-            "validation" => validation,
-            "criticism" => criticism
-          }
+      case ArtifactCritic.review(spec, research, generated, validated, critic_opts) do
+        {:ok, criticism} ->
+          with {:ok, persisted_attempt} <-
+                 persist_builder_attempt(
+                   artifact,
+                   generated,
+                   "accepted",
+                   [],
+                   validation,
+                   criticism,
+                   validated
+                 ) do
+            accepted = %{
+              "attempt" => persisted_attempt.attempt_number,
+              "status" => "accepted",
+              "validation" => validation,
+              "criticism" => criticism
+            }
 
-          {:ok,
-           %{
-             generated: generated,
-             validated: validated,
-             criticism: criticism,
-             repair_count: attempt - 1,
-             history: history ++ [accepted]
-           }}
-        end
+            {:ok,
+             %{
+               generated: generated,
+               validated: validated,
+               criticism: criticism,
+               repair_count: attempt - 1,
+               history: history ++ [accepted]
+             }}
+          end
 
-      {:error, {:artifact_critic_rejected, criticism}} ->
-        repair_builder_or_stop(
-          artifact,
-          proposal,
-          spec,
-          research,
-          project_id,
-          attempt,
-          generated,
-          critic_findings(criticism),
-          validation,
-          criticism,
-          history,
-          "critic_rejected"
-        )
+        {:error, {:artifact_critic_rejected, criticism}} ->
+          repair_builder_or_stop(
+            artifact,
+            proposal,
+            spec,
+            research,
+            project_id,
+            attempt,
+            generated,
+            critic_findings(criticism),
+            validation,
+            criticism,
+            history,
+            "critic_rejected"
+          )
 
-      {:error, reason} ->
-        criticism = %{"failure" => finding(reason, "artifact_critic")}
+        {:error, reason} ->
+          criticism = %{"failure" => finding(reason, "artifact_critic")}
 
-        with {:ok, _persisted_attempt} <-
-               persist_builder_attempt(
-                 artifact,
-                 generated,
-                 "critic_failed",
-                 findings(reason, "artifact_critic"),
-                 validation,
-                 criticism,
-                 validated
-               ) do
-          {:error, reason}
-        end
+          with {:ok, _persisted_attempt} <-
+                 persist_builder_attempt(
+                   artifact,
+                   generated,
+                   "critic_failed",
+                   findings(reason, "artifact_critic"),
+                   validation,
+                   criticism,
+                   validated
+                 ) do
+            {:error, reason}
+          end
+      end
     end
   end
 

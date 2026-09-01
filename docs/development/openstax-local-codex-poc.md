@@ -65,7 +65,9 @@ criticism keep using that backend. There is no API fallback.
 6. Verify readiness:
 
    ```bash
-   curl --fail http://localhost:4001/health
+   curl --fail \
+     --header "Authorization: Bearer $CODEX_PROXY_TOKEN" \
+     http://localhost:4001/health
    ```
 
    A ready response has `"ok":true` and `"auth_method":"chatgpt"`. The import form then

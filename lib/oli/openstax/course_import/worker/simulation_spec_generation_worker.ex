@@ -63,6 +63,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationSpecGenerationWorker do
          {:ok, research} <- Enrichment.fetch_research_set(spec.research_set_id),
          true <- proposal.run_id == spec.run_id and research.run_id == spec.run_id,
          true <- research.status == "approved" and research.content_hash == spec.evidence_hash,
+         {:ok, services} <- AIBackend.simulation_spec_services(run.ai_backend),
          designer_opts <-
            [
              three_d_enabled: three_d_enabled?(spec.project_id),
@@ -72,7 +73,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.SimulationSpecGenerationWorker do
              cost_scope: :simulation,
              ai_backend: run.ai_backend
            ]
-           |> maybe_put_services(AIBackend.simulation_spec_services(run.ai_backend)),
+           |> maybe_put_services(services),
          result <-
            SimulationSpecDesigner.generate(
              proposal,

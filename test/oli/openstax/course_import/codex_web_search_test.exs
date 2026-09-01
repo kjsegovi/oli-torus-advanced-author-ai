@@ -6,12 +6,16 @@ defmodule Oli.OpenStax.CourseImport.CodexWebSearchTest do
 
   setup do
     original_token = Application.get_env(:oli, :openstax_codex_proxy_token)
+    original_openai_key = System.get_env("OPENAI_API_KEY")
+    Application.put_env(:oli, :openstax_codex_proxy_token, "research-test-bridge-token")
 
     on_exit(fn ->
       case original_token do
         nil -> Application.delete_env(:oli, :openstax_codex_proxy_token)
         token -> Application.put_env(:oli, :openstax_codex_proxy_token, token)
       end
+
+      restore_system_env("OPENAI_API_KEY", original_openai_key)
     end)
   end
 
@@ -107,6 +111,30 @@ defmodule Oli.OpenStax.CourseImport.CodexWebSearchTest do
     assert {:ok, _result} = CodexWebSearch.research(proposal, request_fun: request_fun)
   end
 
+  test "missing bridge token fails before research provider requests or global key fallback" do
+    global_key = "synthetic-research-openai-key-must-not-escape"
+    System.put_env("OPENAI_API_KEY", global_key)
+
+    proposal = %EnrichmentProposal{
+      kind: "generated_simulation",
+      learner_task: "Compare pressure.",
+      instructional_rationale: "Use evidence.",
+      source_evidence: %{"block-1" => %{"summary" => "Evidence"}},
+      metadata: %{"domain" => "chemistry", "research_query" => "pressure"}
+    }
+
+    for token <- [nil, "", "   "] do
+      restore_application_env(:openstax_codex_proxy_token, token)
+
+      assert {:error, {:local_codex_configuration_error, :missing_proxy_token}} =
+               CodexWebSearch.research(proposal,
+                 request_fun: fn _payload, _headers ->
+                   flunk("missing bridge tokens must fail before a research provider request")
+                 end
+               )
+    end
+  end
+
   test "rejects citations returned outside the server allowlist" do
     proposal = %EnrichmentProposal{
       kind: "generated_simulation",
@@ -136,4 +164,9 @@ defmodule Oli.OpenStax.CourseImport.CodexWebSearchTest do
                end
              )
   end
+
+  defp restore_application_env(key, nil), do: Application.delete_env(:oli, key)
+  defp restore_application_env(key, value), do: Application.put_env(:oli, key, value)
+  defp restore_system_env(key, nil), do: System.delete_env(key)
+  defp restore_system_env(key, value), do: System.put_env(key, value)
 end

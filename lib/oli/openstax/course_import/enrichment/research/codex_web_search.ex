@@ -21,7 +21,8 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Research.CodexWebSearch do
     query = get_in(proposal.metadata || %{}, ["research_query"])
     allowed_domains = ResponsesWebSearch.allowed_domains(domain, opts)
 
-    with true <- present?(query),
+    with :ok <- require_authorization(opts),
+         true <- present?(query),
          true <- allowed_domains != [],
          {:ok, response} <- request(payload(proposal, domain, query, allowed_domains, opts), opts),
          {:ok, result} <-
@@ -54,7 +55,7 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Research.CodexWebSearch do
   end
 
   defp request(payload, opts) do
-    headers = AIBackend.authorization_headers()
+    headers = authorization_headers(opts)
 
     case Keyword.get(opts, :request_fun) do
       fun when is_function(fun, 2) ->
@@ -101,6 +102,22 @@ defmodule Oli.OpenStax.CourseImport.Enrichment.Research.CodexWebSearch do
         end
     end
   end
+
+  defp require_authorization(opts) do
+    configured? =
+      Enum.any?(authorization_headers(opts), fn
+        {"Authorization", "Bearer " <> token} -> String.trim(token) != ""
+        _ -> false
+      end)
+
+    case configured? do
+      true -> :ok
+      false -> {:error, {:local_codex_configuration_error, :missing_proxy_token}}
+    end
+  end
+
+  defp authorization_headers(opts),
+    do: Keyword.get(opts, :authorization_headers, AIBackend.authorization_headers())
 
   defp normalize_domain(value) when is_binary(value),
     do: value |> String.trim() |> String.downcase() |> String.replace(~r/[\s-]+/, "_")

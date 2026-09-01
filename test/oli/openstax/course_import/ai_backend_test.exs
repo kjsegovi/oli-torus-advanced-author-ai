@@ -10,12 +10,14 @@ defmodule Oli.OpenStax.CourseImport.AIBackendTest do
     original_enabled = Application.get_env(:oli, :openstax_codex_poc_enabled)
     original_url = Application.get_env(:oli, :openstax_codex_proxy_url)
     original_token = Application.get_env(:oli, :openstax_codex_proxy_token)
+    original_openai_key = System.get_env("OPENAI_API_KEY")
 
     on_exit(fn ->
       restore_env(:env, original_env)
       restore_env(:openstax_codex_poc_enabled, original_enabled)
       restore_env(:openstax_codex_proxy_url, original_url)
       restore_env(:openstax_codex_proxy_token, original_token)
+      restore_system_env("OPENAI_API_KEY", original_openai_key)
     end)
 
     :ok
@@ -52,7 +54,7 @@ defmodule Oli.OpenStax.CourseImport.AIBackendTest do
     Application.put_env(:oli, :openstax_codex_proxy_url, "http://127.0.0.1:4001")
     Application.put_env(:oli, :openstax_codex_proxy_token, "runtime-bridge-token")
 
-    base = AIBackend.service_config(:local_codex)
+    assert {:ok, base} = AIBackend.service_config(:local_codex)
     assert base.primary_model.model == "codex-proxy/gpt-5.6-terra"
     assert base.primary_model.max_concurrent == 1
 
@@ -114,8 +116,33 @@ defmodule Oli.OpenStax.CourseImport.AIBackendTest do
     token = "service-runtime-token"
     Application.put_env(:oli, :openstax_codex_proxy_token, token)
 
-    assert AIBackend.service_config(:local_codex).primary_model.api_key == token
+    assert {:ok, service} = AIBackend.service_config(:local_codex)
+    assert service.primary_model.api_key == token
     refute capture_log(fn -> AIBackend.service_config(:local_codex) end) =~ token
+  end
+
+  test "all Local Codex service loaders fail closed without selecting a global OpenAI key" do
+    global_key = "synthetic-global-openai-key-must-not-escape"
+    error = {:local_codex_configuration_error, :missing_proxy_token}
+    System.put_env("OPENAI_API_KEY", global_key)
+
+    for token <- [nil, "", "   "] do
+      restore_env(:openstax_codex_proxy_token, token)
+
+      log =
+        capture_log(fn ->
+          assert {:error, ^error} = AIBackend.service_config(:local_codex)
+          assert {:error, ^error} = AIBackend.simulation_spec_services(:local_codex)
+          assert {:error, ^error} = AIBackend.generator_options(:local_codex)
+          assert {:error, ^error} = AIBackend.artifact_critic_options(:local_codex)
+          assert {:error, ^error} = AIBackend.research_options(:local_codex)
+
+          loader = AIBackend.planner_options(:local_codex)[:service_config_loader]
+          assert {:error, ^error} = loader.()
+        end)
+
+      refute log =~ global_key
+    end
   end
 
   test "non-loopback bridge URLs fail closed" do
@@ -128,4 +155,7 @@ defmodule Oli.OpenStax.CourseImport.AIBackendTest do
 
   defp restore_env(key, nil), do: Application.delete_env(:oli, key)
   defp restore_env(key, value), do: Application.put_env(:oli, key, value)
+
+  defp restore_system_env(key, nil), do: System.delete_env(key)
+  defp restore_system_env(key, value), do: System.put_env(key, value)
 end

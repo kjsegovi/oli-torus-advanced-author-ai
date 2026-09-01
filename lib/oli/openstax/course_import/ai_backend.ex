@@ -14,6 +14,8 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
   @default_model "codex-proxy/gpt-5.6-terra"
 
   @type backend :: :openai_api | :local_codex
+  @type configuration_error ::
+          {:local_codex_configuration_error, :missing_proxy_token}
   @type readiness ::
           %{ready?: true, code: :ready, message: String.t()}
           | %{ready?: false, code: atom(), message: String.t()}
@@ -64,70 +66,66 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
   def planner_options(:local_codex) do
     [
       ai_backend: :local_codex,
-      service_config_loader: fn -> {:ok, service_config(:local_codex)} end
+      service_config_loader: fn -> service_config(:local_codex) end
     ]
   end
 
   def planner_options(_backend), do: [ai_backend: :openai_api]
 
-  @spec service_config(:local_codex) :: ServiceConfig.t()
+  @spec service_config(:local_codex) ::
+          {:ok, ServiceConfig.t()} | {:error, configuration_error()}
   def service_config(:local_codex) do
-    model = %RegisteredModel{
-      id: -9_001,
-      name: "openstax-local-codex",
-      provider: :open_ai,
-      model: @default_model,
-      url_template: proxy_url(),
-      api_key: proxy_token(),
-      timeout: 30_000,
-      recv_timeout: 310_000,
-      pool_class: :slow,
-      max_concurrent: 1,
-      routing_breaker_error_rate_threshold: 0.0,
-      routing_breaker_429_threshold: 0.0,
-      routing_breaker_latency_p95_ms: 0
-    }
-
-    %ServiceConfig{
-      id: -9_001,
-      name: "openstax-local-codex",
-      primary_model: model,
-      secondary_model: nil,
-      backup_model: nil
-    }
+    with {:ok, token} <- require_proxy_token() do
+      {:ok, build_service_config(token)}
+    end
   end
 
-  @spec simulation_spec_services(backend()) :: map() | nil
+  @spec simulation_spec_services(backend()) ::
+          {:ok, map() | nil} | {:error, configuration_error()}
   def simulation_spec_services(:local_codex) do
-    base = service_config(:local_codex)
-    %{designer: base, critic: base}
+    with {:ok, base} <- service_config(:local_codex) do
+      {:ok, %{designer: base, critic: base}}
+    end
   end
 
-  def simulation_spec_services(_backend), do: nil
+  def simulation_spec_services(_backend), do: {:ok, nil}
 
-  @spec generator_options(backend()) :: keyword()
-  def generator_options(:local_codex),
-    do: [service: service_config(:local_codex), ai_backend: :local_codex]
+  @spec generator_options(backend()) ::
+          {:ok, keyword()} | {:error, configuration_error()}
+  def generator_options(:local_codex) do
+    with {:ok, service} <- service_config(:local_codex) do
+      {:ok, [service: service, ai_backend: :local_codex]}
+    end
+  end
 
-  def generator_options(_backend), do: [ai_backend: :openai_api]
+  def generator_options(_backend), do: {:ok, [ai_backend: :openai_api]}
 
-  @spec artifact_critic_options(backend()) :: keyword()
-  def artifact_critic_options(:local_codex),
-    do: [artifact_critic_service: service_config(:local_codex), ai_backend: :local_codex]
+  @spec artifact_critic_options(backend()) ::
+          {:ok, keyword()} | {:error, configuration_error()}
+  def artifact_critic_options(:local_codex) do
+    with {:ok, service} <- service_config(:local_codex) do
+      {:ok, [artifact_critic_service: service, ai_backend: :local_codex]}
+    end
+  end
 
-  def artifact_critic_options(_backend), do: [ai_backend: :openai_api]
+  def artifact_critic_options(_backend), do: {:ok, [ai_backend: :openai_api]}
 
-  @spec research_options(backend()) :: keyword()
+  @spec research_options(backend()) ::
+          {:ok, keyword()} | {:error, configuration_error()}
   def research_options(:local_codex) do
-    [
-      research: CodexWebSearch,
-      proxy_url: proxy_url(),
-      model: @default_model,
-      ai_backend: :local_codex
-    ]
+    with {:ok, token} <- require_proxy_token() do
+      {:ok,
+       [
+         research: CodexWebSearch,
+         proxy_url: proxy_url(),
+         model: @default_model,
+         authorization_headers: authorization_headers(token),
+         ai_backend: :local_codex
+       ]}
+    end
   end
 
-  def research_options(_backend), do: [ai_backend: :openai_api]
+  def research_options(_backend), do: {:ok, [ai_backend: :openai_api]}
 
   @spec logical_provider(String.t() | nil, atom() | String.t() | nil) :: String.t()
   def logical_provider("codex-proxy/" <> _model, _fallback), do: "codex_cli"
@@ -172,8 +170,46 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
   def authorization_headers do
     case proxy_token() do
       nil -> []
-      token -> [{"Authorization", "Bearer #{token}"}]
+      token -> authorization_headers(token)
     end
+  end
+
+  defp authorization_headers(token), do: [{"Authorization", "Bearer #{token}"}]
+
+  defp require_proxy_token do
+    case proxy_token() do
+      nil -> {:error, configuration_error()}
+      token -> {:ok, token}
+    end
+  end
+
+  defp configuration_error,
+    do: {:local_codex_configuration_error, :missing_proxy_token}
+
+  defp build_service_config(token) do
+    model = %RegisteredModel{
+      id: -9_001,
+      name: "openstax-local-codex",
+      provider: :open_ai,
+      model: @default_model,
+      url_template: proxy_url(),
+      api_key: token,
+      timeout: 30_000,
+      recv_timeout: 310_000,
+      pool_class: :slow,
+      max_concurrent: 1,
+      routing_breaker_error_rate_threshold: 0.0,
+      routing_breaker_429_threshold: 0.0,
+      routing_breaker_latency_p95_ms: 0
+    }
+
+    %ServiceConfig{
+      id: -9_001,
+      name: "openstax-local-codex",
+      primary_model: model,
+      secondary_model: nil,
+      backup_model: nil
+    }
   end
 
   defp request_readiness(opts) do

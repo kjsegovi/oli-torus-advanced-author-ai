@@ -155,9 +155,23 @@ defmodule Oli.OpenStax.CourseImport do
     kill_switch =
       Application.get_env(:oli, :openstax_generated_simulation_kill_switch, true) == true
 
-    generator_available = Generator.available?(AIBackend.generator_options(ai_backend))
+    generator_available =
+      case AIBackend.generator_options(ai_backend) do
+        {:ok, generator_opts} -> Generator.available?(generator_opts)
+        {:error, _reason} -> false
+      end
+
     sandbox_available = Sandbox.available?()
     storage_available = ArtifactStorage.available?()
+
+    research_available =
+      case AIBackend.research_options(ai_backend) do
+        {:ok, research_opts} ->
+          generated_enabled and web_research_enabled and Research.available?(research_opts)
+
+        {:error, _reason} ->
+          false
+      end
 
     %{
       generated_enabled: generated_enabled,
@@ -170,9 +184,7 @@ defmodule Oli.OpenStax.CourseImport do
       storage_available: storage_available,
       generated_available:
         generated_enabled and generator_available and sandbox_available and storage_available,
-      research_available:
-        generated_enabled and web_research_enabled and
-          Research.available?(AIBackend.research_options(ai_backend)),
+      research_available: research_available,
       delivery_available: generated_enabled and delivery_enabled and not kill_switch
     }
   rescue
