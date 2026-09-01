@@ -64,13 +64,10 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV7 do
            "objective_catalog" => objective_catalog,
            "orientation" => %{
              "overview" =>
-               present(get_in(candidate, ["orientation", "overview"])) ||
-                 present(candidate["overview"]) ||
+               orientation_overview(candidate) ||
                  source_overview(blocks)
            },
-           "narrative" =>
-             present(get_in(candidate, ["orientation", "overview"])) ||
-               present(candidate["overview"]) || source_overview(blocks),
+           "narrative" => orientation_overview(candidate) || source_overview(blocks),
            "content_groups" => hydrated_groups,
            "question_slots" => slots,
            "media" => hydrate_media(media, hydrated_groups, generated_alt),
@@ -717,6 +714,16 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV7 do
 
   defp finding(code, path, message),
     do: %{"severity" => "hard_blocker", "code" => code, "path" => path, "message" => message}
+
+  defp orientation_overview(candidate) do
+    overview =
+      case candidate["orientation"] do
+        orientation when is_map(orientation) -> orientation["overview"]
+        orientation -> orientation
+      end
+
+    present(overview) || present(candidate["overview"])
+  end
 
   defp present(value) when is_binary(value) do
     case String.trim(value) do

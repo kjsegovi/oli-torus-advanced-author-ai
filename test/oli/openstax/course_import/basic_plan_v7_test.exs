@@ -77,6 +77,33 @@ defmodule Oli.OpenStax.CourseImport.BasicPlanV7Test do
     assert hd(content["question_slots"])["placement_after_section_id"] == "models"
   end
 
+  test "normalizes a string orientation returned by the architect" do
+    candidate = %{
+      "title" => "The Nature of Science",
+      "orientation" => "Use the source to examine scientific knowledge.",
+      "content_groups" => [
+        %{
+          "id" => "source",
+          "title" => "Evidence and models",
+          "instructional_purpose" => "concept",
+          "source_block_ids" => ["heading-1", "paragraph-1", "paragraph-2", "figure-1"]
+        }
+      ],
+      "question_slots" => [],
+      "generated_alt_text" => [
+        %{
+          "source_media_id" => "figure-media-1",
+          "alt" => "A model is revised as observations are added."
+        }
+      ],
+      "synthesis" => %{"summary" => "Evidence can revise a model."}
+    }
+
+    assert {:ok, content} = BasicPlanV7.build(candidate, lesson(), 1)
+    assert content["orientation"]["overview"] == candidate["orientation"]
+    assert content["narrative"] == candidate["orientation"]
+  end
+
   test "reconstructs a compact repair candidate without hydrated source AST" do
     lesson = lesson()
 

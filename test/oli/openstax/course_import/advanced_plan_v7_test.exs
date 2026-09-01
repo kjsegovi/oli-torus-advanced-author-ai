@@ -86,6 +86,24 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV7Test do
     assert stage_activity_ids == ~w(activity-1 activity-2 activity-3 activity-4)
   end
 
+  test "reports duration errors together with structural findings" do
+    candidate =
+      architecture_candidate()
+      |> put_in(["experience_blueprint", "branch_sets"], [])
+      |> update_in(["experience_blueprint", "stages"], fn stages ->
+        Enum.map(stages, &Map.put(&1, "estimated_minutes", 4))
+      end)
+      |> update_in(["experience_blueprint", "activity_slots"], fn slots ->
+        Enum.map(slots, &Map.put(&1, "estimated_minutes", 4))
+      end)
+
+    assert {:error, findings} = AdvancedPlanV7.build_architecture(candidate, lesson(), 1)
+    codes = Enum.map(findings, & &1["code"])
+
+    assert "missing_exploratory_branch" in codes
+    assert "advanced_duration_out_of_range" in codes
+  end
+
   test "reconstructs editable architecture and activity candidates from a realized plan" do
     lesson = lesson()
 

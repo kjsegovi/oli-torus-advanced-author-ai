@@ -390,6 +390,140 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPipelineV7Test do
     assert result.metadata["quality_gate"]["approved"]
   end
 
+  test "allows a second deterministic repair when the finding code repeats" do
+    Process.put(:repair_count, 0)
+
+    invalid_candidate =
+      put_in(Fixture.architecture_candidate(), ["experience_blueprint", "branch_sets"], [])
+
+    checkpoint = %{
+      "stage" => "advanced_content_repair_pending",
+      "payload" => %{
+        "repair_candidate" => invalid_candidate,
+        "repair_findings" => [
+          %{
+            "code" => "missing_exploratory_branch",
+            "severity" => "hard_blocker",
+            "path" => "$.experience_blueprint.branch_sets",
+            "message" => "Add a branch."
+          }
+        ],
+        "content_reviews" => [],
+        "content_attempts" => [%{"attempt" => 1}],
+        "next_attempt" => 2
+      }
+    }
+
+    execution = fn context, _messages, _service ->
+      case context.phase do
+        :repair_patch_writer ->
+          attempt = Process.get(:repair_count, 0) + 1
+          Process.put(:repair_count, attempt)
+
+          patch =
+            if attempt == 1 do
+              [
+                %{
+                  "op" => "replace",
+                  "path" => "/experience_blueprint/driving_question",
+                  "value" => "How does the evidence explain the phenomenon?"
+                }
+              ]
+            else
+              [
+                %{
+                  "op" => "add",
+                  "path" => "/experience_blueprint/branch_sets",
+                  "value" =>
+                    get_in(Fixture.architecture_candidate(), [
+                      "experience_blueprint",
+                      "branch_sets"
+                    ])
+                }
+              ]
+            end
+
+          {:ok, %{content: Jason.encode!(%{"patch" => patch}), metadata: %{}}}
+
+        :advanced_activity_writer ->
+          provider_response(context, [])
+
+        phase ->
+          flunk("unexpected provider phase #{inspect(phase)}")
+      end
+    end
+
+    assert {:ok, result} =
+             AdvancedPipelineV7.plan(Fixture.lesson(), 1, services(),
+               generation_checkpoint: checkpoint,
+               v7_execution_fun: execution,
+               advanced_content_critic_fun: fn _, _, _, _ -> {:ok, approved_review(0.96)} end,
+               advanced_activity_critic_fun: fn _, _, _, _ -> {:ok, approved_review(0.95)} end
+             )
+
+    assert Process.get(:repair_count) == 2
+    assert result.metadata["quality_gate"]["approved"]
+  end
+
+  test "allows a second deterministic activity repair when the finding code repeats" do
+    extra_choice = %{
+      "id" => "extra",
+      "text" => "An extra choice not present in the approved branch.",
+      "correct" => false,
+      "feedback" => "Choose an approved pathway."
+    }
+
+    invalid_candidate =
+      update_in(
+        Fixture.activity_candidate(),
+        ["activities", Access.at(0), "choices"],
+        fn choices ->
+          choices ++ [extra_choice]
+        end
+      )
+
+    Process.put(:activity_repair_count, 0)
+
+    execution = fn context, messages, _service ->
+      case context.phase do
+        :advanced_experience_architect ->
+          provider_response(context, messages)
+
+        :advanced_activity_writer ->
+          {:ok, %{content: Jason.encode!(invalid_candidate), metadata: %{}}}
+
+        :repair_patch_writer ->
+          attempt = Process.get(:activity_repair_count, 0) + 1
+          Process.put(:activity_repair_count, attempt)
+
+          patch =
+            if attempt == 1 do
+              [
+                %{
+                  "op" => "replace",
+                  "path" => "/activities/0/prompt",
+                  "value" => "Which approved evidence pathway should the learner follow?"
+                }
+              ]
+            else
+              [%{"op" => "remove", "path" => "/activities/0/choices/2"}]
+            end
+
+          {:ok, %{content: Jason.encode!(%{"patch" => patch}), metadata: %{}}}
+      end
+    end
+
+    assert {:ok, result} =
+             AdvancedPipelineV7.plan(Fixture.lesson(), 1, services(),
+               v7_execution_fun: execution,
+               advanced_content_critic_fun: fn _, _, _, _ -> {:ok, approved_review(0.96)} end,
+               advanced_activity_critic_fun: fn _, _, _, _ -> {:ok, approved_review(0.95)} end
+             )
+
+    assert Process.get(:activity_repair_count) == 2
+    assert result.metadata["quality_gate"]["approved"]
+  end
+
   defp services do
     %{architect: %{}, critic: %{}, activity_writer: %{}, activity_critic: %{}}
   end

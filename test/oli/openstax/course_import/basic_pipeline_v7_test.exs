@@ -42,6 +42,35 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV7Test do
                     %{"questions_payload" => %{"items" => [_]}}}
   end
 
+  test "uses a valid unique agent run UUID while preserving the parent import run id" do
+    import_run_id = Ecto.UUID.generate()
+    planning_request_id = Ecto.UUID.generate()
+
+    assert {:ok, _result} =
+             BasicPipelineV7.plan(lesson(), 1, services(),
+               run_id: import_run_id,
+               planning_request_id: planning_request_id,
+               v7_architect_execution_fun: architect_fun(valid_candidate()),
+               content_critic_fun: fn _lesson, _content, _service, _opts ->
+                 {:ok, approved_review(0.96)}
+               end,
+               question_agent_fun: fn _lesson, _content, _service, opts ->
+                 assert opts[:import_run_id] == import_run_id
+                 assert opts[:run_id] != import_run_id
+                 assert {:ok, _binary_uuid} = Ecto.UUID.cast(opts[:run_id])
+
+                 {:ok,
+                  %{
+                    questions_payload: questions(),
+                    generation_metadata: %{"model" => "terra-question-writer"}
+                  }}
+               end,
+               question_critic_fun: fn _lesson, _content, _questions, _ledger, _service, _opts ->
+                 {:ok, approved_review(0.94)}
+               end
+             )
+  end
+
   test "returns repaired content when the original architect resolves structured findings" do
     parent = self()
     {:ok, counter} = Agent.start_link(fn -> 0 end)

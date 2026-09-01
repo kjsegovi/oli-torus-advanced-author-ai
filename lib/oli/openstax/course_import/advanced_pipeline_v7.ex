@@ -16,7 +16,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPipelineV7 do
     StructuredPatch
   }
 
-  @max_candidates 2
+  @max_candidates 3
 
   @spec plan(map(), pos_integer(), map(), keyword()) ::
           {:ok, %{content_payload: map(), questions_payload: map(), metadata: map()}}
@@ -273,9 +273,6 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPipelineV7 do
         attempt >= @max_candidates and is_map(valid_content) ->
           {:ok, attention(valid_content, reviews, attempts, resumed, "content_quality_exhausted")}
 
-        attempt > 1 and fingerprint == previous ->
-          {:error, {:advanced_content_contract_stalled, quality_failure(review, reviews)}}
-
         attempt >= @max_candidates ->
           {:error, {:advanced_content_contract_exhausted, quality_failure(review, reviews)}}
 
@@ -484,9 +481,6 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPipelineV7 do
         attempt >= @max_candidates and is_map(valid_content) ->
           {:ok,
            attention(valid_content, reviews, attempts, resumed, "activity_quality_exhausted")}
-
-        attempt > 1 and fingerprint == previous ->
-          {:error, {:advanced_activity_contract_stalled, quality_failure(review, reviews)}}
 
         attempt >= @max_candidates ->
           {:error, {:advanced_activity_contract_exhausted, quality_failure(review, reviews)}}

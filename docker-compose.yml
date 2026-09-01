@@ -11,6 +11,14 @@ services:
       PHX_SERVER: "true"
       HTTP_PORT: "8080"
       TORUS_BEHIND_EDGE: "true"
+      # Required by the prod release in config/runtime.exs (the compose app runs a
+      # MIX_ENV=prod release, not the dev-mode config that oli.env was written for).
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/postgres"
+      SECRET_KEY_BASE: "wNtg0UFwidZQYqn85Lhm45pzO5wSVH0W+hXzP47mZS1yLF3pSZGfMnijY5sqvjlOkxSZ5SVYq9tGE63oWZsSrA=="
+      LIVE_VIEW_SALT: "fV3mb43rQC6PxhWglhR9wxRgWQpCQAiWyjfy9gxsQ0myBhZyabSbwg8c91/j5AJBJegpJs5V1Isq35sJVen7IA=="
+      S3_MEDIA_BUCKET_NAME: "torus-media"
+      S3_XAPI_BUCKET_NAME: "torus-xapi"
+      MEDIA_URL: "https://localhost/buckets/torus-media"
       AWS_S3_SCHEME: "http"
       AWS_S3_HOST: "minio"
       AWS_S3_PORT: "9000"

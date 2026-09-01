@@ -334,6 +334,7 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV7 do
     stages = normalize_stages(raw["stages"])
     slots = normalize_slots(raw["activity_slots"], stages)
     branch_sets = normalize_branch_sets(raw["branch_sets"])
+    duration = duration_manifest(base, slots, stages)
 
     findings =
       []
@@ -355,34 +356,27 @@ defmodule Oli.OpenStax.CourseImport.AdvancedPlanV7 do
         validate_branch_sets(branch_sets, slots, stages, group_ids, objective_ids, source_ids)
       )
       |> Kernel.++(validate_group_stage_coverage(stages, group_ids))
+      |> maybe_finding(
+        duration["total_minutes"] not in @minimum_minutes..@maximum_minutes,
+        "advanced_duration_out_of_range",
+        "$.experience_blueprint",
+        "The deterministic experience estimate is #{duration["total_minutes"]} minutes; Advanced requires 45–75 without padding."
+      )
 
     case findings do
       [] ->
-        duration = duration_manifest(base, slots, stages)
-
-        if duration["total_minutes"] in @minimum_minutes..@maximum_minutes do
-          {:ok,
-           %{
-             "driving_question" => String.trim(raw["driving_question"]),
-             "stages" => stages,
-             "activity_slots" => slots,
-             "branch_sets" => branch_sets,
-             "activities" => [],
-             "enrichment_references" => [],
-             "duration_manifest" => duration,
-             "estimated_minutes" => duration["total_minutes"],
-             "remediation_paths" => []
-           }}
-        else
-          {:error,
-           [
-             finding(
-               "advanced_duration_out_of_range",
-               "$.experience_blueprint",
-               "The deterministic experience estimate is #{duration["total_minutes"]} minutes; Advanced requires 45–75 without padding."
-             )
-           ]}
-        end
+        {:ok,
+         %{
+           "driving_question" => String.trim(raw["driving_question"]),
+           "stages" => stages,
+           "activity_slots" => slots,
+           "branch_sets" => branch_sets,
+           "activities" => [],
+           "enrichment_references" => [],
+           "duration_manifest" => duration,
+           "estimated_minutes" => duration["total_minutes"],
+           "remediation_paths" => []
+         }}
 
       findings ->
         {:error, findings}

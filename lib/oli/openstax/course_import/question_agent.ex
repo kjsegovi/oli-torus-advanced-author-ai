@@ -26,6 +26,15 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
     start_fun = Keyword.get(opts, :agent_start_fun, &Agent.start_run/1)
     await_fun = Keyword.get(opts, :agent_await_fun, &Agent.await_result/2)
 
+    # The caller may scope :run_id per lesson/attempt to keep the agent-run id
+    # unique (agent_runs primary key / Registry), while still tracking ledger
+    # usage under the parent import run via :import_run_id.
+    ledger_opts =
+      case Keyword.fetch(opts, :import_run_id) do
+        {:ok, import_id} -> Keyword.put(opts, :run_id, import_id)
+        :error -> opts
+      end
+
     args =
       %{
         run_id: run_id,
@@ -66,7 +75,7 @@ defmodule Oli.OpenStax.CourseImport.QuestionAgent do
         author_id: Keyword.get(opts, :author_id),
         project_id: Keyword.get(opts, :project_id),
         request_context_factory: fn step ->
-          AIUsageLedger.request_context(opts, :basic_question_writer, %{
+          AIUsageLedger.request_context(ledger_opts, :basic_question_writer, %{
             candidate_number: step,
             operation_id: run_id
           })

@@ -386,6 +386,14 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV7 do
         :agent_start_fun,
         :agent_await_fun
       ])
+      # The Agent framework keys each run by a globally-unique id (Registry
+      # lookup + agent_runs primary key). The import-level :run_id is shared
+      # by every lesson, so scope it per lesson/attempt or the first lesson's
+      # question agent wins the id and every later lesson fails to start.
+      |> Keyword.put(:run_id, question_agent_run_id(opts))
+      # Keep the original import run id available to the ledger so question
+      # agent usage still groups under the parent course-import run.
+      |> Keyword.put(:import_run_id, Keyword.get(opts, :run_id))
       |> Keyword.put(:authoring_mode, "basic")
       |> Keyword.put(:objective_ledger, objective_ledger)
       |> Keyword.put(:question_slots, content["question_slots"])
@@ -512,6 +520,8 @@ defmodule Oli.OpenStax.CourseImport.BasicPipelineV7 do
       end
     end
   end
+
+  defp question_agent_run_id(_opts), do: Ecto.UUID.generate()
 
   defp architect_candidate(lesson, index, service_config, repair_context, attempt, opts) do
     contract = BasicPlanV7.prompt_contract(lesson)
