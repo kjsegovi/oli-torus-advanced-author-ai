@@ -173,10 +173,8 @@ defmodule Oli.GoogleSlides.ImportWorkflow.Planner do
       "supportedComponents" => Catalog.components(),
       "reviewedStyleProfiles" => Catalog.style_profiles(),
       "globalRegistry" => value(context, :global_registry, %{}),
-      "neighboringScreenSummaries" =>
-        value(context, :neighboring_screen_summaries, []),
-      "unresolvedPathwayIntents" =>
-        value(context, :unresolved_pathway_intents, []),
+      "neighboringScreenSummaries" => value(context, :neighboring_screen_summaries, []),
+      "unresolvedPathwayIntents" => value(context, :unresolved_pathway_intents, []),
       "currentSlideRange" => value(context, :current_slide_range),
       "selectedLesson" => value(context, :selected_lesson)
     }
