@@ -3,7 +3,15 @@ defmodule Oli.OpenStax.CourseImport.AICostGuardTest do
   use Oban.Testing, repo: Oli.Repo
 
   alias Oli.OpenStax.CourseImport
-  alias Oli.OpenStax.CourseImport.{AICostGuard, AICostReservation, AIUsageLedger}
+
+  alias Oli.OpenStax.CourseImport.{
+    AICostGuard,
+    AICostReservation,
+    AIPricing,
+    AIUsageEvent,
+    AIUsageLedger
+  }
+
   alias Oli.ScopedFeatureFlags
 
   setup do
@@ -80,7 +88,8 @@ defmodule Oli.OpenStax.CourseImport.AICostGuardTest do
       model: "gpt-5.6-terra",
       service_tier: "flex",
       input_tokens: 100,
-      max_output_tokens: 12_000
+      max_output_tokens: 12_000,
+      request_payload_hash: "payload-a"
     }
 
     assert {:ok, :proceed} = AIUsageLedger.prepare(context, request)
@@ -93,12 +102,85 @@ defmodule Oli.OpenStax.CourseImport.AICostGuardTest do
                input_tokens: 100,
                output_tokens: 20,
                response_content: "{\"approved\":true}",
-               request_id: "request-one"
+               request_id: "request-one",
+               request_payload_hash: "payload-a"
              })
 
     assert {:ok, {:replay, replayed}} = AIUsageLedger.prepare(context, request)
     assert replayed.content == "{\"approved\":true}"
     assert replayed.metadata["cache_status"] == "durable_replay"
     assert Repo.aggregate(AICostReservation, :count) == 1
+  end
+
+  test "a changed payload hash proceeds with a new reservation", %{run: run} do
+    context =
+      AIUsageLedger.request_context(
+        [run_id: run.id, planning_request_id: Ecto.UUID.generate()],
+        :basic_content_architect
+      )
+
+    insert_successful_event(context, "payload-a")
+
+    changed_request = %{
+      model: "gpt-5.6-terra",
+      service_tier: "flex",
+      input_tokens: 100,
+      max_output_tokens: 12_000,
+      request_payload_hash: "payload-b"
+    }
+
+    assert {:ok, :proceed} = AIUsageLedger.prepare(context, changed_request)
+    assert Repo.aggregate(AICostReservation, :count) == 1
+  end
+
+  test "a nil request or historical payload hash is never replayed", %{run: run} do
+    request = %{
+      model: "gpt-5.6-terra",
+      service_tier: "flex",
+      input_tokens: 100,
+      max_output_tokens: 12_000,
+      request_payload_hash: "payload-a"
+    }
+
+    context_with_historical_nil_hash =
+      AIUsageLedger.request_context(
+        [run_id: run.id, planning_request_id: Ecto.UUID.generate()],
+        :basic_content_architect
+      )
+
+    insert_successful_event(context_with_historical_nil_hash, nil)
+
+    assert {:ok, :proceed} =
+             AIUsageLedger.prepare(context_with_historical_nil_hash, request)
+
+    context_with_nil_request_hash =
+      AIUsageLedger.request_context(
+        [run_id: run.id, planning_request_id: Ecto.UUID.generate()],
+        :basic_content_architect
+      )
+
+    insert_successful_event(context_with_nil_request_hash, "payload-a")
+
+    request_with_nil_hash = %{request | request_payload_hash: nil}
+
+    assert {:ok, :proceed} =
+             AIUsageLedger.prepare(context_with_nil_request_hash, request_with_nil_hash)
+
+    assert Repo.aggregate(AICostReservation, :count) == 2
+  end
+
+  defp insert_successful_event(context, request_payload_hash) do
+    %AIUsageEvent{}
+    |> AIUsageEvent.changeset(%{
+      run_id: context[:run_id],
+      role: context[:role],
+      phase: to_string(context[:phase]),
+      request_key: context[:request_key],
+      request_payload_hash: request_payload_hash,
+      response_payload: %{"content" => "{\"approved\":true}", "metadata" => %{}},
+      pricing_version: AIPricing.pricing_version(),
+      outcome: "succeeded"
+    })
+    |> Repo.insert!()
   end
 end

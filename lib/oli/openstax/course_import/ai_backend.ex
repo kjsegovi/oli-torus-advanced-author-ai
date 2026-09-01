@@ -50,6 +50,9 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
       not loopback_url?(proxy_url()) ->
         unavailable(:non_loopback_url, "The Codex bridge must use a loopback URL.")
 
+      is_nil(proxy_token()) ->
+        unavailable(:missing_proxy_token, "The Codex bridge token is not configured.")
+
       true ->
         request_readiness(opts)
     end
@@ -75,9 +78,9 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
       provider: :open_ai,
       model: @default_model,
       url_template: proxy_url(),
-      api_key: "local-codex-chatgpt-plan",
+      api_key: proxy_token(),
       timeout: 30_000,
-      recv_timeout: 300_000,
+      recv_timeout: 310_000,
       pool_class: :slow,
       max_concurrent: 1,
       routing_breaker_error_rate_threshold: 0.0,
@@ -151,13 +154,41 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
     |> String.trim_trailing("/")
   end
 
+  @spec proxy_token() :: String.t() | nil
+  def proxy_token do
+    case Application.get_env(:oli, :openstax_codex_proxy_token) do
+      token when is_binary(token) ->
+        case String.trim(token) do
+          "" -> nil
+          token -> token
+        end
+
+      _ ->
+        nil
+    end
+  end
+
+  @spec authorization_headers() :: [{String.t(), String.t()}]
+  def authorization_headers do
+    case proxy_token() do
+      nil -> []
+      token -> [{"Authorization", "Bearer #{token}"}]
+    end
+  end
+
   defp request_readiness(opts) do
     case Keyword.get(opts, :request_fun) do
+      fun when is_function(fun, 2) ->
+        normalize_readiness_response(fun.(proxy_url() <> "/health", authorization_headers()))
+
       fun when is_function(fun, 1) ->
         normalize_readiness_response(fun.(proxy_url() <> "/health"))
 
       _ ->
         case Application.get_env(:oli, :openstax_codex_readiness_fun) do
+          fun when is_function(fun, 2) ->
+            normalize_readiness_response(fun.(proxy_url() <> "/health", authorization_headers()))
+
           fun when is_function(fun, 1) ->
             normalize_readiness_response(fun.(proxy_url() <> "/health"))
 
@@ -168,7 +199,10 @@ defmodule Oli.OpenStax.CourseImport.AIBackend do
   end
 
   defp http_readiness do
-    case HTTPoison.get(proxy_url() <> "/health", [], timeout: 2_000, recv_timeout: 2_000) do
+    case HTTPoison.get(proxy_url() <> "/health", authorization_headers(),
+           timeout: 2_000,
+           recv_timeout: 2_000
+         ) do
       {:ok, %HTTPoison.Response{status_code: status, body: body}} ->
         normalize_readiness_response({:ok, status, body})
 

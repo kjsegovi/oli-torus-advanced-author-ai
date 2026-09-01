@@ -21,6 +21,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
   alias Oli.OpenStax.CourseImport.{AIBackend, AIPlanner}
 
   @provider_attempt_limit 2
+  @provider_capacity_reasons [:over_capacity, :secondary_over_capacity]
   @advanced_contract_categories [
     :advanced_content_contract_exhausted,
     :advanced_content_contract_stalled,
@@ -212,6 +213,9 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
   defp completion_category(:plan_schema_version_immutable), do: :plan_schema_version_mismatch
   defp completion_category(_reason), do: :lesson_plan_persistence_failed
 
+  defp classify_provider_failure(reason) when reason in @provider_capacity_reasons,
+    do: {:transient, :provider_capacity}
+
   defp classify_provider_failure(reason) do
     cond do
       contains_atom?(reason, [:ai_cost_limit_exceeded]) ->
@@ -273,6 +277,7 @@ defmodule Oli.OpenStax.CourseImport.Worker.LessonPlanWorker do
 
   defp category_attempt_limit(category, _max_attempts)
        when category in [
+              :provider_capacity,
               :rate_limited,
               :provider_unavailable,
               :provider_timeout

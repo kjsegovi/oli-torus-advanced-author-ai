@@ -127,6 +127,28 @@ defmodule Oli.GenAI.ExecutionTest do
     assert selected_model_id == service_config.secondary_model.id
   end
 
+  test "preserves provider metadata from a cold completer module" do
+    service_config = build_service_config(33, secondary_model: nil, backup_model: nil)
+
+    make_reloadable(MetadataCompletions)
+    :code.purge(MetadataCompletions)
+    :code.delete(MetadataCompletions)
+
+    result =
+      Execution.generate_with_metadata(
+        %{request_type: :generate},
+        [],
+        [],
+        service_config,
+        completions_mod: MetadataCompletions
+      )
+
+    assert {:ok, %{content: "metadata", metadata: metadata}} = result
+    assert metadata.input_tokens == 11
+    assert metadata.output_tokens == 7
+    assert metadata.cached_input_tokens == 3
+  end
+
   test "routes to backup when primary and secondary breakers are open" do
     Process.put(:execution_test_pid, self())
 
@@ -174,6 +196,66 @@ defmodule Oli.GenAI.ExecutionTest do
                service_config,
                completions_mod: __MODULE__.AlwaysOkCompletions
              )
+  end
+
+  @tag capture_log: true
+  test "blocks concurrent execution at an integer model limit with breaker thresholds disabled" do
+    ensure_hackney_started()
+    previous_pool_size = HackneyPool.max_connections(:slow)
+    on_exit(fn -> HackneyPool.set_max_connections(:slow, previous_pool_size) end)
+    HackneyPool.set_max_connections(:slow, 2)
+
+    parent = self()
+
+    model = %RegisteredModel{
+      id: 61,
+      name: "Serialized model",
+      provider: :null,
+      max_concurrent: 1,
+      routing_breaker_error_rate_threshold: 0.0,
+      routing_breaker_429_threshold: 0.0,
+      routing_breaker_latency_p95_ms: 0
+    }
+
+    service_config =
+      build_service_config(6,
+        primary_model: model,
+        secondary_model: nil,
+        backup_model: nil
+      )
+
+    request_ctx = %{request_type: :generate}
+
+    first =
+      Task.async(fn ->
+        Execution.generate(
+          request_ctx,
+          [parent],
+          [],
+          service_config,
+          completions_mod: __MODULE__.BlockingCompletions
+        )
+      end)
+
+    assert_receive {:blocking_generate_called, blocker_pid, 61}, 1_000
+
+    assert {:error, :over_capacity} =
+             Execution.generate(
+               request_ctx,
+               [parent],
+               [],
+               service_config,
+               completions_mod: __MODULE__.BlockingCompletions
+             )
+
+    refute_receive {:blocking_generate_called, _pid, 61}, 100
+    assert AdmissionControl.model_count(61) == 1
+    assert AdmissionControl.pool_count(:genai_slow_pool) == 1
+
+    send(blocker_pid, :release)
+    assert {:ok, _} = Task.await(first, 1_000)
+    assert AdmissionControl.model_count(61) == 0
+    assert AdmissionControl.pool_count(:genai_slow_pool) == 0
   end
 
   test "does not release a model counter when routing admitted only the pool" do
@@ -257,8 +339,9 @@ defmodule Oli.GenAI.ExecutionTest do
            end)
   end
 
-  test "kill switch always uses primary and bypasses admission controls" do
-    Process.put(:execution_test_pid, self())
+  @tag capture_log: true
+  test "primary-only mode blocks concurrent execution and releases its model admission" do
+    parent = self()
 
     with_env("GENAI_ROUTING_PRIMARY_ONLY", "true", fn ->
       service_config =
@@ -267,7 +350,10 @@ defmodule Oli.GenAI.ExecutionTest do
             id: 71,
             name: "Primary",
             provider: :null,
-            max_concurrent: 0
+            max_concurrent: 1,
+            routing_breaker_error_rate_threshold: 0.0,
+            routing_breaker_429_threshold: 0.0,
+            routing_breaker_latency_p95_ms: 0
           },
           secondary_model: nil,
           backup_model: nil
@@ -276,28 +362,35 @@ defmodule Oli.GenAI.ExecutionTest do
       request_ctx = %{request_type: :generate}
       AdmissionControl.put_breaker_snapshot(service_config.primary_model.id, %{state: :open})
 
-      assert {:ok, _} =
+      first =
+        Task.async(fn ->
+          Execution.generate(
+            request_ctx,
+            [parent],
+            [],
+            service_config,
+            completions_mod: __MODULE__.BlockingCompletions
+          )
+        end)
+
+      assert_receive {:blocking_generate_called, blocker_pid, 71}, 1_000
+
+      assert {:error, :over_capacity} =
                Execution.generate(
                  request_ctx,
-                 [],
-                 [],
-                 service_config,
-                 completions_mod: __MODULE__.AlwaysOkCompletions
-               )
-
-      assert {:ok, _} =
-               Execution.generate(
-                 request_ctx,
-                 [],
+                 [parent],
                  [],
                  service_config,
-                 completions_mod: __MODULE__.AlwaysOkCompletions
+                 completions_mod: __MODULE__.BlockingCompletions
                )
 
-      primary_id = service_config.primary_model.id
-      assert_received {:generate_called, ^primary_id}
-      assert_received {:generate_called, ^primary_id}
-      assert AdmissionControl.model_count(primary_id) == 0
+      refute_receive {:blocking_generate_called, _pid, 71}, 100
+      assert AdmissionControl.model_count(71) == 1
+      assert AdmissionControl.pool_count(:genai_slow_pool) == 0
+
+      send(blocker_pid, :release)
+      assert {:ok, _} = Task.await(first, 1_000)
+      assert AdmissionControl.model_count(71) == 0
       assert AdmissionControl.pool_count(:genai_slow_pool) == 0
     end)
   end
@@ -342,6 +435,16 @@ defmodule Oli.GenAI.ExecutionTest do
 
     def stream(_messages, _functions, _registered_model, _response_handler_fn) do
       :ok
+    end
+  end
+
+  defmodule BlockingCompletions do
+    def generate([parent], _functions, %RegisteredModel{id: id}) do
+      send(parent, {:blocking_generate_called, self(), id})
+
+      receive do
+        :release -> {:ok, %{response: "ok"}}
+      end
     end
   end
 
@@ -390,6 +493,39 @@ defmodule Oli.GenAI.ExecutionTest do
 
   defp restore_env(key, nil), do: System.delete_env(key)
   defp restore_env(key, value), do: System.put_env(key, value)
+
+  defp make_reloadable(module) do
+    directory =
+      Path.join(System.tmp_dir!(), "execution_test_#{System.unique_integer([:positive])}")
+
+    File.mkdir_p!(directory)
+    source_path = Path.join(directory, "metadata_completions.ex")
+
+    source =
+      [
+        "defmodule ",
+        inspect(module),
+        " do\n",
+        "  def generate(_messages, _functions, _model), do: {:ok, \"fallback\"}\n",
+        "  def generate_with_metadata(_messages, _functions, _model) do\n",
+        "    {:ok, %{content: \"metadata\", response: %{\"id\" => \"first-call\", ",
+        "\"usage\" => %{\"prompt_tokens\" => 11, \"completion_tokens\" => 7, ",
+        "\"prompt_tokens_details\" => %{\"cached_tokens\" => 3}}}}}\n",
+        "  end\nend\n"
+      ]
+      |> IO.iodata_to_binary()
+
+    File.write!(source_path, source)
+    Kernel.ParallelCompiler.compile_to_path([source_path], directory, return_diagnostics: true)
+    :code.add_patha(String.to_charlist(directory))
+
+    on_exit(fn ->
+      :code.purge(module)
+      :code.delete(module)
+      :code.del_path(String.to_charlist(directory))
+      File.rm_rf!(directory)
+    end)
+  end
 
   defp clear_tables do
     if :ets.whereis(:genai_counters) != :undefined do

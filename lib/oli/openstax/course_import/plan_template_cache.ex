@@ -17,7 +17,7 @@ defmodule Oli.OpenStax.CourseImport.PlanTemplateCache do
   def fetch_or_generate(lesson, mode, services, opts, generator)
       when is_map(lesson) and mode in ["basic", "advanced"] and is_map(services) and
              is_list(opts) and is_function(generator, 0) do
-    if Keyword.get(opts, :plan_template_cache_enabled, true) do
+    if Keyword.get(opts, :plan_template_cache_enabled, true) and not guided_regeneration?(lesson) do
       identity = identity(lesson, mode, services, opts)
 
       :global.trans({__MODULE__, identity.cache_key}, fn ->
@@ -50,6 +50,20 @@ defmodule Oli.OpenStax.CourseImport.PlanTemplateCache do
       end
     end
   end
+
+  defp guided_regeneration?(lesson) do
+    Enum.any?(
+      [Map.get(lesson, "repair_context"), Map.get(lesson, :repair_context)],
+      &non_empty?/1
+    )
+  end
+
+  defp non_empty?(value) when is_map(value), do: map_size(value) > 0
+  defp non_empty?(value) when is_binary(value), do: String.trim(value) != ""
+  defp non_empty?(value) when is_list(value), do: value != []
+  defp non_empty?(false), do: false
+  defp non_empty?(nil), do: false
+  defp non_empty?(_value), do: true
 
   def identity(lesson, mode, services, opts) do
     source_hash = hash(source_material(lesson))

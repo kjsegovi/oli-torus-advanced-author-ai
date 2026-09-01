@@ -9,6 +9,7 @@ defmodule Oli.GenAI.Completions do
   """
 
   alias Oli.GenAI.Completions.RegisteredModel
+  alias Oli.GenAI.ModuleCapabilities
 
   def generate(messages, functions, %RegisteredModel{} = registered_model) do
     get_provider(registered_model)
@@ -18,7 +19,7 @@ defmodule Oli.GenAI.Completions do
   def generate_with_metadata(messages, functions, %RegisteredModel{} = registered_model) do
     provider = get_provider(registered_model)
 
-    if function_exported?(provider, :generate_with_metadata, 3) do
+    if ModuleCapabilities.supports?(provider, :generate_with_metadata, 3) do
       apply(provider, :generate_with_metadata, [messages, functions, registered_model])
     else
       case apply(provider, :generate, [messages, functions, registered_model]) do

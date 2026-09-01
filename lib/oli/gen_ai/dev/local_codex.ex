@@ -15,7 +15,8 @@ defmodule Oli.GenAI.Dev.LocalCodex do
 
   @default_api_key "dev"
   @default_feature :student_dialogue
-  @default_model "codex-proxy"
+  @default_model "codex-proxy/gpt-5.6-terra"
+  @default_recv_timeout 310_000
   @default_model_name "local-codex-proxy"
   @default_service_name "local-codex-proxy"
   @default_url "http://localhost:4001"
@@ -83,12 +84,12 @@ defmodule Oli.GenAI.Dev.LocalCodex do
   defp upsert_registered_model(opts) do
     attrs = %{
       api_key: opts.api_key,
-      max_concurrent: 4,
+      max_concurrent: 1,
       model: opts.model,
       name: opts.model_name,
       pool_class: :slow,
       provider: :open_ai,
-      recv_timeout: 60_000,
+      recv_timeout: @default_recv_timeout,
       routing_breaker_429_threshold: 0.0,
       routing_breaker_error_rate_threshold: 0.0,
       routing_breaker_latency_p95_ms: 0,

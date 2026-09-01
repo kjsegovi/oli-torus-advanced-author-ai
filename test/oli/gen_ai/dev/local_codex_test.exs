@@ -31,6 +31,9 @@ defmodule Oli.GenAI.Dev.LocalCodexTest do
 
       assert first.registered_model.provider == :open_ai
       assert first.registered_model.url_template == "http://localhost:4001"
+      assert first.registered_model.model == "codex-proxy/gpt-5.6-terra"
+      assert first.registered_model.max_concurrent == 1
+      assert first.registered_model.recv_timeout == 310_000
       assert first.service_config.primary_model_id == first.registered_model.id
       assert first.feature_config.feature == :student_dialogue
       assert is_nil(first.feature_config.section_id)

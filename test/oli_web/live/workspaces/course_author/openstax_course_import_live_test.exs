@@ -1565,10 +1565,12 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
     original_enabled = Application.get_env(:oli, :openstax_codex_poc_enabled)
     original_readiness_fun = Application.get_env(:oli, :openstax_codex_readiness_fun)
     original_url = Application.get_env(:oli, :openstax_codex_proxy_url)
+    original_token = Application.get_env(:oli, :openstax_codex_proxy_token)
 
     Application.put_env(:oli, :env, :dev)
     Application.put_env(:oli, :openstax_codex_poc_enabled, true)
     Application.put_env(:oli, :openstax_codex_proxy_url, "http://127.0.0.1:4001")
+    Application.put_env(:oli, :openstax_codex_proxy_token, "test-runtime-bridge-token")
     Application.put_env(:oli, :openstax_codex_readiness_fun, readiness_fun)
 
     on_exit(fn ->
@@ -1576,6 +1578,7 @@ defmodule OliWeb.Workspaces.CourseAuthor.OpenStaxCourseImportLiveTest do
       restore_application_env(:openstax_codex_poc_enabled, original_enabled)
       restore_application_env(:openstax_codex_readiness_fun, original_readiness_fun)
       restore_application_env(:openstax_codex_proxy_url, original_url)
+      restore_application_env(:openstax_codex_proxy_token, original_token)
     end)
   end
 
