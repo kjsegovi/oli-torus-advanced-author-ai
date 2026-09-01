@@ -178,44 +178,35 @@ function messageSchema() {
   return {
     additionalProperties: false,
     properties: {
+      arguments: { type: "null" },
       content: { type: "string" },
+      name: { type: "null" },
       type: { const: "message", type: "string" },
     },
-    required: ["type", "content"],
+    required: ["type", "name", "arguments", "content"],
+    type: "object",
+  };
+}
+
+function functionCallSchema(tool) {
+  return {
+    additionalProperties: false,
+    properties: {
+      arguments: normalizeSchema(
+        tool.parameters || { type: "object", properties: {} },
+      ),
+      content: { type: "null" },
+      name: { const: tool.name, type: "string" },
+      type: { const: "function_call", type: "string" },
+    },
+    required: ["type", "name", "arguments", "content"],
     type: "object",
   };
 }
 
 function buildOutputSchema(tools = []) {
   if (!tools.length) return messageSchema();
-
-  const argumentSchemas = tools.map((tool) =>
-    normalizeSchema(tool.parameters || { type: "object", properties: {} }),
-  );
-
-  return {
-    additionalProperties: false,
-    properties: {
-      arguments: {
-        anyOf: [
-          ...(argumentSchemas.length === 1
-            ? argumentSchemas
-            : [{ anyOf: argumentSchemas }]),
-          { type: "null" },
-        ],
-      },
-      content: { type: ["string", "null"] },
-      name: {
-        anyOf: [
-          { enum: tools.map((tool) => tool.name), type: "string" },
-          { type: "null" },
-        ],
-      },
-      type: { enum: ["message", "function_call"], type: "string" },
-    },
-    required: ["type", "name", "arguments", "content"],
-    type: "object",
-  };
+  return { anyOf: [messageSchema(), ...tools.map(functionCallSchema)] };
 }
 
 function buildPrompt({ messages, tools }) {
@@ -540,16 +531,19 @@ function firstJsonObject(text) {
   return null;
 }
 
-function unwrapNestedMessageContent(content) {
+function normalizeMessageContent(content, depth = 0) {
   if (typeof content !== "string") return content ?? "";
+  if (depth >= 4) return content;
 
   const trimmed = content.trim();
+  let objectText = trimmed;
   let parsed;
 
   try {
     parsed = JSON.parse(trimmed);
   } catch {
-    const objectText = firstJsonObject(trimmed);
+    if (!trimmed.startsWith("{")) return content;
+    objectText = firstJsonObject(trimmed);
     if (!objectText) return content;
 
     try {
@@ -559,9 +553,34 @@ function unwrapNestedMessageContent(content) {
     }
   }
 
-  return parsed?.type === "message" && typeof parsed.content === "string"
-    ? parsed.content
-    : content;
+  if (parsed?.type === "message" && typeof parsed.content === "string") {
+    return normalizeMessageContent(parsed.content, depth + 1);
+  }
+
+  return objectText;
+}
+
+function validateChatResult(result, tools) {
+  if (!result || typeof result !== "object" || Array.isArray(result)) {
+    throw new BridgeError("invalid_codex_output", 502);
+  }
+
+  if (result.type === "message" && typeof result.content === "string") {
+    return result;
+  }
+
+  const offered = new Set(tools.map((tool) => tool.name));
+  if (
+    result.type === "function_call" &&
+    offered.has(result.name) &&
+    result.arguments &&
+    typeof result.arguments === "object" &&
+    !Array.isArray(result.arguments)
+  ) {
+    return result;
+  }
+
+  throw new BridgeError("invalid_codex_output", 502);
 }
 
 function asChatCompletion(result, requestedModel, usage, modernTools) {
@@ -617,7 +636,7 @@ function asChatCompletion(result, requestedModel, usage, modernTools) {
         finish_reason: "stop",
         index: 0,
         message: {
-          content: unwrapNestedMessageContent(result.content),
+          content: normalizeMessageContent(result.content),
           role: "assistant",
         },
       },
@@ -765,7 +784,7 @@ export function createServer() {
         }),
       );
       const response = asChatCompletion(
-        execution.result,
+        validateChatResult(execution.result, tools),
         body.model || `codex-proxy/${execution.model}`,
         execution.usage,
         Array.isArray(body.tools),
@@ -802,6 +821,7 @@ export {
   buildResearchPrompt,
   codexArgs,
   parseUsage,
+  validateChatResult,
 };
 
 const isMain =

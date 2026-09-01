@@ -38,7 +38,10 @@ async function unusedPort() {
   return port;
 }
 
-async function fakeCodex(tmpDir, { auth = "chatgpt", delayMs = 0 } = {}) {
+async function fakeCodex(
+  tmpDir,
+  { auth = "chatgpt", delayMs = 0, chatResult } = {},
+) {
   const executable = path.join(tmpDir, "fake-codex");
   const capturePath = path.join(tmpDir, "capture.jsonl");
   const authText =
@@ -69,9 +72,9 @@ process.stdin.on('end', () => {
           ],
           search_count: 2
         }
-      : prompt.includes('review_openstax_questions')
+      : ${JSON.stringify(chatResult)} || (prompt.includes('review_openstax_questions')
         ? { type: 'function_call', name: 'review_openstax_questions', arguments: { candidate: 'v2' } }
-        : { type: 'message', content: 'ok' };
+        : { type: 'message', content: 'ok' });
     fs.appendFileSync(${JSON.stringify(capturePath)}, JSON.stringify({ args, prompt }) + '\\n');
     fs.writeFileSync(outputPath, JSON.stringify(result));
     console.log(JSON.stringify({
@@ -194,6 +197,35 @@ test("modern and legacy tool-call responses retain IDs and arguments", () => {
   assert.equal(legacy.choices[0].message.function_call.name, tool.name);
 });
 
+test("leading JSON is preserved while trailing Codex chatter is discarded", () => {
+  const completion = asChatCompletion(
+    { type: "message", content: '{"patch":[]} trailing Codex chatter' },
+    "codex-proxy/gpt-5.6-sol",
+    {},
+    false,
+  );
+
+  assert.equal(completion.choices[0].message.content, '{"patch":[]}');
+});
+
+test("nested message envelopes unwrap recursively", () => {
+  const patch = { patch: [{ op: "replace", path: "/title", value: "v2" }] };
+  const inner = { type: "message", content: JSON.stringify(patch) };
+  const outer = {
+    type: "message",
+    content: `${JSON.stringify({ type: "message", content: JSON.stringify(inner) })} trailing text`,
+  };
+
+  const completion = asChatCompletion(
+    outer,
+    "codex-proxy/gpt-5.6-sol",
+    {},
+    false,
+  );
+
+  assert.deepEqual(JSON.parse(completion.choices[0].message.content), patch);
+});
+
 test("nested message envelopes with trailing Codex text are unwrapped", () => {
   const nested = {
     type: "message",
@@ -220,18 +252,50 @@ test("nested message envelopes with trailing Codex text are unwrapped", () => {
   });
 });
 
-test("the structured schema binds each tool name to its own argument contract", () => {
-  const schema = buildOutputSchema([tool]);
-
-  assert.deepEqual(schema.properties.name.anyOf[0].enum, [tool.name]);
-  assert.deepEqual(schema.properties.arguments.anyOf[0].required, [
-    "candidate",
-  ]);
-  assert.equal(
-    schema.properties.arguments.anyOf[0].additionalProperties,
-    false,
+test("the structured schema pairs each offered tool with only its argument contract", () => {
+  const toolA = tool;
+  const toolB = {
+    name: "score_openstax_questions",
+    parameters: {
+      type: "object",
+      properties: { score: { type: "integer" } },
+      required: ["score"],
+    },
+  };
+  const schema = buildOutputSchema([toolA, toolB]);
+  const calls = schema.anyOf.filter(
+    (variant) => variant.properties.type.const === "function_call",
   );
-  assert.deepEqual(schema.required, ["type", "name", "arguments", "content"]);
+
+  assert.deepEqual(
+    calls.map((variant) => variant.properties.name.const),
+    [toolA.name, toolB.name],
+  );
+  assert.deepEqual(calls[0].properties.arguments.required, ["candidate"]);
+  assert.deepEqual(calls[1].properties.arguments.required, ["score"]);
+});
+
+test("message schema requires null name and arguments", () => {
+  const schema = buildOutputSchema([tool]);
+  const message = schema.anyOf.find(
+    (variant) => variant.properties.type.const === "message",
+  );
+
+  assert.deepEqual(message.properties.name, { type: "null" });
+  assert.deepEqual(message.properties.arguments, { type: "null" });
+  assert.deepEqual(message.required, ["type", "name", "arguments", "content"]);
+});
+
+test("the structured schema retains a tool argument contract", () => {
+  const schema = buildOutputSchema([tool]);
+  const call = schema.anyOf.find(
+    (variant) => variant.properties.type.const === "function_call",
+  );
+
+  assert.deepEqual(call.properties.name, { const: tool.name, type: "string" });
+  assert.deepEqual(call.properties.arguments.required, ["candidate"]);
+  assert.equal(call.properties.arguments.additionalProperties, false);
+  assert.deepEqual(call.required, ["type", "name", "arguments", "content"]);
 });
 
 test("optional tool fields become required nullable fields for Codex strict schemas", () => {
@@ -254,7 +318,9 @@ test("optional tool fields become required nullable fields for Codex strict sche
     },
   ]);
 
-  const args = schema.properties.arguments.anyOf[0];
+  const args = schema.anyOf.find(
+    (variant) => variant.properties.type.const === "function_call",
+  ).properties.arguments;
   assert.deepEqual(args.required.sort(), ["candidate", "feedback"]);
   assert.deepEqual(args.properties.feedback.anyOf[1], { type: "null" });
 
@@ -420,6 +486,43 @@ test("a fake Codex executable verifies readiness, modern history, research, and 
   assert.ok(
     captures[1].args.some((value) => value.includes("allowed_domains")),
   );
+});
+
+test("an unknown Codex function call is rejected before formatting", async (t) => {
+  const bridge = await startBridge(t, {
+    chatResult: {
+      type: "function_call",
+      name: "unoffered_function",
+      arguments: { candidate: "v2" },
+    },
+  });
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      tools: [{ type: "function", function: tool }],
+      messages: [{ role: "user", content: "Review this." }],
+    }),
+  });
+
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), {
+    error: { code: "invalid_codex_output", type: "bridge_error" },
+  });
+});
+
+test("a non-object Codex result is rejected before formatting", async (t) => {
+  const bridge = await startBridge(t, { chatResult: "not an object" });
+  const response = await fetch(`${bridge.baseUrl}/v1/chat/completions`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ messages: [{ role: "user", content: "Reply." }] }),
+  });
+
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), {
+    error: { code: "invalid_codex_output", type: "bridge_error" },
+  });
 });
 
 test("health rejects API-key authentication", async (t) => {
