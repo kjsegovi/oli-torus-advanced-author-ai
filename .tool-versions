@@ -1,6 +1,6 @@
-erlang 28.1.1
-elixir latest
-gleam  1.16.0
-nodejs 16.14.2
-yarn   1.22.17
-python 3.11.9
+erlang 29
+elixir 1.20
+gleam 1.18
+nodejs 26
+yarn 1.22.17
+python 3.11

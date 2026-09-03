@@ -10,7 +10,7 @@ defmodule Oli.MixProject do
     [
       app: @app,
       version: "0.34.0",
-      elixir: "~> 1.19",
+      elixir: "~> 1.20",
       elixirc_paths: elixirc_paths(Mix.env()),
       elixirc_options: elixirc_options(Mix.env()),
       compilers: [:phoenix_live_view, :gleam, :gleam_runtime] ++ Mix.compilers(),

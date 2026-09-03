@@ -12,7 +12,7 @@
 #   - Ex: hexpm/elixir:1.19.2-erlang-28.1.1-debian-bullseye-20251103-slim
 #
 ARG ELIXIR_VERSION=1.19.2
-ARG OTP_VERSION=28.1.1
+ARG OTP_VERSION=29.0.6
 ARG GLEAM_VERSION=1.16.0
 ARG DEBIAN_VERSION=bullseye-20251103-slim
 
@@ -30,10 +30,10 @@ RUN apt-get update -y && apt-get install -y build-essential git \
     ca-certificates curl gnupg \
     && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
-# install NodeJS 16 for asset compilation
+# install NodeJS 26 for asset compilation
 RUN mkdir -p /etc/apt/keyrings \
   && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-  && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_16.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
+  && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_26.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
 
 RUN apt-get update -y && apt-get install nodejs -y
 
@@ -120,12 +120,12 @@ FROM ${RUNNER_IMAGE}
 RUN apt-get update -y && apt-get install -y libstdc++6 openssl libncurses5 locales \
   && apt-get clean && rm -f /var/lib/apt/lists/*_*
 
-# install NodeJS 16 runtime
+# install NodeJS 26 runtime
 RUN apt-get update -y \
   && apt-get install -y ca-certificates curl gnupg \
   && mkdir -p /etc/apt/keyrings \
   && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-  && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_16.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
+  && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_26.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
 
 RUN apt-get update -y \
   && apt-get install nodejs -y
