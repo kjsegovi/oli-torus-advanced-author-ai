@@ -355,6 +355,9 @@ defmodule Oli.Publishing.DeliveryResolver do
     )
   end
 
+  # Catch-all for nil or unexpected input — return nil to avoid FunctionClauseError
+  defp hierarchy_node_with_children(_node, _nodes_by_sr_id), do: nil
+
   defp hierarchy_nodes_by_sr_id(section, section_resources) do
     labels =
       case section.customizations do

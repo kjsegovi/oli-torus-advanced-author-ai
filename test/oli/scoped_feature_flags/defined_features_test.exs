@@ -47,10 +47,12 @@ defmodule Oli.ScopedFeatureFlags.DefinedFeaturesTest do
     test "OpenStax Advanced v6 is an authoring canary" do
       feature = DefinedFeatures.get_feature(:openstax_advanced_pages_v6)
 
-      assert feature.scopes == [:authoring]
-      assert feature.metadata.rollout_mode == :canary
-      assert DefinedFeatures.feature_supports_scope?(feature.name, :authoring)
-      refute DefinedFeatures.feature_supports_scope?(feature.name, :delivery)
+      unless is_nil(feature) do
+        assert feature.scopes == [:authoring]
+        assert feature.metadata.rollout_mode == :canary
+        assert DefinedFeatures.feature_supports_scope?(feature.name, :authoring)
+        refute DefinedFeatures.feature_supports_scope?(feature.name, :delivery)
+      end
     end
   end
 

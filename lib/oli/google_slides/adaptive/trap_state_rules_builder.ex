@@ -319,6 +319,9 @@ defmodule Oli.GoogleSlides.Adaptive.TrapStateRulesBuilder do
     ]
   end
 
+  # Catch-all for unhandled part types — return empty list so no condition blocks progression
+  defp correct_conditions(_part), do: []
+
   defp incorrect_condition(%{"id" => part_id, "type" => "janus-mcq", "custom" => custom}) do
     %{
       "fact" => "stage.#{part_id}.selectedChoice",

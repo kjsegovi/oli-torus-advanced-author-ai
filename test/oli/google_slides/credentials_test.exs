@@ -2,7 +2,7 @@ defmodule Oli.GoogleSlides.CredentialsTest do
   use Oli.DataCase, async: true
 
   alias Oli.GoogleSlides.Credentials
-  alias Oli.Utils.DbSeeder
+  alias Oli.Seeder
 
   @service_account_json """
   {
