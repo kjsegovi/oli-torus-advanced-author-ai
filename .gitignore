@@ -132,3 +132,6 @@ devops/.env
 test/support/dataset/python/dataset/__pycache__
 
 /oli_project_exports
+
+# Agent plan files
+.hermes/
